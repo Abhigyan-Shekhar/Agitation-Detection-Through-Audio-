@@ -1,3 +1,4 @@
+import logging
 import queue
 import threading
 import time
@@ -6,6 +7,9 @@ import librosa
 import numpy as np
 import sounddevice as sd
 import torch
+
+
+logger = logging.getLogger(__name__)
 
 try:
     from faster_whisper import WhisperModel  # type: ignore[import-untyped]
@@ -345,20 +349,29 @@ class AudioPipeline:
 
         if speech_ratio >= self.speech_ratio_threshold:
             print(f"Emitting chunk! Speech ratio: {speech_ratio:.2f}")
-            person2_output = self.person2_processor.process(
-                normalized_chunk, sample_rate=self.sample_rate
-            )
-            self.output_queue.put(
-                {
-                    "audio": normalized_chunk,
-                    "speech_ratio": speech_ratio,
-                    "timestamp": time.time(),
-                    "duration": len(normalized_chunk) / self.sample_rate,
-                    "acoustic_features": person2_output["acoustic_features"],
-                    "transcript": person2_output["transcript"],
-                    "transcript_details": person2_output["transcript_details"],
-                }
-            )
+            logger.info("Speech window accepted; starting feature and transcription processing")
+            try:
+                person2_output = self.person2_processor.process(
+                    normalized_chunk, sample_rate=self.sample_rate
+                )
+            except Exception:
+                # Without this boundary an exception terminates the daemon worker
+                # and makes the dashboard appear to be waiting indefinitely.
+                logger.exception("Feature/transcription processing failed; chunk was not queued")
+                return
+
+            logger.info("Feature/transcription processing completed; enqueueing result")
+            output = {
+                "audio": normalized_chunk,
+                "speech_ratio": speech_ratio,
+                "timestamp": time.time(),
+                "duration": len(normalized_chunk) / self.sample_rate,
+                "acoustic_features": person2_output["acoustic_features"],
+                "transcript": person2_output["transcript"],
+                "transcript_details": person2_output["transcript_details"],
+            }
+            self.output_queue.put(output)
+            logger.info("Output queue put reached; queue size is now %s", self.output_queue.qsize())
         else:
             print(
                 f"Discarding chunk (speech ratio {speech_ratio:.2f} < {self.speech_ratio_threshold})"
