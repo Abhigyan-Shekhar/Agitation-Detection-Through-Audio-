@@ -316,10 +316,14 @@ class AudioPipeline:
             except queue.Empty:
                 continue
 
+            # Preserve original frame for the buffer to prevent jagged 31Hz discontinuities
+            # when the 5-second chunk is later concatenated.
+            original_frame = frame
+            
             frame = self._preprocess_frame(frame)
             is_speech = self._run_vad(frame)
 
-            self.frame_buffer.append(frame)
+            self.frame_buffer.append(original_frame)
             self.vad_buffer.append(is_speech)
 
             if len(self.frame_buffer) > self.window_frames:
@@ -340,12 +344,14 @@ class AudioPipeline:
         speech_ratio = speech_frames / self.window_frames
 
         chunk_data = np.concatenate(self.frame_buffer)
+        
+        # Remove DC offset cleanly across the entire 5-second chunk
+        chunk_data = chunk_data - np.mean(chunk_data)
 
-        max_val = np.max(np.abs(chunk_data))
-        if max_val > 0:
-            normalized_chunk = chunk_data / max_val
-        else:
-            normalized_chunk = chunk_data
+        # Do not dynamically peak-normalize the chunk. Peak normalizing 
+        # background noise to 1.0 causes Whisper to hallucinate and ruins 
+        # true RMS energy measurements for agitation detection.
+        normalized_chunk = chunk_data
 
         if speech_ratio >= self.speech_ratio_threshold:
             print(f"Emitting chunk! Speech ratio: {speech_ratio:.2f}")

@@ -14,6 +14,7 @@ from person3_module import (
     GeminiBehaviourAnalyzer,
     analyze_person3,
     resolve_acoustic_score,
+    compute_final_score,
 )
 
 logging.basicConfig(
@@ -34,6 +35,8 @@ def initialise() -> None:
     st.session_state.setdefault("person3_analyzer", None)
     st.session_state.setdefault("dashboard_error", None)
     st.session_state.setdefault("last_queue_size", 0)
+    st.session_state.setdefault("last_gemini_call_time", 0.0)
+    st.session_state.setdefault("last_gemini_result", None)
 
 
 def stop_pipeline() -> None:
@@ -74,12 +77,48 @@ def consume_chunks() -> None:
             chunk["acoustic_score"] = resolve_acoustic_score(
                 chunk.get("acoustic_score"), chunk.get("acoustic_features")
             )
-            result = analyze_person3(
-                transcript=transcript,
-                acoustic_features=chunk["acoustic_features"],
-                acoustic_score=chunk.get("acoustic_score"),
-                analyzer=get_analyzer(),
-            )
+            
+            current_time = time.time()
+            # Enforce rate limit (1 call per 15 seconds) to avoid 429 RESOURCE_EXHAUSTED
+            if transcript and (current_time - st.session_state.last_gemini_call_time) >= 15.0:
+                try:
+                    result = analyze_person3(
+                        transcript=transcript,
+                        acoustic_features=chunk["acoustic_features"],
+                        acoustic_score=chunk.get("acoustic_score"),
+                        analyzer=get_analyzer(),
+                    )
+                    st.session_state.last_gemini_call_time = current_time
+                    st.session_state.last_gemini_result = result
+                    st.session_state.dashboard_error = None
+                except Exception as exc:
+                    if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                        logger.warning("Rate limit hit, backing off.")
+                        st.session_state.last_gemini_call_time = current_time + 30.0 # Force a longer backoff
+                        st.session_state.dashboard_error = "Gemini rate limit (429) hit. Reusing previous/fallback linguistic score."
+                    else:
+                        raise
+            
+            # Use the actual result if we just computed it, or fallback
+            if st.session_state.last_gemini_result is not None:
+                result = dict(st.session_state.last_gemini_result)
+                # Ensure the acoustic and final score are up-to-date with this chunk's acoustic features
+                result["acoustic_score"] = chunk["acoustic_score"]
+                result["final_score"] = compute_final_score(chunk["acoustic_score"], result["gemini"]["agitation_score"])
+            else:
+                # Neutral fallback if we haven't made a successful call yet
+                result = {
+                    "acoustic_score": chunk["acoustic_score"],
+                    "gemini": {
+                        "emotion": "Neutral",
+                        "agitation_score": 0.0,
+                        "behaviours": [],
+                        "reasoning": "Awaiting initial Gemini analysis (rate limiting or cooldown in effect)."
+                    },
+                    "cmai_mapping": [],
+                    "final_score": compute_final_score(chunk["acoustic_score"], 0.0)
+                }
+                
         except Exception as exc:
             logger.exception("Person 3 analysis failed")
             st.session_state.dashboard_error = f"Person 3 analysis failed: {exc}"
