@@ -1,21 +1,46 @@
-"""Continuously refreshed Streamlit view of AudioPipeline and Person 3 output."""
+"""Audio + Linguistic Agitation Dashboard — WhisperLiveKit edition.
+
+Architecture overview
+---------------------
+Microphone (sounddevice)
+    │
+    ├─► wlk_queue ──► WhisperLiveKitClient ──► partial_queue  ─► live caption
+    │                                      └──► committed_queue ─► UtteranceAggregator
+    │                                                                     │
+    └─► acoustic_queue ──► AcousticWorker                                 ▼
+                               (rolling ring buffer)            completed utterance_queue
+                                     │                                    │
+                                     └─────────► ScoreFusion ◄────────────┘
+                                                     │
+                                              BehaviourClassifier
+                                                     │
+                                              Streamlit Dashboard
+
+WLK server is launched as a subprocess if WLK_AUTO_LAUNCH=true (default).
+"""
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import subprocess
+import sys
 import time
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+import config
 from audio_pipeline import AudioPipeline
-from person3_module import (
-    GeminiBehaviourAnalyzer,
-    analyze_person3,
-    resolve_acoustic_score,
-    compute_final_score,
-)
+from whisperlivekit_client import WhisperLiveKitClient
+from utterance_aggregator import UtteranceAggregator
+from acoustic_features import AcousticWorker
+from baseline_manager import BaselineManager
+from linguistic_features import LinguisticAnalyzer
+from score_fusion import ScoreFusion
+from behaviour_classifier import BehaviourClassifier
+from event_models import FusedResult, Utterance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,187 +48,416 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-st.set_page_config(page_title="Audio Agitation Dashboard", layout="wide")
-st.title("Audio + Linguistic Agitation Dashboard")
-st.caption("Decision support only; CMAI-inspired labels are not clinical diagnoses.")
+st.set_page_config(page_title="Agitation Dashboard", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Session state helpers
+# ---------------------------------------------------------------------------
+
+def _init() -> None:
+    defaults: dict[str, Any] = {
+        "pipeline": None,
+        "wlk_client": None,
+        "utterance_aggregator": None,
+        "acoustic_worker": None,
+        "baseline_manager": None,
+        "linguistic_analyzer": None,
+        "score_fusion": None,
+        "behaviour_classifier": None,
+        "wlk_proc": None,
+        # Queues
+        "partial_queue": queue.Queue(maxsize=5),
+        "committed_queue": queue.Queue(maxsize=100),
+        "utterance_queue": queue.Queue(maxsize=50),
+        # Display state
+        "partial_caption": "",
+        "committed_lines": [],      # list[str]
+        "timeline": [],             # list[dict]
+        "latest_result": None,      # FusedResult | None
+        "error": None,
+        # Calibration
+        "calibrating": False,
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
 
-def initialise() -> None:
-    st.session_state.setdefault("timeline", [])
-    st.session_state.setdefault("latest", None)
-    st.session_state.setdefault("pipeline", None)
-    st.session_state.setdefault("person3_analyzer", None)
-    st.session_state.setdefault("dashboard_error", None)
-    st.session_state.setdefault("last_queue_size", 0)
-    st.session_state.setdefault("last_gemini_call_time", 0.0)
-    st.session_state.setdefault("last_gemini_result", None)
+def _ensure_services() -> None:
+    """Create long-lived service objects once per session."""
+    if st.session_state.baseline_manager is None:
+        st.session_state.baseline_manager = BaselineManager()
+
+    bm: BaselineManager = st.session_state.baseline_manager
+
+    if st.session_state.linguistic_analyzer is None:
+        st.session_state.linguistic_analyzer = LinguisticAnalyzer()
+
+    if st.session_state.score_fusion is None:
+        st.session_state.score_fusion = ScoreFusion(bm)
+
+    if st.session_state.behaviour_classifier is None:
+        st.session_state.behaviour_classifier = BehaviourClassifier()
 
 
-def stop_pipeline() -> None:
-    pipeline = st.session_state.pipeline
-    if pipeline is not None:
-        pipeline.stop()
-        logger.info("Audio pipeline stopped from dashboard")
-    st.session_state.pipeline = None
-
-
-def get_analyzer() -> GeminiBehaviourAnalyzer:
-    if st.session_state.person3_analyzer is None:
-        logger.info("Creating Gemini Person 3 analyzer")
-        st.session_state.person3_analyzer = GeminiBehaviourAnalyzer()
-    return st.session_state.person3_analyzer
-
-
-def consume_chunks() -> None:
-    """Drain all completed pipeline chunks on every timed fragment rerun."""
-    pipeline = st.session_state.pipeline
-    if pipeline is None:
-        return
-
-    st.session_state.last_queue_size = pipeline.output_queue.qsize()
-    logger.info("Dashboard polling output queue; size=%s", st.session_state.last_queue_size)
-    while True:
-        try:
-            chunk = pipeline.output_queue.get_nowait()
-        except queue.Empty:
-            return
-
-        logger.info("Dashboard dequeued a pipeline result; starting Person 3 analysis")
-        transcript_override = st.session_state.get("transcript_override", "").strip()
-        transcript = transcript_override or chunk.get("transcript", "")
-        try:
-            # AudioPipeline does not currently enqueue an acoustic score. Resolve
-            # the Person 3 feature-based fallback before storing dashboard state.
-            chunk["acoustic_score"] = resolve_acoustic_score(
-                chunk.get("acoustic_score"), chunk.get("acoustic_features")
-            )
-            
-            current_time = time.time()
-            # Enforce rate limit (1 call per 15 seconds) to avoid 429 RESOURCE_EXHAUSTED
-            if transcript and (current_time - st.session_state.last_gemini_call_time) >= 15.0:
-                try:
-                    result = analyze_person3(
-                        transcript=transcript,
-                        acoustic_features=chunk["acoustic_features"],
-                        acoustic_score=chunk.get("acoustic_score"),
-                        analyzer=get_analyzer(),
-                    )
-                    st.session_state.last_gemini_call_time = current_time
-                    st.session_state.last_gemini_result = result
-                    st.session_state.dashboard_error = None
-                except Exception as exc:
-                    if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
-                        logger.warning("Rate limit hit, backing off.")
-                        st.session_state.last_gemini_call_time = current_time + 30.0 # Force a longer backoff
-                        st.session_state.dashboard_error = "Gemini rate limit (429) hit. Reusing previous/fallback linguistic score."
-                    else:
-                        raise
-            
-            # Use the actual result if we just computed it, or fallback
-            if st.session_state.last_gemini_result is not None:
-                result = dict(st.session_state.last_gemini_result)
-                # Ensure the acoustic and final score are up-to-date with this chunk's acoustic features
-                result["acoustic_score"] = chunk["acoustic_score"]
-                result["final_score"] = compute_final_score(chunk["acoustic_score"], result["gemini"]["agitation_score"])
-            else:
-                # Neutral fallback if we haven't made a successful call yet
-                result = {
-                    "acoustic_score": chunk["acoustic_score"],
-                    "gemini": {
-                        "emotion": "Neutral",
-                        "agitation_score": 0.0,
-                        "behaviours": [],
-                        "reasoning": "Awaiting initial Gemini analysis (rate limiting or cooldown in effect)."
-                    },
-                    "cmai_mapping": [],
-                    "final_score": compute_final_score(chunk["acoustic_score"], 0.0)
-                }
-                
-        except Exception as exc:
-            logger.exception("Person 3 analysis failed")
-            st.session_state.dashboard_error = f"Person 3 analysis failed: {exc}"
-            return
-
-        logger.info("Person 3 analysis completed; updating dashboard state")
-        st.session_state.dashboard_error = None
-        st.session_state.latest = {
-            **chunk,
-            **result,
-            "transcript": transcript,
-            "acoustic_score": chunk.get("acoustic_score"),
-        }
-        st.session_state.timeline.append(
-            {
-                "time": time.strftime("%H:%M:%S", time.localtime(chunk["timestamp"])),
-                "acoustic_score": chunk.get("acoustic_score"),
-                "linguistic_score": result["gemini"]["agitation_score"],
-                "final_score": result["final_score"],
-            }
+def _start_wlk_server() -> subprocess.Popen | None:
+    """Launch WhisperLiveKit server as a subprocess if auto-launch is enabled."""
+    if not config.WLK_AUTO_LAUNCH:
+        return None
+    cmd = [
+        sys.executable, "-m", "whisperlivekit.server",
+        "--backend", config.WLK_BACKEND,
+        "--model", config.WLK_MODEL,
+        "--lan", config.WLK_LANGUAGE,
+        "--pcm-input",
+        "--host", config.WLK_HOST,
+        "--port", str(config.WLK_PORT),
+    ]
+    logger.info("Launching WLK server: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
+        time.sleep(2.5)     # give the server a moment to start
+        return proc
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not auto-launch WLK: %s", exc)
+        st.session_state.error = (
+            f"Could not auto-launch WhisperLiveKit: {exc}\n"
+            f"Start it manually: wlk --backend {config.WLK_BACKEND} "
+            f"--model {config.WLK_MODEL} --lan {config.WLK_LANGUAGE} --pcm-input"
+        )
+        return None
 
 
-def render_results() -> None:
-    latest: dict[str, Any] | None = st.session_state.latest
-    if st.session_state.dashboard_error:
-        st.error(st.session_state.dashboard_error)
-    if latest is None:
-        st.info("Waiting for a completed speech chunk. The queue is polled every second while the microphone runs.")
+def _start_pipeline() -> None:
+    _ensure_services()
+
+    # 1. WLK server
+    if st.session_state.wlk_proc is None:
+        st.session_state.wlk_proc = _start_wlk_server()
+
+    # 2. Audio pipeline (fan-out)
+    pipeline = AudioPipeline()
+
+    # 3. WLK client
+    wlk_client = WhisperLiveKitClient(
+        wlk_queue=pipeline.wlk_queue,
+        partial_queue=st.session_state.partial_queue,
+        committed_queue=st.session_state.committed_queue,
+    )
+
+    # 4. Utterance aggregator
+    aggregator = UtteranceAggregator(
+        committed_queue=st.session_state.committed_queue,
+        utterance_queue=st.session_state.utterance_queue,
+    )
+
+    # 5. Acoustic worker
+    acoustic_worker = AcousticWorker(acoustic_queue=pipeline.acoustic_queue)
+    # Feed new windows into baseline manager automatically
+    _original_run = acoustic_worker._run
+
+    def _patched_run():
+        import time as _t
+        bm: BaselineManager = st.session_state.baseline_manager
+        while not acoustic_worker._stop_event.is_set():
+            acoustic_worker._drain_queue()
+            now = _t.time()
+            if now - acoustic_worker._last_extraction_time >= acoustic_worker._hop_sec:
+                records = acoustic_worker._ring.latest_window(acoustic_worker._window_sec)
+                if records:
+                    import time as tt
+                    window_end = now
+                    window_start = window_end - acoustic_worker._window_sec
+                    feat = acoustic_worker._extractor.extract(records, window_start, window_end)
+                    with acoustic_worker._lock:
+                        acoustic_worker._windows.append(feat)
+                    acoustic_worker._last_extraction_time = now
+                    acoustic_worker._windows_extracted += 1
+                    bm.feed(feat)
+            _t.sleep(0.010)
+
+    import threading
+    acoustic_worker._thread = threading.Thread(
+        target=_patched_run, name="acoustic-worker", daemon=True
+    )
+
+    # Start everything
+    pipeline.start()
+    wlk_client.start()
+    aggregator.start()
+    acoustic_worker._stop_event.clear()
+    acoustic_worker._thread.start()
+
+    st.session_state.pipeline = pipeline
+    st.session_state.wlk_client = wlk_client
+    st.session_state.utterance_aggregator = aggregator
+    st.session_state.acoustic_worker = acoustic_worker
+    st.session_state.score_fusion.reset()
+    logger.info("All pipeline components started")
+
+
+def _stop_pipeline() -> None:
+    for key, attr in [
+        ("utterance_aggregator", "stop"),
+        ("wlk_client", "stop"),
+        ("pipeline", "stop"),
+        ("acoustic_worker", "stop"),
+    ]:
+        obj = st.session_state.get(key)
+        if obj is not None:
+            try:
+                getattr(obj, attr)()
+            except Exception:  # noqa: BLE001
+                pass
+            st.session_state[key] = None
+
+    proc = st.session_state.get("wlk_proc")
+    if proc is not None:
+        proc.terminate()
+        st.session_state.wlk_proc = None
+
+    logger.info("All pipeline components stopped")
+
+
+# ---------------------------------------------------------------------------
+# Fragment — runs every 1 second
+# ---------------------------------------------------------------------------
+
+def _consume() -> None:
+    """Drain queues and run analysis on completed utterances."""
+    # Partial caption (display only — no analysis)
+    try:
+        while True:
+            text = st.session_state.partial_queue.get_nowait()
+            st.session_state.partial_caption = text
+    except queue.Empty:
+        pass
+
+    # Committed lines (for the committed transcript display)
+    try:
+        while True:
+            from event_models import CommittedLine
+            line: CommittedLine = st.session_state.committed_queue.get_nowait()
+            st.session_state.committed_lines.append(line.text)
+            if len(st.session_state.committed_lines) > 50:
+                st.session_state.committed_lines.pop(0)
+    except queue.Empty:
+        pass
+
+    # Completed utterances → full analysis pipeline
+    acoustic_worker: AcousticWorker | None = st.session_state.acoustic_worker
+    analyzer: LinguisticAnalyzer = st.session_state.linguistic_analyzer
+    fusion: ScoreFusion = st.session_state.score_fusion
+    classifier: BehaviourClassifier = st.session_state.behaviour_classifier
+
+    try:
+        while True:
+            utterance: Utterance = st.session_state.utterance_queue.get_nowait()
+            logger.info("Processing utterance: %r", utterance.full_text[:60])
+
+            # Aggregate acoustic features for this utterance's time span
+            acoustic = None
+            if acoustic_worker is not None:
+                acoustic = acoustic_worker.aggregate(
+                    utterance.start_time, utterance.end_time
+                )
+
+            # Linguistic features
+            linguistic = analyzer.analyze(utterance)
+
+            # Fusion
+            result = fusion.fuse(utterance, acoustic, linguistic)
+            result.linguistic_features = linguistic
+
+            # Behaviour classification
+            result = classifier.classify(result)
+
+            st.session_state.latest_result = result
+            st.session_state.timeline.append({
+                "time": time.strftime("%H:%M:%S"),
+                "acoustic_score": result.acoustic_score,
+                "linguistic_score": result.linguistic_score,
+                "smoothed_score": result.smoothed_score,
+            })
+
+            # Optional Gemini ablation
+            if config.ENABLE_GEMINI_COMPARISON and acoustic is not None:
+                try:
+                    from person3_module import analyze_person3
+                    gemini_result = analyze_person3(
+                        transcript=utterance.full_text,
+                        acoustic_features=acoustic.to_dict() if acoustic else {},
+                    )
+                    result.gemini_result = gemini_result
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Gemini comparison failed: %s", exc)
+
+    except queue.Empty:
+        pass
+
+
+def _render() -> None:
+    """Render the main dashboard from session state."""
+    # ---- Live caption ---------------------------------------------------
+    st.subheader("🎙️ Live Caption")
+    partial = st.session_state.partial_caption or "_Waiting for speech…_"
+    st.markdown(f"> {partial}")
+
+    # ---- Committed transcript ------------------------------------------
+    committed = st.session_state.committed_lines
+    if committed:
+        with st.expander("📝 Committed Transcript (last 50 lines)", expanded=False):
+            st.write("  \n".join(committed[-20:]))
+
+    result: FusedResult | None = st.session_state.latest_result
+    if result is None:
+        st.info("Waiting for a completed utterance…")
         return
 
-    first, second, third = st.columns(3)
-    first.metric("Acoustic score", latest.get("acoustic_score", "Not available"))
-    second.metric("Gemini agitation score", latest["gemini"]["agitation_score"])
-    third.metric("Final agitation score", latest["final_score"])
-    st.subheader("Acoustic features")
-    st.json(latest["acoustic_features"])
-    st.subheader("Transcript")
-    st.write(latest.get("transcript") or "No transcript available")
-    st.subheader("Gemini emotion")
-    st.write(latest["gemini"]["emotion"])
-    st.subheader("Detected behaviours")
-    st.write(latest["gemini"]["behaviours"] or "None detected")
-    st.subheader("CMAI-inspired mapping")
-    st.dataframe(latest["cmai_mapping"], use_container_width=True)
-    st.subheader("Reasoning")
-    st.write(latest["gemini"]["reasoning"])
+    # ---- Score cards ---------------------------------------------------
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Acoustic score", f"{result.acoustic_score:.3f}")
+    c2.metric("Linguistic score", f"{result.linguistic_score:.3f}")
+    c3.metric("Final score (smoothed)", f"{result.smoothed_score:.3f}")
+    c4.metric("Reliability", f"{result.reliability:.2f}")
 
+    # ---- Severity badge ------------------------------------------------
+    severity_color = {
+        "Low": "🟢", "Mild": "🟡", "Moderate": "🟠", "High": "🔴"
+    }.get(result.severity, "⚪")
+    st.markdown(f"### {severity_color} Severity: **{result.severity}**")
+
+    # ---- Behaviour tags ------------------------------------------------
+    if result.behaviours:
+        st.subheader("Detected Behaviours")
+        cols = st.columns(len(result.behaviours))
+        for col, b in zip(cols, result.behaviours):
+            col.info(b)
+    else:
+        st.subheader("Detected Behaviours")
+        st.success("No audio agitation detected")
+
+    # ---- Explainability panel -----------------------------------------
+    st.subheader("Why was this detected?")
+    all_contributions = {
+        **result.acoustic_contributions,
+        **{k: v for k, v in result.linguistic_contributions.items() if not k.startswith("[")},
+    }
+    if all_contributions:
+        max_val = max(abs(v) for v in all_contributions.values()) or 1.0
+        for feature, contrib in sorted(all_contributions.items(), key=lambda x: -abs(x[1])):
+            bar_len = int(abs(contrib) / max_val * 20)
+            bar = "█" * bar_len
+            sign = "+" if contrib >= 0 else "-"
+            st.text(f"  {feature:<35} {sign}{abs(contrib):.4f}  {bar}")
+
+    # ---- Utterance text -----------------------------------------------
+    if result.utterance:
+        with st.expander("Analysed utterance text"):
+            st.write(result.utterance.full_text)
+
+    # ---- Timeline chart -----------------------------------------------
     if st.session_state.timeline:
-        st.subheader("Timeline of scores")
-        timeline = pd.DataFrame(st.session_state.timeline).set_index("time")
-        st.line_chart(timeline[["acoustic_score", "linguistic_score", "final_score"]])
+        st.subheader("📊 Score Timeline")
+        df = pd.DataFrame(st.session_state.timeline).set_index("time")
+        st.line_chart(df[["acoustic_score", "linguistic_score", "smoothed_score"]])
+
+    # ---- Optional Gemini comparison -----------------------------------
+    if config.ENABLE_GEMINI_COMPARISON and result.gemini_result:
+        with st.expander("🤖 Gemini comparison (ablation)", expanded=False):
+            st.json(result.gemini_result)
 
 
-initialise()
+# ---------------------------------------------------------------------------
+# App entry point
+# ---------------------------------------------------------------------------
+
+_init()
+_ensure_services()
+
+# ---- Sidebar ------------------------------------------------------------
 with st.sidebar:
-    st.header("Controls")
-    st.text_area(
-        "Transcript override (optional)",
-        key="transcript_override",
-        help="Uses external text instead of Whisper output for newly dequeued chunks.",
-    )
-    start, stop = st.columns(2)
-    if start.button("Start microphone", disabled=st.session_state.pipeline is not None):
+    st.title("🎛️ Controls")
+
+    pipeline_running = st.session_state.pipeline is not None
+    col_start, col_stop = st.columns(2)
+
+    if col_start.button("▶ Start mic", disabled=pipeline_running):
+        st.session_state.error = None
         try:
-            st.session_state.pipeline = AudioPipeline()
-            st.session_state.pipeline.start()
-            logger.info("Audio pipeline started from dashboard")
+            _start_pipeline()
         except Exception as exc:
-            logger.exception("Audio pipeline could not start")
-            st.session_state.pipeline = None
-            st.session_state.dashboard_error = f"Audio pipeline could not start: {exc}"
-    if stop.button("Stop microphone", disabled=st.session_state.pipeline is None):
-        stop_pipeline()
-    with st.expander("Debug status"):
-        st.write("Pipeline running:", st.session_state.pipeline is not None)
-        st.write("Last observed queue size:", st.session_state.last_queue_size)
-        st.write("Timeline points:", len(st.session_state.timeline))
+            logger.exception("Failed to start pipeline")
+            st.session_state.error = str(exc)
+
+    if col_stop.button("⏹ Stop mic", disabled=not pipeline_running):
+        _stop_pipeline()
+
+    st.divider()
+
+    # Baseline calibration
+    st.subheader("📐 Baseline Calibration")
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    if bm:
+        if bm.has_personal_baseline:
+            st.success(f"Personal baseline set ({bm._personal_n} windows)")
+            if st.button("Reset baseline"):
+                bm.reset_calibration()
+        elif bm.is_calibrating:
+            progress = bm.calibration_progress
+            st.progress(progress, text=f"Calibrating… {int(progress * 100)}%")
+            if st.button("Stop calibration"):
+                ok = bm.stop_calibration()
+                st.session_state.calibrating = False
+                if ok:
+                    st.success("Baseline saved!")
+                else:
+                    st.warning("Not enough data — keep recording and try again")
+        else:
+            st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
+            if st.button("Start calibration", disabled=not pipeline_running):
+                bm.start_calibration()
+                st.session_state.calibrating = True
+
+    st.divider()
+
+    # Debug
+    with st.expander("🔧 Debug"):
+        st.write("Pipeline running:", pipeline_running)
+        st.write("WLK auto-launch:", config.WLK_AUTO_LAUNCH)
+        st.write("WLK backend:", config.WLK_BACKEND)
+        st.write("WLK model:", config.WLK_MODEL)
+        st.write("Gemini comparison:", config.ENABLE_GEMINI_COMPARISON)
+        aw = st.session_state.acoustic_worker
+        if aw:
+            st.write("Acoustic windows extracted:", aw.windows_extracted)
+        ua = st.session_state.utterance_aggregator
+        if ua:
+            st.write("Utterances emitted:", ua.emitted_count)
+        if bm:
+            st.write("Rolling baseline windows:", len(bm._rolling))
+
+# ---- Error banner --------------------------------------------------------
+if st.session_state.error:
+    st.error(st.session_state.error)
+
+# ---- Main title ----------------------------------------------------------
+st.title("🔊 Audio + Linguistic Agitation Dashboard")
+st.caption(
+    "Local, real-time, explainable audio-linguistic cue detection. "
+    "CMAI-inspired labels are decision support only — not a clinical diagnosis."
+)
 
 
+# ---- Live fragment (polls every second) ----------------------------------
 @st.fragment(run_every=1.0)
-def live_results() -> None:
-    """Streamlit reruns this fragment every second without restarting audio capture."""
-    consume_chunks()
-    render_results()
+def _live() -> None:
+    if st.session_state.pipeline is not None:
+        _consume()
+    _render()
 
 
-live_results()
+_live()

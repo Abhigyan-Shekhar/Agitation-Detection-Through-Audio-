@@ -1,452 +1,207 @@
+"""Audio capture and fan-out to downstream processing queues.
+
+Responsibilities
+----------------
+* Open a sounddevice InputStream at 16 kHz mono float32.
+* On every callback, put a copy of the raw float32 frame on two queues:
+    - ``acoustic_queue``  → acoustic feature worker
+    - ``wlk_queue``       → WhisperLiveKit PCM16 sender
+* Track frame timestamps so downstream workers can align features with
+  transcript segments.
+* Expose start() / stop() for the dashboard to call.
+
+What this module does NOT do
+-----------------------------
+* No VAD gating — WhisperLiveKit handles its own VAD internally.
+* No overlapping window buffering — that moved to acoustic_features.py.
+* No transcription — that moved to whisperlivekit_client.py.
+"""
+from __future__ import annotations
+
 import logging
 import queue
 import threading
 import time
+from typing import NamedTuple
 
-import librosa
 import numpy as np
-import sounddevice as sd
-import torch
 
+try:
+    import sounddevice as sd  # type: ignore[import-untyped]
+except ImportError:
+    sd = None  # type: ignore[assignment]
+
+import config
 
 logger = logging.getLogger(__name__)
 
-try:
-    from faster_whisper import WhisperModel  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover - optional runtime dependency
-    WhisperModel = None  # type: ignore[assignment]
 
+class TimestampedFrame(NamedTuple):
+    """A single audio callback chunk with wall-clock metadata."""
 
-class FeatureTranscriptionProcessor:
-    def __init__(
-        self,
-        sample_rate=16000,
-        whisper_model=None,
-        whisper_model_factory=None,
-        model_size="tiny",
-        device="cpu",
-        compute_type="int8",
-        language=None,
-    ):
-        self.sample_rate = sample_rate
-        self._whisper_model = whisper_model
-        self._whisper_model_factory = whisper_model_factory
-        self._model_size = model_size
-        self._device = device
-        self._compute_type = compute_type
-        self._language = language
-
-    def _sanitize_finite_float(self, value, default=0.0):
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return default
-        if not np.isfinite(number):
-            return default
-        return number
-
-    def extract_acoustic_features(self, audio_segment, sample_rate=None):
-        audio = np.asarray(audio_segment, dtype=np.float32)
-        sample_rate = self.sample_rate if sample_rate is None else sample_rate
-
-        if audio.size == 0 or audio.size < 4:
-            return {
-                "rms_energy": 0.0,
-                "pitch_mean": 0.0,
-                "pitch_variance": 0.0,
-                "zero_crossing_rate": 0.0,
-                "spectral_centroid": 0.0,
-            }
-
-        rms_energy = float(np.mean(librosa.feature.rms(y=audio)))
-        zero_crossing_rate = float(np.mean(librosa.feature.zero_crossing_rate(audio)))
-        spectral_centroid = float(
-            np.mean(librosa.feature.spectral_centroid(y=audio, sr=sample_rate))
-        )
-
-        f0, voiced_flag, _ = librosa.pyin(audio, fmin=50.0, fmax=400.0, sr=sample_rate)
-        voiced_f0 = f0[voiced_flag & np.isfinite(f0)]
-        if voiced_f0.size == 0:
-            pitch_mean = 0.0
-            pitch_variance = 0.0
-        else:
-            pitch_mean = float(np.mean(voiced_f0))
-            pitch_variance = float(np.var(voiced_f0))
-
-        return {
-            "rms_energy": self._sanitize_finite_float(rms_energy),
-            "pitch_mean": self._sanitize_finite_float(pitch_mean),
-            "pitch_variance": self._sanitize_finite_float(pitch_variance),
-            "zero_crossing_rate": self._sanitize_finite_float(zero_crossing_rate),
-            "spectral_centroid": self._sanitize_finite_float(spectral_centroid),
-        }
-
-    def _get_whisper_model(self):
-        if self._whisper_model is not None:
-            return self._whisper_model
-
-        if self._whisper_model_factory is not None:
-            self._whisper_model = self._whisper_model_factory()
-            return self._whisper_model
-
-        if WhisperModel is None:
-            raise ImportError("faster-whisper is not installed")
-
-        self._whisper_model = WhisperModel(
-            self._model_size,
-            device=self._device,
-            compute_type=self._compute_type,
-        )
-        return self._whisper_model
-
-    def transcribe(self, audio_segment, sample_rate=None):
-        audio = np.asarray(audio_segment, dtype=np.float32)
-        if audio.size == 0:
-            return {
-                "text": "",
-                "segments": [],
-                "language": self._language,
-            }
-
-        try:
-            model = self._get_whisper_model()
-        except ImportError:
-            return {
-                "text": "",
-                "segments": [],
-                "language": self._language,
-            }
-
-        if hasattr(model, "transcribe"):
-            try:
-                result = model.transcribe(
-                    audio, language=self._language, beam_size=1, vad_filter=False
-                )
-            except TypeError:
-                result = model.transcribe(audio, language=self._language)
-
-            if isinstance(result, tuple):
-                segments, info = result
-            elif isinstance(result, dict):
-                segments = result.get("segments", [])
-                info = result.get("info")
-                text = result.get("text", "")
-                return {
-                    "text": text,
-                    "segments": self._normalize_segments(segments),
-                    "language": getattr(info, "language", self._language),
-                }
-            else:
-                segments = []
-                info = None
-
-            return {
-                "text": self._extract_text(segments),
-                "segments": self._normalize_segments(segments),
-                "language": getattr(info, "language", self._language),
-            }
-
-        return {
-            "text": "",
-            "segments": [],
-            "language": self._language,
-        }
-
-    def _normalize_segments(self, segments):
-        normalized = []
-        for segment in segments:
-            if isinstance(segment, dict):
-                normalized.append(segment)
-                continue
-
-            normalized.append(
-                {
-                    "text": getattr(segment, "text", ""),
-                    "start": self._sanitize_finite_float(
-                        getattr(segment, "start", 0.0)
-                    ),
-                    "end": self._sanitize_finite_float(getattr(segment, "end", 0.0)),
-                    "confidence": self._confidence_from_segment(segment),
-                }
-            )
-        return normalized
-
-    def _extract_text(self, segments):
-        if not segments:
-            return ""
-        parts = []
-        for segment in segments:
-            if isinstance(segment, dict):
-                text = segment.get("text", "")
-            else:
-                text = getattr(segment, "text", "")
-            if text:
-                parts.append(text)
-        return " ".join(parts).strip()
-
-    def _confidence_from_segment(self, segment):
-        confidence = getattr(segment, "avg_log_prob", None)
-        if confidence is None:
-            return None
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(confidence):
-            return None
-        return float(np.exp(confidence))
-
-    def process(self, audio_segment, sample_rate=None):
-        features = self.extract_acoustic_features(
-            audio_segment, sample_rate=sample_rate
-        )
-        transcription = self.transcribe(audio_segment, sample_rate=sample_rate)
-        return {
-            "acoustic_features": features,
-            "transcript": transcription.get("text", ""),
-            "transcript_details": transcription,
-        }
+    data: np.ndarray   # float32, shape (frame_size,)
+    timestamp: float   # Unix timestamp of the frame's leading edge
 
 
 class AudioPipeline:
+    """Captures microphone audio and fans frames out to downstream workers.
+
+    Parameters
+    ----------
+    sample_rate:
+        Capture sample rate in Hz. Must match WhisperLiveKit's expected input.
+    frame_size:
+        Number of samples per sounddevice callback (one ``TimestampedFrame``).
+    max_queue_size:
+        Maximum frames held in each output queue before old frames are dropped.
+        At 512 samples / 16 000 Hz = ~32 ms per frame, 1 second = ~31 frames.
+        Default 200 gives roughly a 6-second slack buffer.
+    """
+
     def __init__(
         self,
-        sample_rate=16000,
-        frame_size=512,
-        window_seconds=5.0,
-        overlap_seconds=2.5,
-        vad_threshold=0.5,
-        speech_ratio_threshold=0.3,
-        load_vad=True,
-        person2_processor=None,
-    ):
-
+        sample_rate: int = config.SAMPLE_RATE,
+        frame_size: int = config.FRAME_SIZE,
+        max_queue_size: int = 200,
+    ) -> None:
         self.sample_rate = sample_rate
         self.frame_size = frame_size
 
-        # Calculate frame counts
-        self.window_frames = int((window_seconds * sample_rate) / frame_size)
-        self.overlap_frames = int((overlap_seconds * sample_rate) / frame_size)
-        self.emit_interval_frames = self.window_frames - self.overlap_frames
-
-        self.vad_threshold = vad_threshold
-        self.speech_ratio_threshold = speech_ratio_threshold
-
-        # Queues
-        self.audio_queue = queue.Queue()
-        self.output_queue = queue.Queue()
-
-        # Buffers
-        self.frame_buffer = []
-        self.vad_buffer = []
-
-        # State
-        self.is_running = False
-        self.process_thread = None
-        self.stream = None
-        self.frames_since_last_emit = 0
-
-        self.person2_processor = person2_processor or FeatureTranscriptionProcessor(
-            sample_rate=self.sample_rate
+        # Output queues — bounded to prevent unbounded memory growth
+        self.acoustic_queue: queue.Queue[TimestampedFrame] = queue.Queue(
+            maxsize=max_queue_size
         )
-        self.vad_model = None
-        self.get_speech_timestamps = None
-        self.save_audio = None
-        self.read_audio = None
-        self.VADIterator = None
-        self.collect_chunks = None
-
-        if load_vad:
-            self._load_vad_model()
-
-    def _load_vad_model(self):
-        if torch is None:
-            self.vad_model = None
-            return
-
-        print("Loading Silero VAD model...")
-        self.vad_model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=False,
+        self.wlk_queue: queue.Queue[TimestampedFrame] = queue.Queue(
+            maxsize=max_queue_size
         )
-        (
-            self.get_speech_timestamps,
-            self.save_audio,
-            self.read_audio,
-            self.VADIterator,
-            self.collect_chunks,
-        ) = utils
 
-        self.vad_model.reset_states()
-        print("Silero VAD loaded.")
+        self._stream: sd.InputStream | None = None
+        self._is_running: bool = False
+        self._dropped_frames: int = 0
 
-    def _audio_callback(self, indata, frames, time_info, status):
-        if status:
-            print(f"Audio Callback Status: {status}")
+        # Monotonic frame counter for diagnostics
+        self._frame_index: int = 0
 
-        audio_data = indata.flatten()
-        self.audio_queue.put(audio_data.copy())
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def _preprocess_frame(self, frame):
-        """Apply DC offset removal."""
-        frame = frame - np.mean(frame)
-        return frame
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
 
-    def _run_vad(self, frame):
-        if self.vad_model is None:
-            return np.mean(np.abs(frame)) > 1e-4
+    @property
+    def dropped_frames(self) -> int:
+        return self._dropped_frames
 
-        if torch is None:
-            speech_prob = self.vad_model(frame, self.sample_rate)
-            if hasattr(speech_prob, "item"):
-                return speech_prob.item() >= self.vad_threshold
-            return float(speech_prob) >= self.vad_threshold
-
-        tensor_frame = torch.from_numpy(frame).float()
-        with torch.no_grad():
-            speech_prob = self.vad_model(tensor_frame, self.sample_rate).item()
-        return speech_prob >= self.vad_threshold
-
-    def _process_loop(self):
-        while self.is_running:
-            try:
-                frame = self.audio_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            # Preserve original frame for the buffer to prevent jagged 31Hz discontinuities
-            # when the 5-second chunk is later concatenated.
-            original_frame = frame
-            
-            frame = self._preprocess_frame(frame)
-            is_speech = self._run_vad(frame)
-
-            self.frame_buffer.append(original_frame)
-            self.vad_buffer.append(is_speech)
-
-            if len(self.frame_buffer) > self.window_frames:
-                self.frame_buffer.pop(0)
-                self.vad_buffer.pop(0)
-
-            self.frames_since_last_emit += 1
-
-            if (
-                self.frames_since_last_emit >= self.emit_interval_frames
-                and len(self.frame_buffer) == self.window_frames
-            ):
-                self._evaluate_and_emit()
-                self.frames_since_last_emit = 0
-
-    def _evaluate_and_emit(self):
-        speech_frames = sum(self.vad_buffer)
-        speech_ratio = speech_frames / self.window_frames
-
-        chunk_data = np.concatenate(self.frame_buffer)
-        
-        # Remove DC offset cleanly across the entire 5-second chunk
-        chunk_data = chunk_data - np.mean(chunk_data)
-
-        # Do not dynamically peak-normalize the chunk. Peak normalizing 
-        # background noise to 1.0 causes Whisper to hallucinate and ruins 
-        # true RMS energy measurements for agitation detection.
-        normalized_chunk = chunk_data
-
-        if speech_ratio >= self.speech_ratio_threshold:
-            print(f"Emitting chunk! Speech ratio: {speech_ratio:.2f}")
-            logger.info("Speech window accepted; starting feature and transcription processing")
-            try:
-                person2_output = self.person2_processor.process(
-                    normalized_chunk, sample_rate=self.sample_rate
-                )
-            except Exception:
-                # Without this boundary an exception terminates the daemon worker
-                # and makes the dashboard appear to be waiting indefinitely.
-                logger.exception("Feature/transcription processing failed; chunk was not queued")
-                return
-
-            logger.info("Feature/transcription processing completed; enqueueing result")
-            output = {
-                "audio": normalized_chunk,
-                "speech_ratio": speech_ratio,
-                "timestamp": time.time(),
-                "duration": len(normalized_chunk) / self.sample_rate,
-                "acoustic_features": person2_output["acoustic_features"],
-                "transcript": person2_output["transcript"],
-                "transcript_details": person2_output["transcript_details"],
-            }
-            self.output_queue.put(output)
-            logger.info("Output queue put reached; queue size is now %s", self.output_queue.qsize())
-        else:
-            print(
-                f"Discarding chunk (speech ratio {speech_ratio:.2f} < {self.speech_ratio_threshold})"
-            )
-
-    def start(self):
-        if self.is_running:
+    def start(self) -> None:
+        """Open the microphone stream and begin fanning frames to queues."""
+        if self._is_running:
+            logger.warning("AudioPipeline.start() called while already running")
             return
-
-        self.is_running = True
-
-        self.frame_buffer.clear()
-        self.vad_buffer.clear()
-        self.frames_since_last_emit = 0
-        if self.vad_model is not None and hasattr(self.vad_model, "reset_states"):
-            self.vad_model.reset_states()
-
-        while not self.audio_queue.empty():
-            self.audio_queue.get()
-        while not self.output_queue.empty():
-            self.output_queue.get()
-
-        self.process_thread = threading.Thread(target=self._process_loop, daemon=True)
-        self.process_thread.start()
 
         if sd is None:
-            raise RuntimeError("sounddevice is not installed")
+            raise RuntimeError(
+                "sounddevice is not installed. Run: pip install sounddevice"
+            )
 
-        self.stream = sd.InputStream(
+        self._dropped_frames = 0
+        self._frame_index = 0
+        self._flush_queues()
+        self._is_running = True
+
+        self._stream = sd.InputStream(
             samplerate=self.sample_rate,
-            channels=1,
+            channels=config.CHANNELS,
             blocksize=self.frame_size,
-            dtype="float32",
+            dtype=config.DTYPE,
             callback=self._audio_callback,
         )
-        self.stream.start()
-        print("Audio pipeline started.")
+        self._stream.start()
+        logger.info(
+            "AudioPipeline started — sample_rate=%d frame_size=%d",
+            self.sample_rate,
+            self.frame_size,
+        )
 
-    def stop(self):
-        if not self.is_running:
+    def stop(self) -> None:
+        """Stop microphone capture."""
+        if not self._is_running:
             return
 
-        self.is_running = False
+        self._is_running = False
 
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
-        if self.process_thread:
-            self.process_thread.join()
+        logger.info(
+            "AudioPipeline stopped — total dropped frames: %d",
+            self._dropped_frames,
+        )
 
-        print("Audio pipeline stopped.")
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
+    def _audio_callback(
+        self,
+        indata: np.ndarray,
+        frames: int,
+        time_info: object,
+        status: object,
+    ) -> None:
+        """sounddevice calls this on every audio block (runs in a C thread)."""
+        if status:
+            logger.debug("sounddevice status: %s", status)
 
-if __name__ == "__main__":
-    pipeline = AudioPipeline()
-    try:
-        pipeline.start()
-        print("Listening for 15 seconds... Speak into your microphone!")
-        start_time = time.time()
-        while time.time() - start_time < 15:
+        audio = indata[:, 0].copy()  # mono, float32
+        ts = time.time()
+        frame = TimestampedFrame(data=audio, timestamp=ts)
+        self._frame_index += 1
+
+        # Fan out to both queues — drop if full rather than block the callback
+        for q in (self.acoustic_queue, self.wlk_queue):
             try:
-                chunk = pipeline.output_queue.get(timeout=0.5)
-                print(
-                    f"Main Thread received chunk: {chunk['duration']}s, speech_ratio: {chunk['speech_ratio']:.2f}"
+                q.put_nowait(frame)
+            except queue.Full:
+                self._dropped_frames += 1
+                logger.debug(
+                    "Queue full — frame %d dropped (total dropped: %d)",
+                    self._frame_index,
+                    self._dropped_frames,
                 )
-            except queue.Empty:
-                pass
-    except KeyboardInterrupt:
-        print("Interrupted by user.")
+
+    def _flush_queues(self) -> None:
+        """Drain all queues before (re)starting to avoid stale data."""
+        for q in (self.acoustic_queue, self.wlk_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke-test entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import time as _time
+
+    logging.basicConfig(level=logging.INFO)
+    pipeline = AudioPipeline()
+    pipeline.start()
+    print("Listening for 5 s — check that frames appear on both queues…")
+    try:
+        _time.sleep(5)
     finally:
         pipeline.stop()
+
+    acoustic_size = pipeline.acoustic_queue.qsize()
+    wlk_size = pipeline.wlk_queue.qsize()
+    print(
+        f"acoustic_queue={acoustic_size} frames, "
+        f"wlk_queue={wlk_size} frames, "
+        f"dropped={pipeline.dropped_frames}"
+    )

@@ -1,4 +1,13 @@
-"""Person 3: Gemini linguistic analysis and score fusion."""
+"""Person 3: Gemini linguistic analysis (optional ablation module).
+
+This module is DISABLED from the primary execution path.
+To enable for ablation experiments, set:
+    ENABLE_GEMINI_COMPARISON=true
+
+When enabled, the dashboard runs both the deterministic rule-based
+pipeline and Gemini in parallel, allowing side-by-side comparison.
+Never set this true in production — it adds latency and API cost.
+"""
 from __future__ import annotations
 
 import json
