@@ -1,0 +1,95 @@
+# Audio behaviour taxonomy and event data dictionary
+
+This document describes the canonical audio-only behaviour taxonomy used by the prototype, the deterministic mapping rules, and the structured event schema emitted by the pipeline.
+
+## 1. Purpose
+
+The system is intentionally restricted to behaviours that can be inferred from audio alone. It does not infer physical behaviours such as hitting, kicking, pacing, pushing, or grabbing from audio.
+
+The supported labels are audio-observable behaviours that are commonly used in agitation review workflows:
+
+- Screaming
+- Cursing / verbal aggression
+- Repetitive sentences or questions
+- Making strange noises
+- Complaining
+- Negativism
+- Constant requests for attention or help
+
+## 2. Canonical behaviour catalogue
+
+Each behaviour has:
+
+- a canonical display label
+- an internal code used by the implementation
+- one or more aliases that can be matched from transcripts or notes
+- a CMAI-style mapping label
+- a review-required flag when the evidence is ambiguous or weak
+
+| Canonical label | Internal code | Typical aliases | CMAI-style mapping label | Review required? |
+| --- | --- | --- | --- | --- |
+| Screaming | AUDIO_SCREAMING | scream, screaming, shout, shouting, yell, yelling | Verbally agitated: screaming/shouting | No |
+| Cursing / verbal aggression | AUDIO_CURSING | curse, cursing, swear, swearing, insult, insulting, verbal aggression | Verbally agitated: verbal aggression | No |
+| Repetitive sentences or questions | AUDIO_REPETITIVE | repetitive, repeat, repeated, again, again and again, same question | Verbally non-aggressive: repetitive questioning | No |
+| Making strange noises | AUDIO_STRANGE_NOISE | strange noise, weird noise, groan, grunt, moan | Verbally non-aggressive: strange noises | No |
+| Complaining | AUDIO_COMPLAINING | complain, complaining, gripe, grumbling | Verbally non-aggressive: complaining | No |
+| Negativism | AUDIO_NEGATIVISM | negative, negativity, no, refuse, refusal, resistant | Verbally non-aggressive: negativism/refusal | No |
+| Constant requests for attention or help | AUDIO_CONSTANT_REQUEST | constant requests, attention, help, help me, please help | Verbally non-aggressive: repeated requests for attention/help | No |
+
+## 3. Deterministic mapping rules
+
+The mapping layer is deterministic and does not rely on generative inference for the final behaviour label.
+
+Rules:
+
+1. Normal speech or benign conversational text is not mapped to a behaviour label.
+2. Strongly matching keywords or phrases trigger a canonical behaviour.
+3. Ambiguous content that mentions a behaviour-like phrase without enough evidence is flagged as review required.
+4. Unsupported or physical-only behaviour descriptions are not mapped to the audio taxonomy.
+
+Examples:
+
+- “The resident is speaking normally” → no behaviour mapped
+- “Why are you ignoring me?” → mapped to Complaining or review required depending on the evidence strength
+- “The resident keeps shouting” → mapped to Screaming
+- “The resident is cursing loudly” → mapped to Cursing / verbal aggression
+
+## 4. Review-required behaviour handling
+
+Some observations may mention a possible behaviour but not provide enough confidence for an automatic mapping. In those cases the system sets the mapping status to review_required rather than forcing a label.
+
+Examples include:
+
+- vague references such as “something odd” without a clear audio cue
+- mixed or contradictory descriptions
+- unsupported physical-behaviour descriptions
+
+## 5. Event schema
+
+The pipeline emits structured behaviour events through the shared event model.
+
+### BehaviourEvent
+
+| Field | Type | Description |
+| --- | --- | --- |
+| code | str | Internal behaviour code such as AUDIO_SCREAMING |
+| label | str | Canonical human-readable label |
+| cmai_label | str | CMAI-style mapping label |
+| mapping_status | str | One of mapped, review_required, or unclassified |
+| timestamp | datetime | Timestamp for the utterance or event |
+| raw_observation | str | Original observation text that triggered the mapping |
+
+### FusedResult
+
+| Field | Type | Description |
+| --- | --- | --- |
+| utterance_id | str | Identifier for the fused utterance |
+| transcript | str | Final transcript for the utterance |
+| acoustic_score | float | Acoustic distress score derived from audio features |
+| linguistic_score | float | Linguistic distress score derived from transcript features |
+| fused_score | float | Combined score after fusion |
+| behaviour_events | list[BehaviourEvent] | Structured behaviour events associated with the utterance |
+
+## 6. Notes for dashboard and downstream consumers
+
+Downstream components should prefer the structured behaviour events over free-form labels. This keeps the behaviour taxonomy explicit, auditable, and consistent across the dashboard, person3/Gemini integration, and tests.
