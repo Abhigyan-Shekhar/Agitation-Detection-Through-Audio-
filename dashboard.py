@@ -160,11 +160,10 @@ def _start_pipeline() -> None:
     # 5. Acoustic worker
     acoustic_worker = AcousticWorker(acoustic_queue=pipeline.acoustic_queue)
     # Feed new windows into baseline manager automatically
-    _original_run = acoustic_worker._run
+    bm: BaselineManager = st.session_state.baseline_manager
 
     def _patched_run():
         import time as _t
-        bm: BaselineManager = st.session_state.baseline_manager
         while not acoustic_worker._stop_event.is_set():
             acoustic_worker._drain_queue()
             now = _t.time()
