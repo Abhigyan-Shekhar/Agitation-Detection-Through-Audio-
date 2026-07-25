@@ -91,7 +91,7 @@ class TestBehaviourClassifier:
             linguistic=linguistic,
         )
         labels = self._classify(result)
-        assert "Possible verbal aggression" not in labels
+        assert "Cursing / verbal aggression" not in labels
 
     # ---- Shouted neutral → Screaming but not verbal aggression --------
 
@@ -121,8 +121,8 @@ class TestBehaviourClassifier:
         result.linguistic_features = linguistic
         result.acoustic_features = acoustic
         labels = self._classify(result)
-        assert "Possible verbal aggression" not in labels
-        assert "Screaming/shouting" in labels
+        assert "Cursing / verbal aggression" not in labels
+        assert "Screaming" in labels
 
     # ---- Calm threat → threat detected, not necessarily verbal aggression
 
@@ -139,7 +139,7 @@ class TestBehaviourClassifier:
         )
         labels = self._classify(result)
         # Acoustic is below verbal aggression threshold (0.65)
-        assert "Possible verbal aggression" not in labels
+        assert "Cursing / verbal aggression" not in labels
 
     # ---- Shouting + explicit threat → verbal aggression ---------------
 
@@ -169,7 +169,7 @@ class TestBehaviourClassifier:
         result.linguistic_features = linguistic
         result.acoustic_features = acoustic
         labels = self._classify(result)
-        assert "Possible verbal aggression" in labels
+        assert "Cursing / verbal aggression" in labels
 
     # ---- Repeated question → labelled --------------------------------
 
@@ -182,7 +182,7 @@ class TestBehaviourClassifier:
             smoothed_score=0.40,
         )
         labels = self._classify(result)
-        assert "Repeated questioning" in labels
+        assert "Repetitive sentences or questions" in labels
 
     # ---- Repeated verbalization --------------------------------------
 
@@ -192,7 +192,7 @@ class TestBehaviourClassifier:
         )
         result = _make_result(linguistic=linguistic, smoothed_score=0.45)
         labels = self._classify(result)
-        assert "Repetitive verbalization" in labels
+        assert "Repetitive sentences or questions" in labels
 
     # ---- Distressed verbalization ------------------------------------
 
@@ -204,7 +204,7 @@ class TestBehaviourClassifier:
             linguistic=linguistic,
         )
         labels = self._classify(result)
-        assert "Distressed/urgent verbalization" in labels
+        assert "Unmapped audio behaviour" in labels
 
     # ---- Multi-label -------------------------------------------------
 
@@ -220,8 +220,8 @@ class TestBehaviourClassifier:
             linguistic=linguistic,
         )
         labels = self._classify(result)
-        assert "Repeated questioning" in labels
-        assert "Distressed/urgent verbalization" in labels
+        assert "Repetitive sentences or questions" in labels
+        assert "Unmapped audio behaviour" in labels
 
     # ---- No physical labels ------------------------------------------
 

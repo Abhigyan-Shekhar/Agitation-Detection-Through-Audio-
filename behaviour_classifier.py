@@ -1,7 +1,7 @@
 """Multi-label CMAI-inspired behaviour classifier.
 
 Classifies observable audio behaviours from fused acoustic and
-linguistic scores. Returns a list of labels and supporting evidence
+linguistic scores. Returns a list of canonical labels and supporting evidence
 for each active label.
 
 IMPORTANT: Only behaviours detectable from audio are classified.
@@ -10,12 +10,6 @@ require video or wearable data and are NOT produced here.
 
 The output is described as "CMAI-inspired" — not as a clinical CMAI
 score. The system observes acoustic and linguistic cues only.
-
-Rule design
------------
-Each rule has a unique ``label`` and a ``check(result) → bool`` method.
-Rules are evaluated in a fixed priority order.
-Every active rule also produces an evidence string for the UI.
 """
 from __future__ import annotations
 
@@ -23,6 +17,7 @@ import logging
 from dataclasses import dataclass
 
 import config
+from audio_behaviour_taxonomy import build_behaviour_event, map_observed_behaviour
 from event_models import AcousticFeatureWindow, FusedResult, LinguisticFeatures
 
 logger = logging.getLogger(__name__)
@@ -34,7 +29,14 @@ class BehaviourLabel:
 
     label: str
     evidence: str
-    confidence: float       # 0–1 rough indicator (not a calibrated probability)
+    confidence: float
+
+
+def _canonical_label(label: str) -> str:
+    if label == "No audio agitation detected":
+        return label
+    mapped = map_observed_behaviour(label)
+    return mapped.canonical_label if mapped.mapping_status == "mapped" else "Unmapped audio behaviour"
 
 
 # ---------------------------------------------------------------------------
@@ -52,15 +54,14 @@ def _check_screaming(
     energy_contrib = result.acoustic_contributions.get("energy_above_baseline", 0.0)
     burst_contrib = result.acoustic_contributions.get("energy_burst", 0.0)
 
-    # Use contribution magnitudes as a proxy for z-score magnitude
     energy_high = energy_contrib >= (config.ACOUSTIC_WEIGHTS["energy_z"] * config.BEHAVIOUR_ENERGY_Z_SHOUT / config.Z_CLIP)
     burst_high = burst_contrib >= (config.ACOUSTIC_WEIGHTS["energy_burst_z"] * config.BEHAVIOUR_ENERGY_BURST_SHOUT)
-    voiced_present = acoustic.voiced_ratio >= 0.30   # must be actual speech, not just noise
+    voiced_present = acoustic.voiced_ratio >= 0.30
 
     if energy_high and burst_high and voiced_present:
         conf = min(1.0, (energy_contrib + burst_contrib) * 4.0)
         return BehaviourLabel(
-            label="Screaming/shouting",
+            label=_canonical_label("Screaming/shouting"),
             evidence=(
                 f"Energy far above baseline (contribution={energy_contrib:.3f}), "
                 f"high energy burst (contribution={burst_contrib:.3f}), "
@@ -80,7 +81,6 @@ def _check_verbal_aggression(
         return None
 
     threat_ok = linguistic.threat_score >= config.BEHAVIOUR_VERBAL_AGGR_THREAT
-    # Profanity + imperative as alternative trigger
     profanity_imperative_ok = (
         linguistic.profanity_score >= 0.30
         and linguistic.imperative_score >= 0.50
@@ -94,9 +94,9 @@ def _check_verbal_aggression(
         if threat_ok:
             triggers.append(f"threat score={linguistic.threat_score:.2f}")
         if profanity_imperative_ok:
-            triggers.append(f"profanity+imperative")
+            triggers.append("profanity+imperative")
         return BehaviourLabel(
-            label="Possible verbal aggression",
+            label=_canonical_label("Possible verbal aggression"),
             evidence=(
                 f"Acoustic score={result.acoustic_score:.2f}, "
                 f"negative sentiment={linguistic.negative_sentiment:.2f}, "
@@ -115,7 +115,7 @@ def _check_repetitive_verbalization(
         return None
     if linguistic.repetition_score >= config.BEHAVIOUR_REPETITION_THRESHOLD:
         return BehaviourLabel(
-            label="Repetitive verbalization",
+            label=_canonical_label("Repetitive verbalization"),
             evidence=f"Repetition score={linguistic.repetition_score:.2f} (threshold {config.BEHAVIOUR_REPETITION_THRESHOLD})",
             confidence=round(min(1.0, linguistic.repetition_score), 3),
         )
@@ -130,7 +130,7 @@ def _check_repeated_questioning(
         return None
     if linguistic.question_repetition_score >= config.BEHAVIOUR_Q_REP_THRESHOLD:
         return BehaviourLabel(
-            label="Repeated questioning",
+            label=_canonical_label("Repeated questioning"),
             evidence=f"Question repetition score={linguistic.question_repetition_score:.2f}",
             confidence=round(min(1.0, linguistic.question_repetition_score), 3),
         )
@@ -144,14 +144,12 @@ def _check_repeated_requests(
     """Repeated requests for attention (help, go home, give me, etc.)."""
     if linguistic is None:
         return None
-    # We use repetition_score as a proxy here; a dedicated request_repetition
-    # sub-score can be wired in once LinguisticAnalyzer returns it separately.
     rep = linguistic.repetition_score
     urgency = linguistic.urgency_score
     combined = 0.5 * rep + 0.5 * urgency
     if combined >= config.BEHAVIOUR_REQUEST_REP_THRESHOLD:
         return BehaviourLabel(
-            label="Repeated requests",
+            label=_canonical_label("Repeated requests"),
             evidence=f"Combined request+urgency score={combined:.2f}",
             confidence=round(min(1.0, combined), 3),
         )
@@ -170,7 +168,7 @@ def _check_distressed_verbalization(
     ):
         conf = min(1.0, (linguistic.urgency_score + result.acoustic_score) / 2.0)
         return BehaviourLabel(
-            label="Distressed/urgent verbalization",
+            label=_canonical_label("Distressed/urgent verbalization"),
             evidence=(
                 f"Urgency score={linguistic.urgency_score:.2f}, "
                 f"acoustic score={result.acoustic_score:.2f}"
@@ -180,18 +178,9 @@ def _check_distressed_verbalization(
     return None
 
 
-# ---------------------------------------------------------------------------
-# Classifier
-# ---------------------------------------------------------------------------
-
 class BehaviourClassifier:
-    """Apply multi-label behaviour rules to a ``FusedResult``.
+    """Apply multi-label behaviour rules to a ``FusedResult``."""
 
-    Call ``classify(result)`` after ``ScoreFusion.fuse()`` to populate
-    ``result.behaviours`` with detected behaviour labels.
-    """
-
-    # Evaluation order matters: screaming should appear before verbal aggression
     _RULES = [
         _check_screaming,
         _check_verbal_aggression,
@@ -222,10 +211,18 @@ class BehaviourClassifier:
                 )
             )
 
-        # Attach labels and evidence to the result
         result.behaviours = [b.label for b in detected]
+        result.behaviour_events = []
+        for behaviour in detected:
+            if behaviour.label == "No audio agitation detected":
+                continue
+            event = build_behaviour_event(
+                raw_behaviour=behaviour.label,
+                timestamp=getattr(result.utterance, "end_time", None),
+                notes=behaviour.evidence,
+            )
+            result.behaviour_events.append(event)
 
-        # Merge behaviour evidence into linguistic contributions for the UI
         for b in detected:
             result.linguistic_contributions[f"[{b.label}]"] = round(b.confidence, 4)
 

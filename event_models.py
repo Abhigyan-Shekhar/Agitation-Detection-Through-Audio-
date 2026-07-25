@@ -9,6 +9,29 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+@dataclass
+class BehaviourEvent:
+    """Structured representation of a detected behaviour event."""
+
+    event_id: str | None = None
+    internal_code: str | None = None
+    behaviour_type: str | None = None
+    canonical_label: str = "Unmapped audio behaviour"
+    cmai_category: str | None = None
+    person: str | None = None
+    timestamp: Any = None
+    location: str | None = None
+    severity: str | None = None
+    duration: float | None = None
+    trigger: str | None = None
+    intervention: str | None = None
+    outcome: str | None = None
+    notes: str | None = None
+    modality: str = "audio"
+    raw_detected_behaviour: str | None = None
+    mapping_status: str = "review_required"
+
+
 # ---------------------------------------------------------------------------
 # Acoustic branch
 # ---------------------------------------------------------------------------
@@ -116,6 +139,7 @@ class FusedResult:
 
     # Multi-label behaviour output
     behaviours: list[str] = field(default_factory=list)
+    behaviour_events: list[BehaviourEvent] = field(default_factory=list)
 
     # Per-feature contributions for the explainability panel
     acoustic_contributions: dict[str, float] = field(default_factory=dict)

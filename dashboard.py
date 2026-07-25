@@ -299,6 +299,37 @@ def _consume() -> None:
         pass
 
 
+def _render_behaviour_events(result: FusedResult) -> None:
+    """Render canonical behaviour events in a compact, research-friendly layout."""
+    if result.behaviour_events:
+        st.subheader("Detected Behaviours")
+        for event in result.behaviour_events:
+            with st.container():
+                st.markdown(f"**{event.canonical_label}**")
+                details: list[str] = []
+                if event.internal_code:
+                    details.append(f"Internal code: {event.internal_code}")
+                if event.cmai_category:
+                    details.append(f"CMAI: {event.cmai_category}")
+                if event.mapping_status:
+                    details.append(f"Mapping status: {event.mapping_status}")
+                if event.timestamp is not None:
+                    details.append(f"Timestamp: {event.timestamp}")
+                if event.severity:
+                    details.append(f"Severity: {event.severity}")
+                if event.duration is not None:
+                    details.append(f"Duration: {event.duration}")
+                if event.raw_detected_behaviour:
+                    details.append(f"Raw observation: {event.raw_detected_behaviour}")
+                if event.notes:
+                    details.append(f"Notes: {event.notes}")
+                st.caption(" • ".join(details))
+        return
+
+    st.subheader("Detected Behaviours")
+    st.success("No audio agitation detected")
+
+
 def _render() -> None:
     """Render the main dashboard from session state."""
     # ---- Live caption ---------------------------------------------------
@@ -331,14 +362,7 @@ def _render() -> None:
     st.markdown(f"### {severity_color} Severity: **{result.severity}**")
 
     # ---- Behaviour tags ------------------------------------------------
-    if result.behaviours:
-        st.subheader("Detected Behaviours")
-        cols = st.columns(len(result.behaviours))
-        for col, b in zip(cols, result.behaviours):
-            col.info(b)
-    else:
-        st.subheader("Detected Behaviours")
-        st.success("No audio agitation detected")
+    _render_behaviour_events(result)
 
     # ---- Explainability panel -----------------------------------------
     st.subheader("Why was this detected?")

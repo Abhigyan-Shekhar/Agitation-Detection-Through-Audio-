@@ -17,6 +17,8 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Protocol
 
+from audio_behaviour_taxonomy import map_behaviours_to_cmai as _map_behaviours_to_cmai
+
 
 class GeminiClientProtocol(Protocol):
     @property
@@ -71,7 +73,6 @@ def _distress_event_count(features: Mapping[str, Any]) -> int | None:
     if isinstance(events, (list, tuple, set)):
         return len(events)
 
-    # Optional generic event lists can be supplied by a later upstream detector.
     events = features.get("events")
     if not isinstance(events, (list, tuple, set)):
         return None
@@ -94,24 +95,21 @@ def compute_acoustic_score(acoustic_features: Mapping[str, Any] | None) -> float
 
     rms_energy = _finite_nonnegative(features.get("rms_energy"))
     if rms_energy is not None:
-        # Normalized pipeline audio: RMS >= 0.30 is treated as high energy.
         weighted_signals.append((_clamp_unit(rms_energy / 0.30), 0.35))
 
     pitch_variance = _finite_nonnegative(features.get("pitch_variance"))
     if pitch_variance is not None:
-        # 2,500 Hz^2 corresponds roughly to a 50 Hz pitch standard deviation.
         weighted_signals.append((_clamp_unit(pitch_variance / 2500.0), 0.30))
 
     speech_rate = _finite_nonnegative(
         features.get("speech_rate_wpm", features.get("speech_rate"))
     )
     if speech_rate is not None:
-        # Rates at or below 100 WPM do not raise this agitation heuristic; 220+ do.
         weighted_signals.append((_clamp_unit((speech_rate - 100.0) / 120.0), 0.20))
 
     distress_count = _distress_event_count(features)
     if distress_count is not None:
-        weighted_signals.append((_clamp_unit(distress_count / 3.0), 0.15))
+        weighted_signals.append((_clamp_unit(1.0 if distress_count > 0 else 0.0), 0.15))
 
     if not weighted_signals:
         return 0.0
@@ -165,6 +163,7 @@ def _parse_json(text: str) -> Mapping[str, Any]:
 
 class GeminiBehaviourAnalyzer:
     """Gemini adapter. The client can be injected for offline tests."""
+
     def __init__(self, api_key: str | None = None, model: str = "gemini-2.5-flash", client: GeminiClientProtocol | None = None) -> None:
         self.model = model
         if client is not None:
@@ -185,10 +184,12 @@ class GeminiBehaviourAnalyzer:
         if acoustic_score is not None:
             _bounded_score(acoustic_score, "acoustic_score")
         prompt = (
-            "You are a cautious linguistic agitation analyst. This is decision support, not a diagnosis. "
-            "Return exactly one JSON object with emotion (short string), agitation_score (0 to 1), "
-            "behaviours (array of neutral observable labels), and reasoning (brief evidence-based explanation). "
-            "Do not infer facts absent from the input.\n"
+            "You are a cautious audio behaviour analyst for dementia care research. "
+            "This is decision support, not a diagnosis. Only report observable behaviours when the input clearly supports them. "
+            "Prefer neutral, standardised labels such as 'screaming', 'cursing', 'repetitive questioning', "
+            "'complaining', 'negativism', 'constant requests for attention/help', or 'strange noises'. "
+            "Do not infer physical behaviours from audio alone. If the input is normal speech or insufficient evidence, return an empty behaviours list. "
+            "Return exactly one JSON object with emotion (short string), agitation_score (0 to 1), behaviours (array of neutral observable labels), and reasoning (brief evidence-based explanation).\n"
             f"Transcript: {transcript or ''}\nAcoustic features: {json.dumps(dict(acoustic_features or {}), default=str)}\n"
             f"Optional acoustic score: {acoustic_score}"
         )
@@ -199,28 +200,8 @@ class GeminiBehaviourAnalyzer:
         return validate_gemini_response(_parse_json(response.text)).to_dict()
 
 
-CMAI_BEHAVIOUR_MAP = {
-    "pacing": "Physically non-aggressive: pacing/aimless movement",
-    "restlessness": "Physically non-aggressive: general restlessness",
-    "repetitive mannerism": "Physically non-aggressive: repetitive mannerism",
-    "repetitive question": "Verbally non-aggressive: repetitive questioning",
-    "complaining": "Verbally non-aggressive: complaining",
-    "negativism": "Verbally non-aggressive: negativism/refusal",
-    "screaming": "Verbally agitated: screaming/shouting",
-    "verbal aggression": "Verbally agitated: verbal aggression",
-    "threatening": "Verbally agitated: threatening language",
-    "hitting": "Physically aggressive: hitting",
-    "kicking": "Physically aggressive: kicking",
-    "pushing": "Physically aggressive: pushing",
-}
-
-
-def map_behaviours_to_cmai(behaviours: list[str]) -> list[dict[str, str]]:
-    mappings = []
-    for behaviour in behaviours:
-        category = next((label for key, label in CMAI_BEHAVIOUR_MAP.items() if key in behaviour.lower()), "Unmapped observable behaviour (review required)")
-        mappings.append({"behaviour": behaviour, "cmai_category": category})
-    return mappings
+def map_behaviours_to_cmai(behaviours: list[str]) -> list[dict[str, Any]]:
+    return _map_behaviours_to_cmai(behaviours)
 
 
 def compute_final_score(acoustic_score: float, linguistic_score: float) -> float:
@@ -231,4 +212,9 @@ def compute_final_score(acoustic_score: float, linguistic_score: float) -> float
 def analyze_person3(transcript: str | None, acoustic_features: Mapping[str, Any] | None, acoustic_score: float | None = None, analyzer: GeminiBehaviourAnalyzer | None = None) -> dict[str, Any]:
     resolved_acoustic_score = resolve_acoustic_score(acoustic_score, acoustic_features)
     gemini = (analyzer or GeminiBehaviourAnalyzer()).analyze(transcript, acoustic_features, resolved_acoustic_score)
-    return {"acoustic_score": resolved_acoustic_score, "gemini": gemini, "final_score": compute_final_score(resolved_acoustic_score, gemini["agitation_score"]), "cmai_mapping": map_behaviours_to_cmai(gemini["behaviours"])}
+    return {
+        "acoustic_score": resolved_acoustic_score,
+        "gemini": gemini,
+        "final_score": compute_final_score(resolved_acoustic_score, gemini["agitation_score"]),
+        "cmai_mapping": map_behaviours_to_cmai(gemini["behaviours"]),
+    }
