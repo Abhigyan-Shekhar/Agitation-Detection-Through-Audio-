@@ -362,24 +362,38 @@ def _records_dataframe(records: list[dict[str, Any]] | None = None) -> pd.DataFr
 
 def _sidebar_filters(df: pd.DataFrame) -> dict[str, Any]:
     """Render interactive filters and return selected values."""
-    st.sidebar.subheader("🔎 Filters")
+    st.subheader("🔎 Filters")
     residents = sorted(df["resident"].dropna().unique().tolist()) if not df.empty else []
     behaviours = sorted(set(_taxonomy_labels()) | set(df["behaviour"].dropna().unique().tolist())) if not df.empty else _taxonomy_labels()
     severities = sorted(df["severity"].dropna().unique().tolist()) if not df.empty else _severity_options()
     locations = sorted(df["location"].dropna().unique().tolist()) if not df.empty else []
     today = date.today()
     return {
-        "residents": st.sidebar.multiselect("Resident", residents, default=residents, help="Limit dashboard cards, charts, and tables to selected residents."),
-        "behaviours": st.sidebar.multiselect("Behaviour", behaviours, default=behaviours),
-        "severities": st.sidebar.multiselect("Severity", severities, default=severities),
-        "locations": st.sidebar.multiselect("Location", locations, default=locations),
-        "date_range": st.sidebar.date_input("Date range", value=(today - timedelta(days=7), today)),
-        "time_range": st.sidebar.slider(
+        "residents": st.multiselect("Resident", residents, default=residents, help="Limit dashboard cards, charts, and tables to selected residents."),
+        "behaviours": st.multiselect("Behaviour", behaviours, default=behaviours),
+        "severities": st.multiselect("Severity", severities, default=severities),
+        "locations": st.multiselect("Location", locations, default=locations),
+        "date_range": st.date_input("Date range", value=(today - timedelta(days=7), today)),
+        "time_range": st.slider(
             "Time range",
             value=(datetime_time(0, 0), datetime_time(23, 59)),
             help="Filters events by local event time.",
         ),
-        "search": st.sidebar.text_input("Search notes/outcomes", placeholder="Type to search…"),
+        "search": st.text_input("Search notes/outcomes", placeholder="Type to search…"),
+    }
+
+
+def _default_filters(df: pd.DataFrame) -> dict[str, Any]:
+    """Return safe filter defaults when the sidebar has not rendered yet."""
+    today = date.today()
+    return {
+        "residents": sorted(df["resident"].dropna().unique().tolist()) if not df.empty else [],
+        "behaviours": sorted(set(_taxonomy_labels()) | set(df["behaviour"].dropna().unique().tolist())) if not df.empty else _taxonomy_labels(),
+        "severities": sorted(df["severity"].dropna().unique().tolist()) if not df.empty else _severity_options(),
+        "locations": sorted(df["location"].dropna().unique().tolist()) if not df.empty else [],
+        "date_range": (today - timedelta(days=7), today),
+        "time_range": (datetime_time(0, 0), datetime_time(23, 59)),
+        "search": "",
     }
 
 
@@ -584,7 +598,9 @@ def _render_behaviour_events(result: FusedResult) -> None:
 def _render() -> None:
     """Render the main dashboard from session state."""
     df = _records_dataframe()
-    filters = _sidebar_filters(df)
+    filters = st.session_state.get("dashboard_filters")
+    if filters is None:
+        filters = _default_filters(df)
     filtered_df = _apply_filters(df, filters)
     result: FusedResult | None = st.session_state.latest_result
 
@@ -717,6 +733,9 @@ with st.sidebar:
             if st.button("Start calibration", disabled=not pipeline_running):
                 bm.start_calibration()
                 st.session_state.calibrating = True
+
+    st.divider()
+    st.session_state.dashboard_filters = _sidebar_filters(_records_dataframe())
 
     st.divider()
 
