@@ -41,7 +41,17 @@ from baseline_manager import BaselineManager
 from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
 from behaviour_classifier import BehaviourClassifier
-from audio_behaviour_taxonomy import get_supported_behaviours
+from behaviour_dashboard_model import (
+    SEVERITY_OPTIONS,
+    USER_ROLES,
+    can_log_behaviour,
+    event_to_record as model_event_to_record,
+    filter_records,
+    get_behavior_types,
+    make_manual_event_record,
+    records_dataframe,
+    summarize_records,
+)
 from event_models import BehaviourEvent, FusedResult, Utterance
 
 logging.basicConfig(
@@ -76,6 +86,7 @@ def _init() -> None:
         "committed_lines": [],      # list[str]
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
+        "dashboard_role": "Care staff",
         "latest_result": None,      # FusedResult | None
         "error": None,
         # Calibration
@@ -307,11 +318,11 @@ def _consume() -> None:
 
 def _taxonomy_labels() -> list[str]:
     """Return canonical behaviour labels from the shared taxonomy."""
-    return [entry.canonical_label for entry in get_supported_behaviours()]
+    return [entry.label for entry in get_behavior_types()]
 
 
 def _severity_options() -> list[str]:
-    return ["Low", "Medium", "High", "Critical"]
+    return list(SEVERITY_OPTIONS)
 
 
 def _severity_badge(severity: str | None) -> str:
@@ -328,36 +339,13 @@ def _severity_badge(severity: str | None) -> str:
 
 def _event_to_record(event: BehaviourEvent, result: FusedResult | None = None) -> dict[str, Any]:
     """Convert a BehaviourEvent into a dashboard-friendly record."""
-    timestamp = event.timestamp
-    if not isinstance(timestamp, datetime):
-        timestamp = datetime.now()
-    return {
-        "timestamp": timestamp,
-        "resident": event.person or "Unassigned resident",
-        "behaviour": event.canonical_label or event.behaviour_type or "Unmapped audio behaviour",
-        "severity": event.severity or (result.severity if result else "Low"),
-        "location": event.location or "Observation area",
-        "duration": event.duration,
-        "trigger": event.trigger or "",
-        "intervention": event.intervention or "",
-        "outcome": event.outcome or "",
-        "notes": event.notes or "",
-        "source": "Detected",
-    }
+    return model_event_to_record(event, result)
 
 
 def _records_dataframe(records: list[dict[str, Any]] | None = None) -> pd.DataFrame:
     """Build the canonical events DataFrame used by dashboard tabs."""
     data = records if records is not None else st.session_state.behaviour_log
-    columns = [
-        "timestamp", "resident", "behaviour", "severity", "location", "duration",
-        "trigger", "intervention", "outcome", "notes", "source",
-    ]
-    if not data:
-        return pd.DataFrame(columns=columns)
-    df = pd.DataFrame(data)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    return df.sort_values("timestamp", ascending=False)
+    return records_dataframe(data)
 
 
 def _sidebar_filters(df: pd.DataFrame) -> dict[str, Any]:
@@ -398,55 +386,17 @@ def _default_filters(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
-    if df.empty:
-        return df
-    filtered = df.copy()
-    for column, selected in [
-        ("resident", filters["residents"]),
-        ("behaviour", filters["behaviours"]),
-        ("severity", filters["severities"]),
-        ("location", filters["locations"]),
-    ]:
-        if selected:
-            filtered = filtered[filtered[column].isin(selected)]
-    date_range = filters["date_range"]
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = date_range
-        filtered = filtered[
-            (filtered["timestamp"].dt.date >= start_date)
-            & (filtered["timestamp"].dt.date <= end_date)
-        ]
-    start_time, end_time = filters["time_range"]
-    filtered = filtered[
-        (filtered["timestamp"].dt.time >= start_time)
-        & (filtered["timestamp"].dt.time <= end_time)
-    ]
-    search = filters["search"].strip().lower()
-    if search:
-        haystack = (
-            filtered["notes"].fillna("") + " "
-            + filtered["outcome"].fillna("") + " "
-            + filtered["trigger"].fillna("")
-        ).str.lower()
-        filtered = filtered[haystack.str.contains(search, regex=False)]
-    return filtered
+    return filter_records(df, filters)
 
 
 def _render_summary_cards(df: pd.DataFrame) -> None:
-    today_df = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
-    high_df = df[df["severity"].isin(["High", "Critical"])] if not df.empty else df
-    most_common = "—" if df.empty else df["behaviour"].mode().iat[0]
-    active_resident = "—" if df.empty else df["resident"].mode().iat[0]
-    avg_severity = "—"
-    if not df.empty:
-        weights = {"Low": 1, "Mild": 1.5, "Medium": 2, "Moderate": 2.5, "High": 3, "Critical": 4}
-        avg_severity = f"{df['severity'].map(weights).fillna(0).mean():.1f}/4"
+    summary = summarize_records(df)
     cols = st.columns(6)
-    cols[0].metric("Today's Events", len(today_df), help="Events recorded today after filters.")
-    cols[1].metric("High Severity", len(high_df), help="High and critical events.")
-    cols[2].metric("Most Common", most_common)
-    cols[3].metric("Avg Severity", avg_severity)
-    cols[4].metric("Most Active Resident", active_resident)
+    cols[0].metric("Today's Events", summary["today_events"], help="Events recorded today after filters.")
+    cols[1].metric("High Severity", summary["high_severity_events"], help="High and critical events.")
+    cols[2].metric("Most Common", summary["most_common_behaviour"])
+    cols[3].metric("Avg Severity", summary["average_severity"])
+    cols[4].metric("Most Active Resident", summary["most_active_resident"])
     cols[5].metric("System Status", "Running" if st.session_state.pipeline is not None else "Stopped")
 
 
@@ -506,10 +456,14 @@ def _render_recent_events(df: pd.DataFrame) -> None:
 def _render_logging_form() -> None:
     st.subheader("➕ Behaviour Logging Panel")
     st.caption("Record caregiver observations without changing the live audio detection pipeline.")
+    current_role = st.session_state.get("dashboard_role", "Care staff")
+    can_log = can_log_behaviour(current_role)
+    if not can_log:
+        st.warning("Current role can view records but cannot create behaviour events.")
     behaviours = _taxonomy_labels()
     with st.form("behaviour_log_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
-        resident = c1.text_input("Resident / Person", placeholder="Resident name or room", help="Use your facility's preferred identifier.")
+        resident = c1.text_input("Resident / Person", placeholder="Resident name or room", help="Required.")
         behaviour = c2.selectbox("Behaviour", behaviours)
         severity = c3.radio("Severity", _severity_options(), horizontal=True)
 
@@ -540,7 +494,7 @@ def _render_logging_form() -> None:
             outcome = st.radio("Outcome", ["Resolved", "Improved", "Unchanged", "Escalated"], horizontal=True)
         notes = st.text_area("Notes", placeholder="Add concise clinical context.")
 
-        submitted = st.form_submit_button("Save behaviour event")
+        submitted = st.form_submit_button("Save behaviour event", disabled=not can_log)
         if submitted:
             timestamp = datetime.combine(event_date, event_time)
             extra_notes = notes
@@ -548,20 +502,24 @@ def _render_logging_form() -> None:
                 extra_notes = f"{extra_notes}\nEmergency intervention: {emergency}".strip()
             if target:
                 extra_notes = f"{extra_notes}\nTarget of aggression: {target}".strip()
-            st.session_state.behaviour_log.append({
-                "timestamp": timestamp,
-                "resident": resident or "Unassigned resident",
-                "behaviour": behaviour,
-                "severity": severity,
-                "location": location,
-                "duration": duration,
-                "trigger": trigger,
-                "intervention": ", ".join(interventions),
-                "outcome": outcome,
-                "notes": extra_notes,
-                "source": "Manual",
-            })
-            st.success("Behaviour event saved.")
+            try:
+                record = make_manual_event_record(
+                    timestamp=timestamp,
+                    resident=resident,
+                    behaviour=behaviour,
+                    severity=severity,
+                    location=location,
+                    duration=duration,
+                    trigger=trigger,
+                    intervention=", ".join(interventions),
+                    outcome=outcome,
+                    notes=extra_notes,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.behaviour_log.append(record)
+                st.success("Behaviour event saved.")
 
 
 def _render_behaviour_events(result: FusedResult) -> None:
@@ -693,6 +651,12 @@ _ensure_services()
 # ---- Sidebar ------------------------------------------------------------
 with st.sidebar:
     st.title("🎛️ Controls")
+    st.session_state.dashboard_role = st.selectbox(
+        "Dashboard role",
+        list(USER_ROLES),
+        index=list(USER_ROLES).index(st.session_state.get("dashboard_role", "Care staff")),
+        help="Controls whether manual behaviour events can be added.",
+    )
 
     pipeline_running = st.session_state.pipeline is not None
     col_start, col_stop = st.columns(2)
