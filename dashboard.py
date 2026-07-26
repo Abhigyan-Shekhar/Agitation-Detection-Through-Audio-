@@ -700,6 +700,12 @@ _ensure_services()
 # ---- Sidebar ------------------------------------------------------------
 with st.sidebar:
     st.title("🎛️ Controls")
+    st.session_state.dashboard_role = st.selectbox(
+        "Dashboard role",
+        list(USER_ROLES),
+        index=list(USER_ROLES).index(st.session_state.get("dashboard_role", "Care staff")),
+        help="Controls whether manual behaviour events can be added.",
+    )
 
     pipeline_running = st.session_state.pipeline is not None
     col_start, col_stop = st.columns(2)
