@@ -54,7 +54,7 @@ st.set_page_config(page_title="Agitation Dashboard", layout="wide")
 # Minimal role options for dashboard role selectors. No shared USER_ROLES
 # definition exists elsewhere in this project.
 USER_ROLES: tuple[str, ...] = (
-    "Caregiver",
+    "Care staff",
     "Clinician",
     "Administrator",
 )
