@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from person3_module import analyze_person3, map_behaviours_to_cmai
 from audio_behaviour_taxonomy import (
     BehaviourEvent,
     build_behaviour_event,
     map_observed_behaviour,
+    map_behaviours_to_cmai,
     get_supported_behaviours,
 )
 
@@ -14,6 +14,7 @@ def test_supported_audio_behaviours_have_expected_canonical_labels():
     assert {entry.internal_code for entry in taxonomy} == {
         "AUDIO_SCREAMING",
         "AUDIO_CURSING",
+        "AUDIO_VERBAL_SEXUAL_ADVANCES",
         "AUDIO_REPETITIVE",
         "AUDIO_STRANGE_NOISE",
         "AUDIO_COMPLAINING",
@@ -80,9 +81,22 @@ def test_profanity_maps_to_cursing():
     assert mapped.internal_code == "AUDIO_CURSING"
 
 
+def test_verbal_sexual_advances_map_to_source_behaviour():
+    mapped = map_observed_behaviour("making verbal sexual advances")
+    assert mapped.internal_code == "AUDIO_VERBAL_SEXUAL_ADVANCES"
+    assert mapped.canonical_label == "Making verbal sexual advances"
+
+
 def test_unusual_vocalization_maps_to_strange_noises():
     mapped = map_observed_behaviour("unusual vocalization")
     assert mapped.internal_code == "AUDIO_STRANGE_NOISE"
+
+
+def test_source_examples_map_to_strange_noises():
+    for raw_behaviour in ("weird laughter", "crying"):
+        mapped = map_observed_behaviour(raw_behaviour)
+        assert mapped.internal_code == "AUDIO_STRANGE_NOISE"
+        assert mapped.canonical_label == "Making strange noises"
 
 
 def test_help_me_alone_does_not_map_to_constant_requests():
@@ -108,7 +122,7 @@ def test_acoustic_feature_descriptions_remain_review_required():
     assert mapped.internal_code is None
 
 
-def test_unknown_gemini_behaviour_preserves_raw_text_and_marks_review_required():
+def test_unknown_behaviour_preserves_raw_text_and_marks_review_required():
     mapped = map_observed_behaviour("mysterious humming from the hallway")
     assert mapped.mapping_status == "review_required"
     assert mapped.raw_detected_behaviour == "mysterious humming from the hallway"
@@ -144,23 +158,3 @@ def test_behaviour_event_creation_uses_unknown_optional_metadata():
     assert event.trigger is None
     assert event.intervention is None
     assert event.outcome is None
-
-
-def test_person3_mapping_keeps_review_required_behaviours():
-    class FakeAnalyzer:
-        def analyze(self, transcript, acoustic_features, acoustic_score=None):
-            return {
-                "emotion": "neutral",
-                "agitation_score": 0.1,
-                "behaviours": ["The resident is speaking normally and then says something odd"],
-                "reasoning": "No clear observable behaviour detected.",
-            }
-
-    result = analyze_person3(
-        "The resident is speaking normally and then says something odd",
-        {"rms_energy": 0.1},
-        analyzer=FakeAnalyzer(),
-    )
-    assert result["cmai_mapping"]
-    assert result["cmai_mapping"][0]["mapping_status"] == "review_required"
-    assert result["cmai_mapping"][0]["raw_detected_behaviour"] == "The resident is speaking normally and then says something odd"

@@ -80,6 +80,24 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
         ),
     ),
     BehaviourTaxonomyEntry(
+        internal_code="AUDIO_VERBAL_SEXUAL_ADVANCES",
+        canonical_label="Making verbal sexual advances",
+        cmai_category="Verbally agitated: verbal sexual advances",
+        modality="audio",
+        description="Sexualized verbal comments, propositions, or advances.",
+        aliases=(
+            "making verbal sexual advances",
+            "verbal sexual advances",
+            "sexual advances",
+            "sexual advance",
+            "sexual comments",
+            "sexual propositions",
+            "sexual remarks",
+            "sexually inappropriate comments",
+            "sexually inappropriate remarks",
+        ),
+    ),
+    BehaviourTaxonomyEntry(
         internal_code="AUDIO_REPETITIVE",
         canonical_label="Repetitive sentences or questions",
         cmai_category="Verbally non-aggressive: repetitive questioning",
@@ -120,6 +138,12 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "grunting",
             "groaning",
             "moaning",
+            "weird laughter",
+            "odd laughter",
+            "unusual laughter",
+            "crying",
+            "sobbing",
+            "weeping",
         ),
     ),
     BehaviourTaxonomyEntry(
@@ -215,6 +239,14 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
             ),
         )
 
+    if entry.internal_code == "AUDIO_VERBAL_SEXUAL_ADVANCES":
+        has_sexual = _contains_any(normalized, ("sexual", "sexually"))
+        has_verbal_advance = _contains_any(
+            normalized,
+            ("advance", "advances", "comment", "comments", "proposition", "propositions", "remark", "remarks"),
+        )
+        return has_sexual and has_verbal_advance
+
     if entry.internal_code == "AUDIO_REPETITIVE":
         has_repeat = _contains_any(normalized, ("repetitive", "repeated", "repetition"))
         has_question_or_verbal = _contains_any(
@@ -226,7 +258,7 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
     if entry.internal_code == "AUDIO_STRANGE_NOISE":
         has_noise = _contains_any(normalized, ("noise", "noises"))
         has_strange = _contains_any(normalized, ("strange", "weird"))
-        has_vocal = _contains_any(normalized, ("groan", "grunt", "moan"))
+        has_vocal = _contains_any(normalized, ("groan", "grunt", "moan", "laugh", "cry", "sob", "weep"))
         return (has_noise and has_strange) or has_vocal
 
     if entry.internal_code == "AUDIO_COMPLAINING":
