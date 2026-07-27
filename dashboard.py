@@ -118,7 +118,7 @@ def _wlk_command() -> list[str]:
         "wlk",
         "serve",
         "--backend",
-        "faster-whisper",
+        config.WLK_BACKEND,
         "--model",
         config.WLK_MODEL,
         "--language",
@@ -131,8 +131,47 @@ def _wlk_command() -> list[str]:
     ]
 
 
-def _wlk_startup_error(proc: subprocess.Popen) -> str:
-    """Format the WLK process exit code, stdout, and stderr for Streamlit."""
+def _wlk_env() -> dict[str, str]:
+    """Return the environment used only by the WLK subprocess."""
+    env = os.environ.copy()
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    return env
+
+
+def _wlk_command_text(cmd: list[str]) -> str:
+    """Return a readable launch command for logs and Streamlit diagnostics."""
+    return subprocess.list2cmdline(cmd)
+
+
+def _wlk_diagnostics(
+    cmd: list[str],
+    exit_code: int | None = None,
+    stdout: str = "",
+    stderr: str = "",
+) -> str:
+    """Format WLK launch settings and process output for Streamlit."""
+    lines = [
+        "WhisperLiveKit startup failed.",
+        f"Launch command: {_wlk_command_text(cmd)}",
+        f"WebSocket URL: {config.WLK_URL}",
+        f"TCP host: {config.WLK_HOST}",
+        f"TCP port: {config.WLK_PORT}",
+        f"Backend: {config.WLK_BACKEND}",
+        f"Model: {config.WLK_MODEL}",
+        f"Language: {config.WLK_LANGUAGE}",
+    ]
+    if exit_code is not None:
+        lines.append(f"Exit code: {exit_code}")
+    if stdout or stderr or exit_code is not None:
+        lines.extend([
+            f"stdout:\n{stdout.strip() or '(empty)'}",
+            f"stderr:\n{stderr.strip() or '(empty)'}",
+        ])
+    return "\n".join(lines)
+
+
+def _wlk_exit_diagnostics(proc: subprocess.Popen, cmd: list[str]) -> str:
+    """Return startup diagnostics for a WLK process that already exited."""
     stdout, stderr = proc.communicate()
     stdout_text = (
         stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
@@ -140,19 +179,14 @@ def _wlk_startup_error(proc: subprocess.Popen) -> str:
     stderr_text = (
         stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
     )
-    return (
-        "WhisperLiveKit server exited during startup."
-        f"\nExit code: {proc.returncode}"
-        f"\nstdout:\n{stdout_text.strip() or '(empty)'}"
-        f"\nstderr:\n{stderr_text.strip() or '(empty)'}"
-    )
+    return _wlk_diagnostics(cmd, proc.returncode, stdout_text, stderr_text)
 
 
-def _wait_for_wlk_port(proc: subprocess.Popen | None) -> bool:
+def _wait_for_wlk_port(proc: subprocess.Popen | None, cmd: list[str]) -> bool:
     """Wait until WLK accepts TCP connections, or report startup process output."""
     while True:
         if proc is not None and proc.poll() is not None:
-            st.session_state.error = _wlk_startup_error(proc)
+            st.session_state.error = _wlk_exit_diagnostics(proc, cmd)
             return False
         try:
             with socket.create_connection(
@@ -163,13 +197,29 @@ def _wait_for_wlk_port(proc: subprocess.Popen | None) -> bool:
             time.sleep(0.25)
 
 
+def _stop_wlk_server() -> None:
+    """Terminate the auto-launched WLK subprocess and free its TCP port."""
+    proc = st.session_state.get("wlk_proc")
+    if proc is None:
+        return
+
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5.0)
+    st.session_state.wlk_proc = None
+
+
 def _start_wlk_server() -> subprocess.Popen | None:
     """Launch WhisperLiveKit server as a subprocess if auto-launch is enabled."""
     if not config.WLK_AUTO_LAUNCH:
         return None
 
     cmd = _wlk_command()
-    logger.info("Launching WLK server: %s", " ".join(cmd))
+    logger.info("Launching WLK server: %s", _wlk_command_text(cmd))
     try:
         cmd = _wlk_command()
         logger.info("Launching WLK server: %s", " ".join(cmd))
@@ -177,27 +227,57 @@ def _start_wlk_server() -> subprocess.Popen | None:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_wlk_env(),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not auto-launch WLK: %s", exc)
-        st.session_state.error = f"Could not auto-launch WhisperLiveKit: {exc}"
-        return None
-
-    if not _wait_for_wlk_port(proc):
+        st.session_state.error = f"{_wlk_diagnostics(cmd)}\nException: {exc}"
         return None
     return proc
+
+    if not _wait_for_wlk_port(proc, cmd):
+        st.session_state.wlk_proc = None
+        return None
+    return proc
+
+
+def _drain_queue(q: queue.Queue) -> None:
+    """Remove stale runtime events from a session queue."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def _reset_wlk_queues() -> None:
+    """Clear transcript queues before a new recording session starts."""
+    for key in ("partial_queue", "committed_queue", "utterance_queue"):
+        _drain_queue(st.session_state[key])
+    st.session_state.partial_caption = ""
 
 
 def _start_pipeline() -> None:
     _ensure_services()
 
+    if st.session_state.pipeline is not None:
+        logger.warning("Start requested while pipeline is already running")
+        return
+
     # 1. WLK server
     st.session_state.error = None
+    _reset_wlk_queues()
+    cmd = _wlk_command()
+    if (
+        st.session_state.wlk_proc is not None
+        and st.session_state.wlk_proc.poll() is not None
+    ):
+        st.session_state.wlk_proc = None
     if st.session_state.wlk_proc is None:
         st.session_state.wlk_proc = _start_wlk_server()
         if st.session_state.wlk_proc is None and st.session_state.error:
             return
-    if not _wait_for_wlk_port(st.session_state.wlk_proc):
+    if not _wait_for_wlk_port(st.session_state.wlk_proc, cmd):
         return
 
     # 2. Audio pipeline (fan-out)
@@ -245,12 +325,32 @@ def _start_pipeline() -> None:
         target=_patched_run, name="acoustic-worker", daemon=True
     )
 
-    # Start everything
-    pipeline.start()
-    wlk_client.start()
-    aggregator.start()
-    acoustic_worker._stop_event.clear()
-    acoustic_worker._thread.start()
+    # Start everything only after WLK is listening. The websocket client is
+    # started before microphone capture so audio is not produced until the
+    # ASR endpoint is ready to receive it.
+    try:
+        wlk_client.start()
+        wlk_client.wait_until_connected(timeout=10.0)
+        aggregator.start()
+        acoustic_worker._stop_event.clear()
+        acoustic_worker._thread.start()
+        pipeline.start()
+    except Exception as exc:
+        logger.exception("Failed while starting pipeline components")
+        proc = st.session_state.get("wlk_proc")
+        if proc is not None and proc.poll() is not None:
+            diagnostics = _wlk_exit_diagnostics(proc, cmd)
+        else:
+            diagnostics = _wlk_diagnostics(cmd)
+        st.session_state.error = (
+            f"{diagnostics}\nPipeline startup exception: {exc}"
+        )
+        wlk_client.stop()
+        aggregator.stop()
+        acoustic_worker.stop()
+        pipeline.stop()
+        _stop_wlk_server()
+        return
 
     st.session_state.pipeline = pipeline
     st.session_state.wlk_client = wlk_client
@@ -262,9 +362,9 @@ def _start_pipeline() -> None:
 
 def _stop_pipeline() -> None:
     for key, attr in [
-        ("utterance_aggregator", "stop"),
-        ("wlk_client", "stop"),
         ("pipeline", "stop"),
+        ("wlk_client", "stop"),
+        ("utterance_aggregator", "stop"),
         ("acoustic_worker", "stop"),
     ]:
         obj = st.session_state.get(key)
@@ -272,13 +372,10 @@ def _stop_pipeline() -> None:
             try:
                 getattr(obj, attr)()
             except Exception:  # noqa: BLE001
-                pass
+                logger.exception("Error stopping %s", key)
             st.session_state[key] = None
 
-    proc = st.session_state.get("wlk_proc")
-    if proc is not None:
-        proc.terminate()
-        st.session_state.wlk_proc = None
+    _stop_wlk_server()
 
     logger.info("All pipeline components stopped")
 

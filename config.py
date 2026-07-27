@@ -20,13 +20,13 @@ DTYPE: str = "float32"
 # ---------------------------------------------------------------------------
 WLK_HOST: str = os.getenv("WLK_HOST", "127.0.0.1")
 WLK_PORT: int = int(os.getenv("WLK_PORT", "8000"))
-WLK_URL: str = f"ws://{WLK_HOST}:{WLK_PORT}"
+WLK_PATH: str = os.getenv("WLK_PATH", "/asr")
+WLK_URL: str = f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
 
 # WLK model settings (used when auto-launching the server)
 WLK_MODEL: str = os.getenv("WLK_MODEL", "small")
 WLK_LANGUAGE: str = os.getenv("WLK_LANGUAGE", "auto")
-# "mlx-whisper" on Apple Silicon, "faster-whisper" otherwise
-WLK_BACKEND: str = os.getenv("WLK_BACKEND", "mlx-whisper")
+WLK_BACKEND: str = os.getenv("WLK_BACKEND", "faster-whisper")
 # If True, dashboard.py will spawn wlk as a subprocess automatically
 WLK_AUTO_LAUNCH: bool = os.getenv("WLK_AUTO_LAUNCH", "true").lower() == "true"
 
