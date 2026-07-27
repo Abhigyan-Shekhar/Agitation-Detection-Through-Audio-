@@ -11,6 +11,7 @@ import os
 import queue
 import socket
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -76,8 +77,9 @@ class DashboardManager:
     def wlk_command(self) -> list[str]:
         """Return the supported WhisperLiveKit command for this dashboard."""
         return [
-            "wlk",
-            "serve",
+            sys.executable,
+            "-m",
+            "whisperlivekit.basic_server",
             "--backend",
             config.WLK_BACKEND,
             "--model",

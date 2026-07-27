@@ -669,6 +669,14 @@ with st.sidebar:
         aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
+        pipeline = manager.pipeline if manager else None
+        if pipeline:
+            st.write("Audio dropped frames:", pipeline.dropped_frames)
+            st.write("Audio queue size:", pipeline.acoustic_queue.qsize())
+            st.write("WLK queue size:", pipeline.wlk_queue.qsize())
+        wlk_client = manager.wlk_client if manager else None
+        if wlk_client:
+            st.write("WLK client stats:", wlk_client.stats)
         ua = manager.utterance_aggregator if manager else None
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)

@@ -72,6 +72,9 @@ class WhisperLiveKitClient:
         self._bytes_sent = 0
         self._partial_count = 0
         self._committed_count = 0
+        self._messages_received = 0
+        self._last_message_type = ""
+        self._last_message_text = ""
         self._emitted_line_keys: set[tuple[Any, ...]] = set()
 
     def start(self) -> None:
@@ -121,8 +124,12 @@ class WhisperLiveKitClient:
     def stats(self) -> dict[str, int]:
         return {
             "bytes_sent": self._bytes_sent,
+            "messages_received": self._messages_received,
             "partial_count": self._partial_count,
             "committed_count": self._committed_count,
+            "last_message_type": self._last_message_type,
+            "last_message_text": self._last_message_text,
+            "last_error": str(self._last_error) if self._last_error else "",
         }
 
     def _run_event_loop(self) -> None:
@@ -224,15 +231,18 @@ class WhisperLiveKitClient:
             except json.JSONDecodeError:
                 logger.debug("Non-JSON WLK message: %r", raw)
                 continue
+            self._messages_received += 1
             self._dispatch(msg)
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         """Route a parsed WLK message to the appropriate output queue."""
         msg_type = msg.get("type") or msg.get("status") or ""
         text: str = msg.get("text", "") or msg.get("transcript", "") or ""
+        self._last_message_type = msg_type or "snapshot"
 
         buffer_text = msg.get("buffer_transcription")
         if buffer_text is not None:
+            self._last_message_text = str(buffer_text)
             self._put_partial(str(buffer_text))
 
         if "lines" in msg:
