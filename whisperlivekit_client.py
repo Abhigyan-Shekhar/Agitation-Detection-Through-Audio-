@@ -1,25 +1,8 @@
 """WhisperLiveKit WebSocket client.
 
-Responsibilities
-----------------
-* Consume ``TimestampedFrame`` objects from ``AudioPipeline.wlk_queue``.
-* Convert float32 PCM to signed 16-bit little-endian bytes.
-* Stream PCM bytes to the local WhisperLiveKit WebSocket server.
-* Parse JSON messages from WLK and classify them as:
-    - ``partial``   → live caption (put on ``partial_queue``)
-    - ``committed`` → stable transcript lines (put on ``committed_queue``)
-* Reconnect automatically after a connection drop.
-* On ``stop()``, flush any remaining audio before closing.
-
-WhisperLiveKit message protocol (--pcm-input mode)
----------------------------------------------------
-Inbound (to server):  raw PCM16 bytes in chunks (no framing required)
-Outbound (from server): JSON objects, e.g.:
-    {"type": "partial",   "text": "Why can't I go"}
-    {"type": "committed", "text": "Why can't I go home?"}
-
-Note: WLK 0.x may use slightly different field names. The parser below
-normalises both ``type``/``status`` field variants.
+The client owns one background thread, one asyncio event loop, one websocket
+connection at a time, one send loop, and one receive loop.  It connects only to
+``config.WLK_URL`` and retries connection failures a bounded number of times.
 """
 from __future__ import annotations
 
@@ -46,9 +29,9 @@ from event_models import CommittedLine
 
 logger = logging.getLogger(__name__)
 
-# How many bytes to send per WebSocket message (≈ 40 ms of audio)
-_SEND_CHUNK_BYTES: int = int(config.SAMPLE_RATE * 0.040 * 2)  # 16-bit = 2 bytes/sample
+_SEND_CHUNK_BYTES: int = int(config.SAMPLE_RATE * 0.040 * 2)
 _RECONNECT_DELAY_SEC: float = 2.0
+_MAX_RECONNECT_ATTEMPTS: int = 5
 
 
 def float32_to_pcm16(audio: np.ndarray) -> bytes:
@@ -59,19 +42,7 @@ def float32_to_pcm16(audio: np.ndarray) -> bytes:
 
 
 class WhisperLiveKitClient:
-    """Streams PCM audio to WLK and distributes transcript events to queues.
-
-    Parameters
-    ----------
-    wlk_queue:
-        Source of ``TimestampedFrame`` frames from ``AudioPipeline``.
-    partial_queue:
-        Destination for real-time partial caption strings (str).
-    committed_queue:
-        Destination for finalised ``CommittedLine`` objects.
-    url:
-        WebSocket URL of the running WLK server.
-    """
+    """Stream PCM audio to WLK and route transcript events to queues."""
 
     def __init__(
         self,
@@ -81,9 +52,7 @@ class WhisperLiveKitClient:
         url: str = config.WLK_URL,
     ) -> None:
         if websockets is None:
-            raise ImportError(
-                "websockets is not installed. Run: pip install websockets"
-            )
+            raise ImportError("websockets is not installed. Run: pip install websockets")
 
         self._wlk_queue = wlk_queue
         self._partial_queue = partial_queue
@@ -92,34 +61,51 @@ class WhisperLiveKitClient:
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._ws: Any | None = None
         self._stop_event = threading.Event()
+        self._connected_event = threading.Event()
+        self._last_error: BaseException | None = None
 
-        self._bytes_sent: int = 0
-        self._partial_count: int = 0
-        self._committed_count: int = 0
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._bytes_sent = 0
+        self._partial_count = 0
+        self._committed_count = 0
 
     def start(self) -> None:
-        """Spawn the asyncio event loop in a background thread."""
+        """Start the single websocket background thread."""
         if self._thread and self._thread.is_alive():
             logger.warning("WhisperLiveKitClient already running")
             return
 
         self._stop_event.clear()
+        self._connected_event.clear()
+        self._last_error = None
         self._thread = threading.Thread(
-            target=self._run_event_loop, name="wlk-client", daemon=True
+            target=self._run_event_loop,
+            name="wlk-client",
+            daemon=True,
         )
         self._thread.start()
         logger.info("WhisperLiveKitClient thread started → %s", self._url)
 
+    def wait_until_connected(self, timeout: float = 10.0) -> None:
+        """Wait until the websocket connects or raise a startup error."""
+        if self._connected_event.wait(timeout=timeout):
+            return
+        if self._last_error is not None:
+            raise RuntimeError(f"WLK websocket failed to connect: {self._last_error}")
+        raise TimeoutError(
+            f"WLK websocket did not connect to {self._url} within {timeout:.1f}s"
+        )
+
     def stop(self) -> None:
-        """Signal the client to flush remaining audio and shut down."""
+        """Close the websocket and join the background thread."""
         self._stop_event.set()
+        self._connected_event.clear()
+        if self._loop and self._loop.is_running() and self._ws is not None:
+            asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
         if self._thread:
             self._thread.join(timeout=5.0)
+        self._ws = None
         logger.info(
             "WhisperLiveKitClient stopped — bytes_sent=%d partial=%d committed=%d",
             self._bytes_sent,
@@ -135,66 +121,87 @@ class WhisperLiveKitClient:
             "committed_count": self._committed_count,
         }
 
-    # ------------------------------------------------------------------
-    # Asyncio internals
-    # ------------------------------------------------------------------
-
     def _run_event_loop(self) -> None:
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         self._loop = loop
+        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._connect_loop())
+            loop.run_until_complete(self._run_with_retries())
         finally:
+            self._connected_event.clear()
+            self._ws = None
             loop.close()
+            self._loop = None
 
-    async def _connect_loop(self) -> None:
-        """Reconnect automatically until stop() is called."""
+    async def _run_with_retries(self) -> None:
+        attempts = 0
         while not self._stop_event.is_set():
             try:
-                logger.info("Connecting to WLK at %s", self._url)
-                async with websockets.connect(self._url) as ws:
-                    logger.info("WLK connection established")
-                    await asyncio.gather(
-                        self._send_loop(ws),
-                        self._recv_loop(ws),
+                await self._connect_once()
+                attempts = 0
+            except Exception as exc:  # noqa: BLE001
+                self._connected_event.clear()
+                self._last_error = exc
+                if self._stop_event.is_set():
+                    break
+                attempts += 1
+                if attempts > _MAX_RECONNECT_ATTEMPTS:
+                    logger.error(
+                        "WLK websocket failed after %d reconnect attempts: %s",
+                        _MAX_RECONNECT_ATTEMPTS,
+                        exc,
                     )
-            except ConnectionClosed as exc:
-                if self._stop_event.is_set():
                     break
-                logger.warning("WLK connection closed: %s — reconnecting in %.1fs", exc, _RECONNECT_DELAY_SEC)
+                logger.warning(
+                    "WLK websocket error: %s — retrying in %.1fs (%d/%d)",
+                    exc,
+                    _RECONNECT_DELAY_SEC,
+                    attempts,
+                    _MAX_RECONNECT_ATTEMPTS,
+                )
                 await asyncio.sleep(_RECONNECT_DELAY_SEC)
-            except OSError as exc:
-                if self._stop_event.is_set():
-                    break
-                logger.warning("WLK connection failed: %s — retrying in %.1fs", exc, _RECONNECT_DELAY_SEC)
-                await asyncio.sleep(_RECONNECT_DELAY_SEC)
+
+    async def _connect_once(self) -> None:
+        logger.info("Connecting to WLK at %s", self._url)
+        async with websockets.connect(self._url) as ws:
+            self._ws = ws
+            self._last_error = None
+            self._connected_event.set()
+            logger.info("WLK connection established")
+            try:
+                send_task = asyncio.create_task(self._send_loop(ws))
+                recv_task = asyncio.create_task(self._recv_loop(ws))
+                done, pending = await asyncio.wait(
+                    {send_task, recv_task},
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    task.result()
+            finally:
+                self._connected_event.clear()
+                self._ws = None
 
     async def _send_loop(self, ws: Any) -> None:
-        """Drain wlk_queue and stream PCM16 bytes to WLK."""
+        """Drain queued audio and stream PCM16 chunks to WLK."""
         pcm_buffer = bytearray()
-
         while not self._stop_event.is_set():
-            # Drain all available frames without blocking
             try:
                 while True:
-                    frame: TimestampedFrame = self._wlk_queue.get_nowait()
+                    frame = self._wlk_queue.get_nowait()
                     pcm_buffer.extend(float32_to_pcm16(frame.data))
             except queue.Empty:
                 pass
 
-            if len(pcm_buffer) >= _SEND_CHUNK_BYTES:
+            while len(pcm_buffer) >= _SEND_CHUNK_BYTES:
                 chunk = bytes(pcm_buffer[:_SEND_CHUNK_BYTES])
                 del pcm_buffer[:_SEND_CHUNK_BYTES]
-                try:
-                    await ws.send(chunk)
-                    self._bytes_sent += len(chunk)
-                except ConnectionClosed:
-                    raise
+                await ws.send(chunk)
+                self._bytes_sent += len(chunk)
 
-            await asyncio.sleep(0.010)  # yield — ~10 ms polling interval
+            await asyncio.sleep(0.010)
 
-        # Flush remainder on shutdown
         if pcm_buffer:
             try:
                 await ws.send(bytes(pcm_buffer))
@@ -203,7 +210,7 @@ class WhisperLiveKitClient:
                 pass
 
     async def _recv_loop(self, ws: Any) -> None:
-        """Receive JSON messages from WLK and route to the correct queue."""
+        """Receive WLK JSON messages and route transcript events."""
         async for raw in ws:
             if self._stop_event.is_set():
                 break
@@ -212,15 +219,12 @@ class WhisperLiveKitClient:
             except json.JSONDecodeError:
                 logger.debug("Non-JSON WLK message: %r", raw)
                 continue
-
             self._dispatch(msg)
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         """Route a parsed WLK message to the appropriate output queue."""
-        # WLK may use "type" or "status" depending on version
         msg_type = msg.get("type") or msg.get("status") or ""
         text: str = msg.get("text", "") or msg.get("transcript", "") or ""
-
         if not text:
             return
 
@@ -229,26 +233,16 @@ class WhisperLiveKitClient:
                 self._partial_queue.put_nowait(text)
                 self._partial_count += 1
             except queue.Full:
-                pass  # partial captions are display-only; drop if dashboard is slow
+                pass
+            return
 
-        elif msg_type in ("committed", "final", "complete", "completed"):
+        if msg_type in ("committed", "final", "complete", "completed", ""):
             line = CommittedLine(text=text.strip(), timestamp=time.time())
             try:
                 self._committed_queue.put_nowait(line)
                 self._committed_count += 1
-                logger.debug("Committed: %r", text)
             except queue.Full:
                 logger.warning("committed_queue full — committed line dropped")
+            return
 
-        else:
-            # Some WLK versions emit a bare dict with only a "text" field
-            # once a segment stabilises; treat that as committed.
-            if text and msg_type == "":
-                line = CommittedLine(text=text.strip(), timestamp=time.time())
-                try:
-                    self._committed_queue.put_nowait(line)
-                    self._committed_count += 1
-                except queue.Full:
-                    pass
-            else:
-                logger.debug("Unknown WLK message type %r: %r", msg_type, msg)
+        logger.debug("Unknown WLK message type %r: %r", msg_type, msg)
