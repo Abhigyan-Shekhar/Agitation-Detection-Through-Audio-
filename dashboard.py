@@ -242,6 +242,8 @@ def _severity_badge(severity: str | None) -> str:
 def _event_to_record(event: BehaviourEvent, result: FusedResult | None = None) -> dict[str, Any]:
     """Convert a BehaviourEvent into a dashboard-friendly record."""
     timestamp = event.timestamp
+    if isinstance(timestamp, (int, float)):
+        timestamp = datetime.fromtimestamp(timestamp)
     if not isinstance(timestamp, datetime):
         timestamp = datetime.now()
     return {
@@ -606,10 +608,13 @@ _ensure_services()
 # ---- Sidebar ------------------------------------------------------------
 with st.sidebar:
     st.title("🎛️ Controls")
+    current_role = st.session_state.get("dashboard_role", "Care staff")
+    if current_role not in USER_ROLES:
+        current_role = "Care staff"
     st.session_state.dashboard_role = st.selectbox(
         "Dashboard role",
         list(USER_ROLES),
-        index=list(USER_ROLES).index(st.session_state.get("dashboard_role", "Care staff")),
+        index=list(USER_ROLES).index(current_role),
         help="Controls whether manual behaviour events can be added.",
     )
 

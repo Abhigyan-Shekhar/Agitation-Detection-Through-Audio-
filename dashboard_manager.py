@@ -12,6 +12,7 @@ import queue
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -31,6 +32,7 @@ _WLK_TCP_POLL_SEC = 0.25
 _WLK_TCP_CONNECT_TIMEOUT_SEC = 0.5
 _WLK_TERMINATE_TIMEOUT_SEC = 5.0
 _WLK_WEBSOCKET_TIMEOUT_SEC = 10.0
+_WLK_LOG_TAIL_BYTES = 8_192
 
 
 class DashboardStartupError(RuntimeError):
@@ -59,6 +61,9 @@ class DashboardManager:
         self.wlk_client: WhisperLiveKitClient | None = None
         self.utterance_aggregator: UtteranceAggregator | None = None
         self.acoustic_worker: AcousticWorker | None = None
+        self._wlk_log_file: Any | None = None
+        self._wlk_log_path: str | None = None
+        self._owns_wlk_proc = False
 
         self._starting = False
         self._stopping = False
@@ -95,7 +100,7 @@ class DashboardManager:
 
     def start(self) -> None:
         """Start WLK, connect websocket, then start microphone capture."""
-        if self.is_running and self.server_running:
+        if self.is_running:
             logger.info("Start requested while dashboard runtime is already running")
             return
         if self._starting:
@@ -152,6 +157,10 @@ class DashboardManager:
             self._stopping = False
 
     def _start_wlk(self) -> None:
+        if not config.WLK_AUTO_LAUNCH:
+            logger.info("WLK auto-launch disabled; expecting external server")
+            self._owns_wlk_proc = False
+            return
         if self.server_running:
             return
 
@@ -159,14 +168,21 @@ class DashboardManager:
         logger.info("Launching WLK: %s", self._command_text(cmd))
         env = os.environ.copy()
         env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        self._close_wlk_log()
+        self._wlk_log_file = tempfile.NamedTemporaryFile(
+            prefix="odu-wlk-", suffix=".log", delete=False
+        )
+        self._wlk_log_path = self._wlk_log_file.name
         try:
             self.wlk_proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=self._wlk_log_file,
+                stderr=subprocess.STDOUT,
                 env=env,
             )
+            self._owns_wlk_proc = True
         except Exception as exc:  # noqa: BLE001
+            self._close_wlk_log()
             raise DashboardStartupError(
                 f"{self._diagnostics()}\nException: {exc}"
             ) from exc
@@ -267,6 +283,12 @@ class DashboardManager:
     def _stop_wlk(self) -> None:
         proc = self.wlk_proc
         if proc is None:
+            self._close_wlk_log()
+            return
+
+        if not self._owns_wlk_proc:
+            self.wlk_proc = None
+            self._close_wlk_log()
             return
 
         if proc.poll() is None:
@@ -277,6 +299,8 @@ class DashboardManager:
                 proc.kill()
                 proc.wait(timeout=_WLK_TERMINATE_TIMEOUT_SEC)
         self.wlk_proc = None
+        self._owns_wlk_proc = False
+        self._close_wlk_log()
 
     def _discard_exited_server(self) -> None:
         if self.wlk_proc is not None and self.wlk_proc.poll() is not None:
@@ -312,24 +336,37 @@ class DashboardManager:
             f"Port: {config.WLK_PORT}",
             f"Backend: {config.WLK_BACKEND}",
             f"Model: {config.WLK_MODEL}",
+            f"WLK log: {self._wlk_log_path or '(not started)'}",
         ])
 
     def _exit_diagnostics(self) -> str:
         if self.wlk_proc is None:
             return self._diagnostics()
-        stdout, stderr = self.wlk_proc.communicate()
-        stdout_text = (
-            stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
-        )
-        stderr_text = (
-            stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
-        )
+        self.wlk_proc.wait(timeout=_WLK_TERMINATE_TIMEOUT_SEC)
         return "\n".join([
             self._diagnostics(),
             f"Exit code: {self.wlk_proc.returncode}",
-            f"stdout:\n{stdout_text.strip() or '(empty)'}",
-            f"stderr:\n{stderr_text.strip() or '(empty)'}",
+            f"WLK log tail:\n{self._read_wlk_log_tail()}",
         ])
+
+    def _read_wlk_log_tail(self) -> str:
+        if not self._wlk_log_path or not os.path.exists(self._wlk_log_path):
+            return "(empty)"
+        if self._wlk_log_file is not None:
+            self._wlk_log_file.flush()
+        with open(self._wlk_log_path, "rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            size = log_file.tell()
+            log_file.seek(max(0, size - _WLK_LOG_TAIL_BYTES))
+            return log_file.read().decode(errors="replace").strip() or "(empty)"
+
+    def _close_wlk_log(self) -> None:
+        if self._wlk_log_file is None:
+            return
+        try:
+            self._wlk_log_file.close()
+        finally:
+            self._wlk_log_file = None
 
     @staticmethod
     def _command_text(cmd: list[str]) -> str:

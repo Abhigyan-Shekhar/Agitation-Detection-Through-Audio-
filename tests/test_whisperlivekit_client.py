@@ -41,6 +41,20 @@ def test_wlk_buffer_transcription_updates_partial_caption() -> None:
     assert client._partial_count == 1
 
 
+def test_partial_caption_queue_keeps_latest_value_when_full() -> None:
+    partial_q: queue.Queue[str] = queue.Queue(maxsize=1)
+    partial_q.put_nowait("")
+
+    client = WhisperLiveKitClient.__new__(WhisperLiveKitClient)
+    client._partial_queue = partial_q
+    client._partial_count = 0
+
+    client._put_partial("new live speech")
+
+    assert partial_q.get_nowait() == "new live speech"
+    assert client._partial_count == 1
+
+
 def test_wlk_lines_snapshot_emits_only_new_committed_lines() -> None:
     committed_q: queue.Queue[CommittedLine] = queue.Queue()
 

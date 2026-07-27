@@ -121,7 +121,7 @@ class WhisperLiveKitClient:
         )
 
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | str]:
         return {
             "bytes_sent": self._bytes_sent,
             "messages_received": self._messages_received,
@@ -239,6 +239,8 @@ class WhisperLiveKitClient:
         msg_type = msg.get("type") or msg.get("status") or ""
         text: str = msg.get("text", "") or msg.get("transcript", "") or ""
         self._last_message_type = msg_type or "snapshot"
+        if text:
+            self._last_message_text = text
 
         buffer_text = msg.get("buffer_transcription")
         if buffer_text is not None:
@@ -295,6 +297,7 @@ class WhisperLiveKitClient:
 
     def _put_partial(self, text: str) -> None:
         """Publish live, replaceable buffer text to the dashboard."""
+        self._drain_queue(self._partial_queue)
         try:
             self._partial_queue.put_nowait(text)
             self._partial_count += 1
@@ -314,3 +317,12 @@ class WhisperLiveKitClient:
 
         if delivered:
             self._committed_count += 1
+
+    @staticmethod
+    def _drain_queue(target_queue: queue.Queue[Any]) -> None:
+        """Remove stale queued items so a latest-value display queue stays fresh."""
+        while True:
+            try:
+                target_queue.get_nowait()
+            except queue.Empty:
+                return

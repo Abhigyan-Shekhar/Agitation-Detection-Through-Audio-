@@ -143,6 +143,8 @@ def make_manual_event_record(
 def event_to_record(event: BehaviourEvent, result: FusedResult | None = None) -> dict[str, Any]:
     """Convert a detected BehaviourEvent into the dashboard storage shape."""
     timestamp = event.timestamp
+    if isinstance(timestamp, (int, float)):
+        timestamp = datetime.fromtimestamp(timestamp)
     if not isinstance(timestamp, datetime):
         timestamp = datetime.now()
     return {

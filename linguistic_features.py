@@ -125,6 +125,11 @@ NEGATIVE_HINGLISH: frozenset[str] = frozenset({
     "galat", "bekar", "dukh", "taklif", "khafa", "chinta",
 })
 
+NEGATIVE_ENGLISH: frozenset[str] = frozenset({
+    "afraid", "angry", "awful", "bad", "crying", "hate", "hated", "horrible",
+    "hurt", "pain", "sad", "scared", "terrible", "upset", "worse", "worst",
+})
+
 PROFANITY_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bf+u+c+k+\b", re.I),
     re.compile(r"\bsh+i+t+\b", re.I),
@@ -340,11 +345,13 @@ class LinguisticAnalyzer:
             vader_scores = _vader.polarity_scores(text)
             score = max(score, vader_scores["neg"])
 
-        # Hinglish supplement
+        # Lightweight lexical supplement keeps scoring useful when VADER is not
+        # installed in the local runtime.
         words = set(_normalize(text).split())
         hinglish_matches = len(words & NEGATIVE_HINGLISH)
-        hinglish_score = min(1.0, hinglish_matches / 3.0)
-        score = max(score, hinglish_score)
+        english_matches = len(words & NEGATIVE_ENGLISH)
+        lexical_score = min(1.0, (hinglish_matches + english_matches) / 3.0)
+        score = max(score, lexical_score)
 
         return score
 

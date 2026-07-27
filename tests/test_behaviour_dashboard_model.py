@@ -93,6 +93,17 @@ def test_detected_event_record_matches_dashboard_storage_shape():
     assert record["source"] == "Detected"
 
 
+def test_detected_event_record_preserves_unix_timestamp():
+    event = BehaviourEvent(
+        canonical_label="Complaining",
+        timestamp=datetime(2026, 7, 26, 10, 0).timestamp(),
+    )
+
+    record = event_to_record(event)
+
+    assert record["timestamp"] == datetime(2026, 7, 26, 10, 0)
+
+
 def test_permissions_allow_logging_only_for_care_roles():
     assert can_view_dashboard("Read only")
     assert not can_log_behaviour("Read only")
