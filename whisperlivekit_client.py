@@ -75,6 +75,8 @@ class WhisperLiveKitClient:
         self._messages_received = 0
         self._last_message_type = ""
         self._last_message_text = ""
+        self._last_partial_text = ""
+        self._last_committed_text = ""
         self._emitted_line_keys: set[tuple[Any, ...]] = set()
 
     def start(self) -> None:
@@ -129,6 +131,7 @@ class WhisperLiveKitClient:
             "committed_count": self._committed_count,
             "last_message_type": self._last_message_type,
             "last_message_text": self._last_message_text,
+            "last_partial_text": self._last_partial_text,
             "last_error": str(self._last_error) if self._last_error else "",
         }
 
@@ -244,8 +247,11 @@ class WhisperLiveKitClient:
 
         buffer_text = msg.get("buffer_transcription")
         if buffer_text is not None:
-            self._last_message_text = str(buffer_text)
-            self._put_partial(str(buffer_text))
+            live_text = str(buffer_text).strip()
+            if live_text:
+                self._last_message_text = live_text
+                self._last_partial_text = live_text
+                self._put_partial(live_text)
 
         if "lines" in msg:
             self._dispatch_lines(msg.get("lines", []))
@@ -263,9 +269,16 @@ class WhisperLiveKitClient:
         if msg_type in ("committed", "final", "complete", "completed", ""):
             if text:
                 self._put_committed_text(text)
+            elif buffer_text is not None:
+                self._commit_last_partial_if_needed()
             return
 
-        if msg_type in ("config", "ready_to_stop", "no_audio_detected"):
+        if msg_type in ("active_transcription", "no_audio_detected"):
+            if buffer_text is not None and not str(buffer_text).strip():
+                self._commit_last_partial_if_needed()
+            return
+
+        if msg_type in ("config", "ready_to_stop"):
             return
 
         logger.debug("Unknown WLK message type %r: %r", msg_type, msg)
@@ -295,6 +308,14 @@ class WhisperLiveKitClient:
             self._emitted_line_keys.add(line_key)
             self._put_committed_text(text)
 
+    def _commit_last_partial_if_needed(self) -> None:
+        """Commit buffered live text when WLK ends speech without a line."""
+        text = self._last_partial_text.strip()
+        if not text:
+            return
+        self._put_committed_text(text)
+        self._last_partial_text = ""
+
     def _put_partial(self, text: str) -> None:
         """Publish live, replaceable buffer text to the dashboard."""
         self._drain_queue(self._partial_queue)
@@ -306,7 +327,11 @@ class WhisperLiveKitClient:
 
     def _put_committed_text(self, text: str) -> None:
         """Publish a committed transcript line to all downstream consumers."""
-        line = CommittedLine(text=text.strip(), timestamp=time.time())
+        clean_text = text.strip()
+        if not clean_text or clean_text == self._last_committed_text:
+            return
+
+        line = CommittedLine(text=clean_text, timestamp=time.time())
         delivered = False
         for committed_queue in self._committed_queues:
             try:
@@ -316,6 +341,8 @@ class WhisperLiveKitClient:
                 logger.warning("committed_queue full — committed line dropped")
 
         if delivered:
+            self._last_committed_text = clean_text
+            self._last_message_text = clean_text
             self._committed_count += 1
 
     @staticmethod

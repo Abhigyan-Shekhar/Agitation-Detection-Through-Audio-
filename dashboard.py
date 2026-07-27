@@ -122,6 +122,26 @@ def _pipeline_running() -> bool:
     return bool(manager and manager.is_running)
 
 
+def _current_recording_text() -> str:
+    """Return the freshest transcript text available for the live panel."""
+    partial = st.session_state.partial_caption.strip()
+    if partial:
+        return partial
+
+    committed = st.session_state.committed_lines
+    if committed:
+        return committed[-1]
+
+    manager = st.session_state.get("manager")
+    wlk_client = manager.wlk_client if manager is not None else None
+    if wlk_client is not None:
+        last_text = str(wlk_client.stats.get("last_message_text", "")).strip()
+        if last_text:
+            return last_text
+
+    return "_Waiting for speech..._"
+
+
 def _start_pipeline() -> None:
     st.session_state.error = None
     st.session_state.partial_caption = ""
@@ -535,8 +555,7 @@ def _render() -> None:
         live_col, current_col = st.columns([1, 1])
         with live_col:
             st.subheader("🎙️ Current Recording")
-            partial = st.session_state.partial_caption or "_Waiting for speech…_"
-            st.markdown(f"> {partial}")
+            st.markdown(f"> {_current_recording_text()}")
             committed = st.session_state.committed_lines
             with st.expander("📝 Current Transcript", expanded=bool(committed)):
                 st.write("  \n".join(committed[-20:]) if committed else "No committed transcript yet.")
