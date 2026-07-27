@@ -160,6 +160,7 @@ class WhisperLiveKitClient:
                     _MAX_RECONNECT_ATTEMPTS,
                 )
                 await asyncio.sleep(_RECONNECT_DELAY_SEC)
+        self._connected_event.clear()
 
     async def _connect_once(self) -> None:
         logger.info("Connecting to WLK at %s", self._url)
