@@ -13,7 +13,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from typing import Any
 
@@ -224,8 +223,8 @@ class DashboardManager:
         )
         self.acoustic_worker = AcousticWorker(
             acoustic_queue=self.pipeline.acoustic_queue,
+            window_callback=self._baseline_manager.feed,
         )
-        self._patch_acoustic_worker_baseline_feed()
 
     def _connect_websocket(self) -> None:
         if self.wlk_client is None:
@@ -246,39 +245,6 @@ class DashboardManager:
             raise DashboardStartupError(f"{self._diagnostics()}\nAudioPipeline is not ready.")
         logger.info("Starting microphone")
         self.pipeline.start()
-
-    def _patch_acoustic_worker_baseline_feed(self) -> None:
-        """Preserve the existing dashboard baseline feed behavior."""
-        acoustic_worker = self.acoustic_worker
-        if acoustic_worker is None:
-            return
-
-        def _run_with_baseline_feed() -> None:
-            while not acoustic_worker._stop_event.is_set():
-                acoustic_worker._drain_queue()
-                now = time.time()
-                if now - acoustic_worker._last_extraction_time >= acoustic_worker._hop_sec:
-                    records = acoustic_worker._ring.latest_window(
-                        acoustic_worker._window_sec
-                    )
-                    if records:
-                        window_end = now
-                        window_start = window_end - acoustic_worker._window_sec
-                        feat = acoustic_worker._extractor.extract(
-                            records, window_start, window_end
-                        )
-                        with acoustic_worker._lock:
-                            acoustic_worker._windows.append(feat)
-                        acoustic_worker._last_extraction_time = now
-                        acoustic_worker._windows_extracted += 1
-                        self._baseline_manager.feed(feat)
-                time.sleep(0.010)
-
-        acoustic_worker._thread = threading.Thread(
-            target=_run_with_baseline_feed,
-            name="acoustic-worker",
-            daemon=True,
-        )
 
     def _stop_wlk(self) -> None:
         proc = self.wlk_proc

@@ -151,3 +151,35 @@ def test_filter_records_and_summary_metrics():
     assert summary["today_events"] == 1
     assert summary["high_severity_events"] == 1
     assert summary["most_common_behaviour"] == "Screaming"
+
+
+def test_filter_records_accepts_list_range_values():
+    records = [
+        make_manual_event_record(
+            timestamp=datetime(2026, 7, 26, 9, 30),
+            resident="Room 12",
+            behaviour="Screaming",
+            severity="High",
+            location="Hallway",
+            duration=2,
+        ),
+        make_manual_event_record(
+            timestamp=datetime(2026, 7, 27, 15, 0),
+            resident="Room 8",
+            behaviour="Complaining",
+            severity="Low",
+            location="Dining room",
+            duration=5,
+        ),
+    ]
+    df = records_dataframe(records)
+
+    filtered = filter_records(
+        df,
+        {
+            "date_range": [date(2026, 7, 26), date(2026, 7, 26)],
+            "time_range": [time(0, 0), time(23, 59)],
+        },
+    )
+
+    assert filtered["resident"].tolist() == ["Room 12"]

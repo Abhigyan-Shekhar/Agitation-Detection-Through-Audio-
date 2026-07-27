@@ -180,6 +180,12 @@ def _selected(values: Iterable[Any] | None) -> list[Any]:
     return [value for value in values or [] if value not in (None, "")]
 
 
+def _range_pair(value: Any) -> tuple[Any, Any] | None:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return value[0], value[1]
+    return None
+
+
 def filter_records(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
     """Apply sidebar filter values to dashboard records."""
     if df.empty:
@@ -196,16 +202,18 @@ def filter_records(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
             filtered = filtered[filtered[column].isin(selected)]
 
     date_range = filters.get("date_range")
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = date_range
+    date_pair = _range_pair(date_range)
+    if date_pair is not None:
+        start_date, end_date = date_pair
         filtered = filtered[
             (filtered["timestamp"].dt.date >= start_date)
             & (filtered["timestamp"].dt.date <= end_date)
         ]
 
     time_range = filters.get("time_range")
-    if isinstance(time_range, tuple) and len(time_range) == 2:
-        start_time, end_time = time_range
+    time_pair = _range_pair(time_range)
+    if time_pair is not None:
+        start_time, end_time = time_pair
         if isinstance(start_time, time) and isinstance(end_time, time):
             filtered = filtered[
                 (filtered["timestamp"].dt.time >= start_time)

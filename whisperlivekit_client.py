@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _SEND_CHUNK_BYTES: int = int(config.SAMPLE_RATE * 0.040 * 2)
 _RECONNECT_DELAY_SEC: float = 2.0
 _MAX_RECONNECT_ATTEMPTS: int = 5
+_LINE_SNAPSHOT_STABLE_SEC: float = 0.8
 
 
 def float32_to_pcm16(audio: np.ndarray) -> bytes:
@@ -77,6 +78,9 @@ class WhisperLiveKitClient:
         self._last_message_text = ""
         self._last_partial_text = ""
         self._last_committed_text = ""
+        self._line_snapshot_text = ""
+        self._line_snapshot_updated_at = 0.0
+        self._line_snapshot_has_silence = False
         self._emitted_line_keys: set[tuple[Any, ...]] = set()
 
     def start(self) -> None:
@@ -247,18 +251,16 @@ class WhisperLiveKitClient:
 
         buffer_text = msg.get("buffer_transcription")
         if buffer_text is not None:
-            live_text = str(buffer_text).strip()
-            if live_text:
-                self._last_message_text = live_text
-                self._last_partial_text = live_text
-                self._put_partial(live_text)
-
-        if "lines" in msg:
-            self._dispatch_lines(msg.get("lines", []))
-            return
+            self._set_partial_text(str(buffer_text))
 
         if msg_type == "diff":
             self._dispatch_lines(msg.get("new_lines", []))
+            return
+
+        if "lines" in msg:
+            self._dispatch_lines_snapshot(msg.get("lines", []))
+            if msg_type in ("committed", "final", "complete", "completed"):
+                self._commit_last_partial_if_needed()
             return
 
         if msg_type in ("partial", "interim", "processing"):
@@ -279,6 +281,8 @@ class WhisperLiveKitClient:
             return
 
         if msg_type in ("config", "ready_to_stop"):
+            if msg_type == "ready_to_stop":
+                self._commit_last_partial_if_needed()
             return
 
         logger.debug("Unknown WLK message type %r: %r", msg_type, msg)
@@ -308,6 +312,43 @@ class WhisperLiveKitClient:
             self._emitted_line_keys.add(line_key)
             self._put_committed_text(text)
 
+    def _dispatch_lines_snapshot(self, lines: Any) -> None:
+        """Use WLK ``lines`` snapshots as mutable live transcript previews."""
+        if not isinstance(lines, list):
+            logger.debug("Ignoring malformed WLK lines payload: %r", lines)
+            return
+
+        texts: list[str] = []
+        has_silence = False
+        for raw_line in lines:
+            if not isinstance(raw_line, dict):
+                continue
+            if raw_line.get("speaker") == -2:
+                has_silence = True
+                continue
+            text = str(raw_line.get("text") or "").strip()
+            if text:
+                texts.append(text)
+
+        if texts:
+            snapshot_text = " ".join(texts)
+            now = time.monotonic()
+            if snapshot_text != self._line_snapshot_text:
+                self._line_snapshot_text = snapshot_text
+                self._line_snapshot_updated_at = now
+                self._line_snapshot_has_silence = has_silence
+            else:
+                self._line_snapshot_has_silence = (
+                    self._line_snapshot_has_silence or has_silence
+                )
+
+            self._set_partial_text(snapshot_text)
+            if (
+                self._line_snapshot_has_silence
+                and now - self._line_snapshot_updated_at >= _LINE_SNAPSHOT_STABLE_SEC
+            ):
+                self._commit_last_partial_if_needed()
+
     def _commit_last_partial_if_needed(self) -> None:
         """Commit buffered live text when WLK ends speech without a line."""
         text = self._last_partial_text.strip()
@@ -315,6 +356,19 @@ class WhisperLiveKitClient:
             return
         self._put_committed_text(text)
         self._last_partial_text = ""
+
+    def _set_partial_text(self, text: str) -> None:
+        """Record a non-empty live transcript update if it changed."""
+        clean_text = text.strip()
+        if (
+            not clean_text
+            or clean_text == self._last_partial_text
+            or clean_text == self._last_committed_text
+        ):
+            return
+        self._last_message_text = clean_text
+        self._last_partial_text = clean_text
+        self._put_partial(clean_text)
 
     def _put_partial(self, text: str) -> None:
         """Publish live, replaceable buffer text to the dashboard."""

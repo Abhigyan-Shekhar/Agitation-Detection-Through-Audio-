@@ -22,6 +22,9 @@ def _client_for_dispatch(
     client._last_message_text = ""
     client._last_partial_text = ""
     client._last_committed_text = ""
+    client._line_snapshot_text = ""
+    client._line_snapshot_updated_at = 0.0
+    client._line_snapshot_has_silence = False
     client._last_error = None
     client._emitted_line_keys = set()
     return client
@@ -66,10 +69,11 @@ def test_partial_caption_queue_keeps_latest_value_when_full() -> None:
     assert client._partial_count == 1
 
 
-def test_wlk_lines_snapshot_emits_only_new_committed_lines() -> None:
+def test_wlk_lines_snapshot_updates_partial_without_committing() -> None:
+    partial_q: queue.Queue[str] = queue.Queue()
     committed_q: queue.Queue[CommittedLine] = queue.Queue()
 
-    client = _client_for_dispatch(committed_q=committed_q)
+    client = _client_for_dispatch(partial_q, committed_q)
 
     msg = {
         "status": "active_transcription",
@@ -87,7 +91,94 @@ def test_wlk_lines_snapshot_emits_only_new_committed_lines() -> None:
     client._dispatch(msg)
     client._dispatch(msg)
 
-    assert committed_q.get_nowait().text == "Hello dashboard."
+    assert committed_q.empty()
+    assert partial_q.get_nowait() == "Hello dashboard."
+    assert partial_q.empty()
+    assert client._partial_count == 1
+
+
+def test_wlk_incremental_line_snapshots_commit_only_final_text() -> None:
+    partial_q: queue.Queue[str] = queue.Queue()
+    committed_q: queue.Queue[CommittedLine] = queue.Queue()
+    client = _client_for_dispatch(partial_q, committed_q)
+
+    for text in [
+        "Hello, hello",
+        "Hello, hello, hello",
+        "Hello, hello, hello, please help me now",
+    ]:
+        client._dispatch({
+            "status": "active_transcription",
+            "lines": [
+                {
+                    "speaker": 1,
+                    "start": "0:00:00",
+                    "end": "0:00:02",
+                    "text": text,
+                }
+            ],
+            "buffer_transcription": "",
+        })
+
+    client._dispatch({
+        "status": "no_audio_detected",
+        "buffer_transcription": "",
+    })
+
+    partials = []
+    while not partial_q.empty():
+        partials.append(partial_q.get_nowait())
+
+    assert partials[-1] == "Hello, hello, hello, please help me now"
+    assert committed_q.get_nowait().text == "Hello, hello, hello, please help me now"
+    assert committed_q.empty()
+    assert client._committed_count == 1
+
+
+def test_silent_line_snapshot_commits_after_stability_window(monkeypatch) -> None:
+    committed_q: queue.Queue[CommittedLine] = queue.Queue()
+    client = _client_for_dispatch(committed_q=committed_q)
+    current_time = 100.0
+
+    def fake_monotonic() -> float:
+        return current_time
+
+    monkeypatch.setattr("whisperlivekit_client.time.monotonic", fake_monotonic)
+
+    msg = {
+        "status": "active_transcription",
+        "lines": [
+            {
+                "speaker": 1,
+                "start": "0:00:00",
+                "end": "0:00:02",
+                "text": "please help me now",
+            },
+            {
+                "speaker": -2,
+                "start": "0:00:03",
+                "end": "0:00:03",
+                "text": "",
+            },
+        ],
+        "buffer_transcription": "",
+    }
+
+    client._dispatch(msg)
+    assert committed_q.empty()
+
+    current_time = 100.4
+    client._dispatch(msg)
+    assert committed_q.empty()
+
+    current_time = 100.9
+    client._dispatch(msg)
+    assert committed_q.get_nowait().text == "please help me now"
+    assert committed_q.empty()
+    assert client._committed_count == 1
+
+    current_time = 101.8
+    client._dispatch(msg)
     assert committed_q.empty()
     assert client._committed_count == 1
 

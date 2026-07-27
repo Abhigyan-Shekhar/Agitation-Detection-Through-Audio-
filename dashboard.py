@@ -332,6 +332,12 @@ def _default_filters(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _range_pair(value: Any) -> tuple[Any, Any] | None:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return value[0], value[1]
+    return None
+
+
 def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
     if df.empty:
         return df
@@ -344,18 +350,20 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
     ]:
         if selected:
             filtered = filtered[filtered[column].isin(selected)]
-    date_range = filters["date_range"]
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = date_range
+    date_pair = _range_pair(filters["date_range"])
+    if date_pair is not None:
+        start_date, end_date = date_pair
         filtered = filtered[
             (filtered["timestamp"].dt.date >= start_date)
             & (filtered["timestamp"].dt.date <= end_date)
         ]
-    start_time, end_time = filters["time_range"]
-    filtered = filtered[
-        (filtered["timestamp"].dt.time >= start_time)
-        & (filtered["timestamp"].dt.time <= end_time)
-    ]
+    time_pair = _range_pair(filters["time_range"])
+    if time_pair is not None:
+        start_time, end_time = time_pair
+        filtered = filtered[
+            (filtered["timestamp"].dt.time >= start_time)
+            & (filtered["timestamp"].dt.time <= end_time)
+        ]
     search = filters["search"].strip().lower()
     if search:
         haystack = (

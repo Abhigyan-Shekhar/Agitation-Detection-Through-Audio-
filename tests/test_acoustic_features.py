@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import time
+import queue
 import numpy as np
 import pytest
 
 pytest.importorskip("librosa")
 
+import acoustic_features
 from acoustic_features import AcousticExtractor, _safe, _AudioRecord
+from audio_pipeline import TimestampedFrame
+from event_models import AcousticFeatureWindow
 
 
 def _make_record(
@@ -99,3 +103,89 @@ class TestAcousticExtractor:
         ]:
             val = getattr(w, field_name)
             assert np.isfinite(val), f"{field_name}={val} is not finite"
+
+
+def test_acoustic_worker_invokes_window_callback(monkeypatch):
+    class FakeVAD:
+        def is_speech(self, frame):
+            return True
+
+    class FakeExtractor:
+        def extract(self, records, window_start, window_end):
+            return AcousticFeatureWindow(
+                start_time=window_start,
+                end_time=window_end,
+                rms_mean=0.2,
+                voiced_ratio=1.0,
+            )
+
+    monkeypatch.setattr(acoustic_features, "SileroVAD", lambda: FakeVAD())
+    monkeypatch.setattr(acoustic_features, "AcousticExtractor", lambda: FakeExtractor())
+
+    acoustic_queue: queue.Queue[TimestampedFrame] = queue.Queue()
+    callback_windows: list[AcousticFeatureWindow] = []
+    worker = acoustic_features.AcousticWorker(
+        acoustic_queue=acoustic_queue,
+        window_sec=0.01,
+        hop_sec=0.01,
+        ring_buffer_sec=1.0,
+        window_callback=callback_windows.append,
+    )
+
+    acoustic_queue.put_nowait(TimestampedFrame(
+        data=np.ones(512, dtype=np.float32),
+        timestamp=time.time(),
+    ))
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not callback_windows:
+            time.sleep(0.01)
+    finally:
+        worker.stop()
+
+    assert callback_windows
+    assert callback_windows[0].rms_mean == pytest.approx(0.2)
+
+
+def test_dashboard_manager_wires_acoustic_windows_to_baseline(monkeypatch):
+    import dashboard_manager
+    from baseline_manager import BaselineManager
+
+    class FakeAudioPipeline:
+        def __init__(self):
+            self.acoustic_queue = queue.Queue()
+            self.wlk_queue = queue.Queue()
+
+    class FakeWlkClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeUtteranceAggregator:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeAcousticWorker:
+        def __init__(self, acoustic_queue, window_callback=None):
+            self.acoustic_queue = acoustic_queue
+            self.window_callback = window_callback
+
+    monkeypatch.setattr(dashboard_manager, "AudioPipeline", FakeAudioPipeline)
+    monkeypatch.setattr(dashboard_manager, "WhisperLiveKitClient", FakeWlkClient)
+    monkeypatch.setattr(dashboard_manager, "UtteranceAggregator", FakeUtteranceAggregator)
+    monkeypatch.setattr(dashboard_manager, "AcousticWorker", FakeAcousticWorker)
+
+    baseline_manager = BaselineManager()
+    manager = dashboard_manager.DashboardManager(
+        partial_queue=queue.Queue(),
+        committed_queue=queue.Queue(),
+        committed_display_queue=queue.Queue(),
+        utterance_queue=queue.Queue(),
+        baseline_manager=baseline_manager,
+    )
+
+    manager._create_pipeline_components()
+    window = AcousticFeatureWindow(start_time=1.0, end_time=2.0, rms_mean=0.5)
+    manager.acoustic_worker.window_callback(window)
+
+    assert list(baseline_manager._rolling) == [window]

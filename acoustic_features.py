@@ -28,7 +28,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Deque
+from typing import Callable, Deque
 
 import librosa
 import numpy as np
@@ -284,10 +284,12 @@ class AcousticWorker:
         window_sec: float = config.ACOUSTIC_WINDOW_SEC,
         hop_sec: float = config.ACOUSTIC_HOP_SEC,
         ring_buffer_sec: float = config.AUDIO_RING_BUFFER_SEC,
+        window_callback: Callable[[AcousticFeatureWindow], None] | None = None,
     ) -> None:
         self._queue = acoustic_queue
         self._window_sec = window_sec
         self._hop_sec = hop_sec
+        self._window_callback = window_callback
 
         self._vad = SileroVAD()
         self._ring = AudioRingBuffer(max_seconds=ring_buffer_sec)
@@ -375,6 +377,7 @@ class AcousticWorker:
                         self._windows.append(feat)
                     self._last_extraction_time = now
                     self._windows_extracted += 1
+                    self._emit_window(feat)
 
             time.sleep(0.010)   # ~10 ms yield
 
@@ -390,6 +393,14 @@ class AcousticWorker:
     # ------------------------------------------------------------------
     # Helper
     # ------------------------------------------------------------------
+
+    def _emit_window(self, window: AcousticFeatureWindow) -> None:
+        if self._window_callback is None:
+            return
+        try:
+            self._window_callback(window)
+        except Exception:  # noqa: BLE001
+            logger.exception("Acoustic window callback failed")
 
     @staticmethod
     def _average_windows(
