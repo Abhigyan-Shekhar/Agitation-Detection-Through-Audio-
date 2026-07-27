@@ -5,6 +5,8 @@ import time
 import numpy as np
 import pytest
 
+pytest.importorskip("librosa")
+
 from acoustic_features import AcousticExtractor, _safe, _AudioRecord
 
 
