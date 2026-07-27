@@ -8,7 +8,7 @@ Responsibilities
 * Parse JSON messages from WLK and classify them as:
     - ``partial``   → live caption (put on ``partial_queue``)
     - ``committed`` → stable transcript lines (put on ``committed_queue``)
-* Reconnect automatically after a connection drop.
+* Reconnect a bounded number of times after a connection drop.
 * On ``stop()``, flush any remaining audio before closing.
 
 WhisperLiveKit message protocol (--pcm-input mode)
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 # How many bytes to send per WebSocket message (≈ 40 ms of audio)
 _SEND_CHUNK_BYTES: int = int(config.SAMPLE_RATE * 0.040 * 2)  # 16-bit = 2 bytes/sample
 _RECONNECT_DELAY_SEC: float = 2.0
+_MAX_RECONNECT_ATTEMPTS: int = 5
 
 
 def float32_to_pcm16(audio: np.ndarray) -> bytes:
@@ -92,7 +93,10 @@ class WhisperLiveKitClient:
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._ws: Any | None = None
         self._stop_event = threading.Event()
+        self._connected_event = threading.Event()
+        self._last_error: Exception | None = None
 
         self._bytes_sent: int = 0
         self._partial_count: int = 0
@@ -109,17 +113,36 @@ class WhisperLiveKitClient:
             return
 
         self._stop_event.clear()
+        self._connected_event.clear()
+        self._last_error = None
         self._thread = threading.Thread(
             target=self._run_event_loop, name="wlk-client", daemon=True
         )
         self._thread.start()
         logger.info("WhisperLiveKitClient thread started → %s", self._url)
 
+    def wait_until_connected(self, timeout: float = 10.0) -> None:
+        """Block until the websocket connects or raise a startup error."""
+        if not self._connected_event.wait(timeout=timeout):
+            if self._last_error is not None:
+                raise RuntimeError(
+                    f"WLK websocket failed to connect: {self._last_error}"
+                )
+            raise TimeoutError(
+                f"WLK websocket did not connect to {self._url} "
+                f"within {timeout:.1f}s"
+            )
+
     def stop(self) -> None:
         """Signal the client to flush remaining audio and shut down."""
         self._stop_event.set()
+        if self._loop and self._loop.is_running():
+            if self._ws is not None:
+                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+            self._loop.call_soon_threadsafe(lambda: None)
         if self._thread:
             self._thread.join(timeout=5.0)
+        self._connected_event.clear()
         logger.info(
             "WhisperLiveKitClient stopped — bytes_sent=%d partial=%d committed=%d",
             self._bytes_sent,
@@ -149,26 +172,88 @@ class WhisperLiveKitClient:
             loop.close()
 
     async def _connect_loop(self) -> None:
-        """Reconnect automatically until stop() is called."""
+        """Connect to WLK and retry a bounded number of times while running."""
+        attempts = 0
         while not self._stop_event.is_set():
             try:
                 logger.info("Connecting to WLK at %s", self._url)
                 async with websockets.connect(self._url) as ws:
+                    self._ws = ws
+                    attempts = 0
+                    self._last_error = None
+                    self._connected_event.set()
                     logger.info("WLK connection established")
-                    await asyncio.gather(
-                        self._send_loop(ws),
-                        self._recv_loop(ws),
-                    )
+                    try:
+                        await asyncio.gather(
+                            self._send_loop(ws),
+                            self._recv_loop(ws),
+                        )
+                    finally:
+                        self._ws = None
             except ConnectionClosed as exc:
+                self._connected_event.clear()
                 if self._stop_event.is_set():
                     break
-                logger.warning("WLK connection closed: %s — reconnecting in %.1fs", exc, _RECONNECT_DELAY_SEC)
+                attempts += 1
+                self._last_error = exc
+                if attempts > _MAX_RECONNECT_ATTEMPTS:
+                    logger.error(
+                        "WLK connection closed after %d retries: %s",
+                        attempts - 1,
+                        exc,
+                    )
+                    break
+                logger.warning(
+                    "WLK connection closed: %s — reconnecting in %.1fs (%d/%d)",
+                    exc,
+                    _RECONNECT_DELAY_SEC,
+                    attempts,
+                    _MAX_RECONNECT_ATTEMPTS,
+                )
                 await asyncio.sleep(_RECONNECT_DELAY_SEC)
             except OSError as exc:
+                self._connected_event.clear()
                 if self._stop_event.is_set():
                     break
-                logger.warning("WLK connection failed: %s — retrying in %.1fs", exc, _RECONNECT_DELAY_SEC)
+                attempts += 1
+                self._last_error = exc
+                if attempts > _MAX_RECONNECT_ATTEMPTS:
+                    logger.error(
+                        "WLK connection failed after %d retries: %s",
+                        attempts - 1,
+                        exc,
+                    )
+                    break
+                logger.warning(
+                    "WLK connection failed: %s — retrying in %.1fs (%d/%d)",
+                    exc,
+                    _RECONNECT_DELAY_SEC,
+                    attempts,
+                    _MAX_RECONNECT_ATTEMPTS,
+                )
                 await asyncio.sleep(_RECONNECT_DELAY_SEC)
+            except Exception as exc:  # noqa: BLE001
+                self._connected_event.clear()
+                if self._stop_event.is_set():
+                    break
+                attempts += 1
+                self._last_error = exc
+                if attempts > _MAX_RECONNECT_ATTEMPTS:
+                    logger.error(
+                        "WLK websocket error after %d retries: %s",
+                        attempts - 1,
+                        exc,
+                    )
+                    break
+                logger.warning(
+                    "WLK websocket error: %s — retrying in %.1fs (%d/%d)",
+                    exc,
+                    _RECONNECT_DELAY_SEC,
+                    attempts,
+                    _MAX_RECONNECT_ATTEMPTS,
+                )
+                await asyncio.sleep(_RECONNECT_DELAY_SEC)
+        self._connected_event.clear()
 
     async def _send_loop(self, ws: Any) -> None:
         """Drain wlk_queue and stream PCM16 bytes to WLK."""
