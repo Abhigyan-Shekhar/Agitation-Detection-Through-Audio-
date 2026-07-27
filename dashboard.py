@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import queue
 import socket
 import subprocess
+import sys
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
@@ -169,6 +171,8 @@ def _start_wlk_server() -> subprocess.Popen | None:
     cmd = _wlk_command()
     logger.info("Launching WLK server: %s", " ".join(cmd))
     try:
+        cmd = _wlk_command()
+        logger.info("Launching WLK server: %s", " ".join(cmd))
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
