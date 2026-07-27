@@ -77,7 +77,7 @@ class DashboardManager:
             "wlk",
             "serve",
             "--backend",
-            config.WLK_BACKEND,
+            "faster-whisper",
             "--model",
             config.WLK_MODEL,
             "--language",
@@ -298,7 +298,7 @@ class DashboardManager:
             f"WebSocket URL: {config.WLK_URL}",
             f"Host: {config.WLK_HOST}",
             f"Port: {config.WLK_PORT}",
-            f"Backend: {config.WLK_BACKEND}",
+            "Backend: faster-whisper",
             f"Model: {config.WLK_MODEL}",
         ])
 
