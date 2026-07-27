@@ -43,11 +43,13 @@ class DashboardManager:
         self,
         partial_queue: queue.Queue[str],
         committed_queue: queue.Queue[CommittedLine],
+        committed_display_queue: queue.Queue[CommittedLine],
         utterance_queue: queue.Queue[Utterance],
         baseline_manager: BaselineManager,
     ) -> None:
         self._partial_queue = partial_queue
         self._committed_queue = committed_queue
+        self._committed_display_queue = committed_display_queue
         self._utterance_queue = utterance_queue
         self._baseline_manager = baseline_manager
 
@@ -77,7 +79,7 @@ class DashboardManager:
             "wlk",
             "serve",
             "--backend",
-            "faster-whisper",
+            config.WLK_BACKEND,
             "--model",
             config.WLK_MODEL,
             "--language",
@@ -193,7 +195,10 @@ class DashboardManager:
         self.wlk_client = WhisperLiveKitClient(
             wlk_queue=self.pipeline.wlk_queue,
             partial_queue=self._partial_queue,
-            committed_queue=self._committed_queue,
+            committed_queue=[
+                self._committed_queue,
+                self._committed_display_queue,
+            ],
         )
         self.utterance_aggregator = UtteranceAggregator(
             committed_queue=self._committed_queue,
@@ -276,7 +281,12 @@ class DashboardManager:
             self.wlk_proc = None
 
     def _clear_runtime_queues(self) -> None:
-        for q in (self._partial_queue, self._committed_queue, self._utterance_queue):
+        for q in (
+            self._partial_queue,
+            self._committed_queue,
+            self._committed_display_queue,
+            self._utterance_queue,
+        ):
             while True:
                 try:
                     q.get_nowait()
@@ -298,7 +308,7 @@ class DashboardManager:
             f"WebSocket URL: {config.WLK_URL}",
             f"Host: {config.WLK_HOST}",
             f"Port: {config.WLK_PORT}",
-            "Backend: faster-whisper",
+            f"Backend: {config.WLK_BACKEND}",
             f"Model: {config.WLK_MODEL}",
         ])
 

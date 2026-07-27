@@ -68,6 +68,7 @@ def _init() -> None:
         # Queues
         "partial_queue": queue.Queue(maxsize=5),
         "committed_queue": queue.Queue(maxsize=100),
+        "committed_display_queue": queue.Queue(maxsize=100),
         "utterance_queue": queue.Queue(maxsize=50),
         # Display state
         "partial_caption": "",
@@ -107,6 +108,7 @@ def _get_manager() -> DashboardManager:
         manager = DashboardManager(
             partial_queue=st.session_state.partial_queue,
             committed_queue=st.session_state.committed_queue,
+            committed_display_queue=st.session_state.committed_display_queue,
             utterance_queue=st.session_state.utterance_queue,
             baseline_manager=st.session_state.baseline_manager,
         )
@@ -152,7 +154,7 @@ def _consume() -> None:
     try:
         while True:
             from event_models import CommittedLine
-            line: CommittedLine = st.session_state.committed_queue.get_nowait()
+            line: CommittedLine = st.session_state.committed_display_queue.get_nowait()
             st.session_state.committed_lines.append(line.text)
             if len(st.session_state.committed_lines) > 50:
                 st.session_state.committed_lines.pop(0)

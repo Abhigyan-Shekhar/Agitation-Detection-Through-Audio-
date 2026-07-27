@@ -48,7 +48,7 @@ class WhisperLiveKitClient:
         self,
         wlk_queue: queue.Queue[TimestampedFrame],
         partial_queue: queue.Queue[str],
-        committed_queue: queue.Queue[CommittedLine],
+        committed_queue: queue.Queue[CommittedLine] | list[queue.Queue[CommittedLine]],
         url: str = config.WLK_URL,
     ) -> None:
         if websockets is None:
@@ -56,7 +56,10 @@ class WhisperLiveKitClient:
 
         self._wlk_queue = wlk_queue
         self._partial_queue = partial_queue
-        self._committed_queue = committed_queue
+        if isinstance(committed_queue, list):
+            self._committed_queues = committed_queue
+        else:
+            self._committed_queues = [committed_queue]
         self._url = url
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -69,6 +72,7 @@ class WhisperLiveKitClient:
         self._bytes_sent = 0
         self._partial_count = 0
         self._committed_count = 0
+        self._emitted_line_keys: set[tuple[Any, ...]] = set()
 
     def start(self) -> None:
         """Start the single websocket background thread."""
@@ -226,24 +230,77 @@ class WhisperLiveKitClient:
         """Route a parsed WLK message to the appropriate output queue."""
         msg_type = msg.get("type") or msg.get("status") or ""
         text: str = msg.get("text", "") or msg.get("transcript", "") or ""
-        if not text:
+
+        buffer_text = msg.get("buffer_transcription")
+        if buffer_text is not None:
+            self._put_partial(str(buffer_text))
+
+        if "lines" in msg:
+            self._dispatch_lines(msg.get("lines", []))
+            return
+
+        if msg_type == "diff":
+            self._dispatch_lines(msg.get("new_lines", []))
             return
 
         if msg_type in ("partial", "interim", "processing"):
-            try:
-                self._partial_queue.put_nowait(text)
-                self._partial_count += 1
-            except queue.Full:
-                pass
+            if text:
+                self._put_partial(text)
             return
 
         if msg_type in ("committed", "final", "complete", "completed", ""):
-            line = CommittedLine(text=text.strip(), timestamp=time.time())
-            try:
-                self._committed_queue.put_nowait(line)
-                self._committed_count += 1
-            except queue.Full:
-                logger.warning("committed_queue full — committed line dropped")
+            if text:
+                self._put_committed_text(text)
+            return
+
+        if msg_type in ("config", "ready_to_stop", "no_audio_detected"):
             return
 
         logger.debug("Unknown WLK message type %r: %r", msg_type, msg)
+
+    def _dispatch_lines(self, lines: Any) -> None:
+        """Publish only newly committed WLK line objects."""
+        if not isinstance(lines, list):
+            logger.debug("Ignoring malformed WLK lines payload: %r", lines)
+            return
+
+        for raw_line in lines:
+            if not isinstance(raw_line, dict):
+                continue
+            if raw_line.get("speaker") == -2:
+                continue
+            text = str(raw_line.get("text") or "").strip()
+            if not text:
+                continue
+            line_key = (
+                raw_line.get("speaker"),
+                raw_line.get("start"),
+                raw_line.get("end"),
+                text,
+            )
+            if line_key in self._emitted_line_keys:
+                continue
+            self._emitted_line_keys.add(line_key)
+            self._put_committed_text(text)
+
+    def _put_partial(self, text: str) -> None:
+        """Publish live, replaceable buffer text to the dashboard."""
+        try:
+            self._partial_queue.put_nowait(text)
+            self._partial_count += 1
+        except queue.Full:
+            pass
+
+    def _put_committed_text(self, text: str) -> None:
+        """Publish a committed transcript line to all downstream consumers."""
+        line = CommittedLine(text=text.strip(), timestamp=time.time())
+        delivered = False
+        for committed_queue in self._committed_queues:
+            try:
+                committed_queue.put_nowait(line)
+                delivered = True
+            except queue.Full:
+                logger.warning("committed_queue full — committed line dropped")
+
+        if delivered:
+            self._committed_count += 1
