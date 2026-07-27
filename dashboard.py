@@ -21,12 +21,7 @@ WLK server is launched as a subprocess if WLK_AUTO_LAUNCH=true (default).
 from __future__ import annotations
 
 import logging
-import os
-import platform
 import queue
-import socket
-import subprocess
-import sys
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
@@ -35,10 +30,7 @@ import pandas as pd
 import streamlit as st
 
 import config
-from audio_pipeline import AudioPipeline
-from whisperlivekit_client import WhisperLiveKitClient
-from utterance_aggregator import UtteranceAggregator
-from acoustic_features import AcousticWorker
+from dashboard_manager import DashboardManager
 from baseline_manager import BaselineManager
 from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
@@ -68,15 +60,11 @@ USER_ROLES: tuple[str, ...] = (
 
 def _init() -> None:
     defaults: dict[str, Any] = {
-        "pipeline": None,
-        "wlk_client": None,
-        "utterance_aggregator": None,
-        "acoustic_worker": None,
+        "manager": None,
         "baseline_manager": None,
         "linguistic_analyzer": None,
         "score_fusion": None,
         "behaviour_classifier": None,
-        "wlk_proc": None,
         # Queues
         "partial_queue": queue.Queue(maxsize=5),
         "committed_queue": queue.Queue(maxsize=100),
@@ -112,272 +100,38 @@ def _ensure_services() -> None:
         st.session_state.behaviour_classifier = BehaviourClassifier()
 
 
-def _wlk_command() -> list[str]:
-    """Return the supported WhisperLiveKit launch command for this dashboard."""
-    return [
-        "wlk",
-        "serve",
-        "--backend",
-        config.WLK_BACKEND,
-        "--model",
-        config.WLK_MODEL,
-        "--language",
-        config.WLK_LANGUAGE,
-        "--pcm-input",
-        "--host",
-        config.WLK_HOST,
-        "--port",
-        str(config.WLK_PORT),
-    ]
-
-
-def _wlk_env() -> dict[str, str]:
-    """Return the environment used only by the WLK subprocess."""
-    env = os.environ.copy()
-    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-    return env
-
-
-def _wlk_command_text(cmd: list[str]) -> str:
-    """Return a readable launch command for logs and Streamlit diagnostics."""
-    return subprocess.list2cmdline(cmd)
-
-
-def _wlk_diagnostics(
-    cmd: list[str],
-    exit_code: int | None = None,
-    stdout: str = "",
-    stderr: str = "",
-) -> str:
-    """Format WLK launch settings and process output for Streamlit."""
-    lines = [
-        "WhisperLiveKit startup failed.",
-        f"Launch command: {_wlk_command_text(cmd)}",
-        f"WebSocket URL: {config.WLK_URL}",
-        f"TCP host: {config.WLK_HOST}",
-        f"TCP port: {config.WLK_PORT}",
-        f"Backend: {config.WLK_BACKEND}",
-        f"Model: {config.WLK_MODEL}",
-        f"Language: {config.WLK_LANGUAGE}",
-    ]
-    if exit_code is not None:
-        lines.append(f"Exit code: {exit_code}")
-    if stdout or stderr or exit_code is not None:
-        lines.extend([
-            f"stdout:\n{stdout.strip() or '(empty)'}",
-            f"stderr:\n{stderr.strip() or '(empty)'}",
-        ])
-    return "\n".join(lines)
-
-
-def _wlk_exit_diagnostics(proc: subprocess.Popen, cmd: list[str]) -> str:
-    """Return startup diagnostics for a WLK process that already exited."""
-    stdout, stderr = proc.communicate()
-    stdout_text = (
-        stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
-    )
-    stderr_text = (
-        stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
-    )
-    return _wlk_diagnostics(cmd, proc.returncode, stdout_text, stderr_text)
-
-
-def _wait_for_wlk_port(proc: subprocess.Popen | None, cmd: list[str]) -> bool:
-    """Wait until WLK accepts TCP connections, or report startup process output."""
-    while True:
-        if proc is not None and proc.poll() is not None:
-            st.session_state.error = _wlk_exit_diagnostics(proc, cmd)
-            return False
-        try:
-            with socket.create_connection(
-                (config.WLK_HOST, config.WLK_PORT), timeout=0.5
-            ):
-                return True
-        except OSError:
-            time.sleep(0.25)
-
-
-def _stop_wlk_server() -> None:
-    """Terminate the auto-launched WLK subprocess and free its TCP port."""
-    proc = st.session_state.get("wlk_proc")
-    if proc is None:
-        return
-
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
-    st.session_state.wlk_proc = None
-
-
-def _start_wlk_server() -> subprocess.Popen | None:
-    """Launch WhisperLiveKit server as a subprocess if auto-launch is enabled."""
-    if not config.WLK_AUTO_LAUNCH:
-        return None
-
-    cmd = _wlk_command()
-    logger.info("Launching WLK server: %s", _wlk_command_text(cmd))
-    try:
-        cmd = _wlk_command()
-        logger.info("Launching WLK server: %s", " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_wlk_env(),
+def _get_manager() -> DashboardManager:
+    """Return the single runtime manager stored in Streamlit session state."""
+    manager = st.session_state.get("manager")
+    if manager is None:
+        manager = DashboardManager(
+            partial_queue=st.session_state.partial_queue,
+            committed_queue=st.session_state.committed_queue,
+            utterance_queue=st.session_state.utterance_queue,
+            baseline_manager=st.session_state.baseline_manager,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not auto-launch WLK: %s", exc)
-        st.session_state.error = f"{_wlk_diagnostics(cmd)}\nException: {exc}"
-        return None
-    return proc
-
-    if not _wait_for_wlk_port(proc, cmd):
-        st.session_state.wlk_proc = None
-        return None
-    return proc
+        st.session_state.manager = manager
+    return manager
 
 
-def _drain_queue(q: queue.Queue) -> None:
-    """Remove stale runtime events from a session queue."""
-    while True:
-        try:
-            q.get_nowait()
-        except queue.Empty:
-            return
-
-
-def _reset_wlk_queues() -> None:
-    """Clear transcript queues before a new recording session starts."""
-    for key in ("partial_queue", "committed_queue", "utterance_queue"):
-        _drain_queue(st.session_state[key])
-    st.session_state.partial_caption = ""
+def _pipeline_running() -> bool:
+    """Return True when the live runtime manager has active microphone capture."""
+    manager = st.session_state.get("manager")
+    return bool(manager and manager.is_running)
 
 
 def _start_pipeline() -> None:
-    _ensure_services()
-
-    if st.session_state.pipeline is not None:
-        logger.warning("Start requested while pipeline is already running")
-        return
-
-    # 1. WLK server
     st.session_state.error = None
-    _reset_wlk_queues()
-    cmd = _wlk_command()
-    if (
-        st.session_state.wlk_proc is not None
-        and st.session_state.wlk_proc.poll() is not None
-    ):
-        st.session_state.wlk_proc = None
-    if st.session_state.wlk_proc is None:
-        st.session_state.wlk_proc = _start_wlk_server()
-        if st.session_state.wlk_proc is None and st.session_state.error:
-            return
-    if not _wait_for_wlk_port(st.session_state.wlk_proc, cmd):
-        return
-
-    # 2. Audio pipeline (fan-out)
-    pipeline = AudioPipeline()
-
-    # 3. WLK client
-    wlk_client = WhisperLiveKitClient(
-        wlk_queue=pipeline.wlk_queue,
-        partial_queue=st.session_state.partial_queue,
-        committed_queue=st.session_state.committed_queue,
-    )
-
-    # 4. Utterance aggregator
-    aggregator = UtteranceAggregator(
-        committed_queue=st.session_state.committed_queue,
-        utterance_queue=st.session_state.utterance_queue,
-    )
-
-    # 5. Acoustic worker
-    acoustic_worker = AcousticWorker(acoustic_queue=pipeline.acoustic_queue)
-    # Feed new windows into baseline manager automatically
-    bm: BaselineManager = st.session_state.baseline_manager
-
-    def _patched_run():
-        import time as _t
-        while not acoustic_worker._stop_event.is_set():
-            acoustic_worker._drain_queue()
-            now = _t.time()
-            if now - acoustic_worker._last_extraction_time >= acoustic_worker._hop_sec:
-                records = acoustic_worker._ring.latest_window(acoustic_worker._window_sec)
-                if records:
-                    import time as tt
-                    window_end = now
-                    window_start = window_end - acoustic_worker._window_sec
-                    feat = acoustic_worker._extractor.extract(records, window_start, window_end)
-                    with acoustic_worker._lock:
-                        acoustic_worker._windows.append(feat)
-                    acoustic_worker._last_extraction_time = now
-                    acoustic_worker._windows_extracted += 1
-                    bm.feed(feat)
-            _t.sleep(0.010)
-
-    import threading
-    acoustic_worker._thread = threading.Thread(
-        target=_patched_run, name="acoustic-worker", daemon=True
-    )
-
-    # Start everything only after WLK is listening. The websocket client is
-    # started before microphone capture so audio is not produced until the
-    # ASR endpoint is ready to receive it.
-    try:
-        wlk_client.start()
-        wlk_client.wait_until_connected(timeout=10.0)
-        aggregator.start()
-        acoustic_worker._stop_event.clear()
-        acoustic_worker._thread.start()
-        pipeline.start()
-    except Exception as exc:
-        logger.exception("Failed while starting pipeline components")
-        proc = st.session_state.get("wlk_proc")
-        if proc is not None and proc.poll() is not None:
-            diagnostics = _wlk_exit_diagnostics(proc, cmd)
-        else:
-            diagnostics = _wlk_diagnostics(cmd)
-        st.session_state.error = (
-            f"{diagnostics}\nPipeline startup exception: {exc}"
-        )
-        wlk_client.stop()
-        aggregator.stop()
-        acoustic_worker.stop()
-        pipeline.stop()
-        _stop_wlk_server()
-        return
-
-    st.session_state.pipeline = pipeline
-    st.session_state.wlk_client = wlk_client
-    st.session_state.utterance_aggregator = aggregator
-    st.session_state.acoustic_worker = acoustic_worker
-    st.session_state.score_fusion.reset()
-    logger.info("All pipeline components started")
+    st.session_state.partial_caption = ""
+    _get_manager().start()
 
 
 def _stop_pipeline() -> None:
-    for key, attr in [
-        ("pipeline", "stop"),
-        ("wlk_client", "stop"),
-        ("utterance_aggregator", "stop"),
-        ("acoustic_worker", "stop"),
-    ]:
-        obj = st.session_state.get(key)
-        if obj is not None:
-            try:
-                getattr(obj, attr)()
-            except Exception:  # noqa: BLE001
-                logger.exception("Error stopping %s", key)
-            st.session_state[key] = None
+    manager = st.session_state.get("manager")
+    if manager is not None:
+        manager.stop()
+    st.session_state.manager = None
 
-    _stop_wlk_server()
-
-    logger.info("All pipeline components stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +160,8 @@ def _consume() -> None:
         pass
 
     # Completed utterances → full analysis pipeline
-    acoustic_worker: AcousticWorker | None = st.session_state.acoustic_worker
+    manager = st.session_state.get("manager")
+    acoustic_worker = manager.acoustic_worker if manager is not None else None
     analyzer: LinguisticAnalyzer = st.session_state.linguistic_analyzer
     fusion: ScoreFusion = st.session_state.score_fusion
     classifier: BehaviourClassifier = st.session_state.behaviour_classifier
@@ -603,7 +358,7 @@ def _render_summary_cards(df: pd.DataFrame) -> None:
     cols[2].metric("Most Common", most_common)
     cols[3].metric("Avg Severity", avg_severity)
     cols[4].metric("Most Active Resident", active_resident)
-    cols[5].metric("System Status", "Running" if st.session_state.pipeline is not None else "Stopped")
+    cols[5].metric("System Status", "Running" if _pipeline_running() else "Stopped")
 
 
 def _render_empty(message: str) -> None:
@@ -769,9 +524,9 @@ def _render() -> None:
         st.divider()
         st.subheader("🩺 System Status")
         status_cols = st.columns([1, 1, 2])
-        status_cols[0].success("Microphone active" if st.session_state.pipeline is not None else "Monitoring stopped")
+        status_cols[0].success("Microphone active" if _pipeline_running() else "Monitoring stopped")
         status_cols[1].caption("Local decision support only — not a clinical diagnosis.")
-        status_cols[2].progress(1.0 if st.session_state.pipeline is not None else 0.0, text="Audio pipeline status")
+        status_cols[2].progress(1.0 if _pipeline_running() else 0.0, text="Audio pipeline status")
 
         live_col, current_col = st.columns([1, 1])
         with live_col:
@@ -856,7 +611,7 @@ with st.sidebar:
         help="Controls whether manual behaviour events can be added.",
     )
 
-    pipeline_running = st.session_state.pipeline is not None
+    pipeline_running = _pipeline_running()
     col_start, col_stop = st.columns(2)
 
     if col_start.button("▶ Start mic", disabled=pipeline_running):
@@ -908,10 +663,11 @@ with st.sidebar:
         st.write("WLK backend:", config.WLK_BACKEND)
         st.write("WLK model:", config.WLK_MODEL)
         st.write("Gemini comparison:", config.ENABLE_GEMINI_COMPARISON)
-        aw = st.session_state.acoustic_worker
+        manager = st.session_state.get("manager")
+        aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
-        ua = st.session_state.utterance_aggregator
+        ua = manager.utterance_aggregator if manager else None
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)
         if bm:
@@ -932,7 +688,7 @@ st.caption(
 # ---- Live fragment (polls every second) ----------------------------------
 @st.fragment(run_every=1.0)
 def _live() -> None:
-    if st.session_state.pipeline is not None:
+    if _pipeline_running():
         _consume()
     _render()
 
