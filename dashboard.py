@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import queue
 import socket
 import subprocess
+import sys
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
@@ -219,6 +221,8 @@ def _start_wlk_server() -> subprocess.Popen | None:
     cmd = _wlk_command()
     logger.info("Launching WLK server: %s", _wlk_command_text(cmd))
     try:
+        cmd = _wlk_command()
+        logger.info("Launching WLK server: %s", " ".join(cmd))
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -229,6 +233,7 @@ def _start_wlk_server() -> subprocess.Popen | None:
         logger.warning("Could not auto-launch WLK: %s", exc)
         st.session_state.error = f"{_wlk_diagnostics(cmd)}\nException: {exc}"
         return None
+    return proc
 
     if not _wait_for_wlk_port(proc, cmd):
         st.session_state.wlk_proc = None
