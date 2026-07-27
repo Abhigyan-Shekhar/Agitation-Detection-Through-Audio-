@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import socket
 import subprocess
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
@@ -109,44 +110,91 @@ def _ensure_services() -> None:
         st.session_state.behaviour_classifier = BehaviourClassifier()
 
 
+def _wlk_command() -> list[str]:
+    """Return the supported WhisperLiveKit launch command for this dashboard."""
+    return [
+        "wlk",
+        "serve",
+        "--backend",
+        "faster-whisper",
+        "--model",
+        config.WLK_MODEL,
+        "--language",
+        config.WLK_LANGUAGE,
+        "--pcm-input",
+        "--host",
+        config.WLK_HOST,
+        "--port",
+        str(config.WLK_PORT),
+    ]
+
+
+def _wlk_startup_error(proc: subprocess.Popen) -> str:
+    """Format the WLK process exit code, stdout, and stderr for Streamlit."""
+    stdout, stderr = proc.communicate()
+    stdout_text = (
+        stdout.decode(errors="replace") if isinstance(stdout, bytes) else stdout
+    )
+    stderr_text = (
+        stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+    )
+    return (
+        "WhisperLiveKit server exited during startup."
+        f"\nExit code: {proc.returncode}"
+        f"\nstdout:\n{stdout_text.strip() or '(empty)'}"
+        f"\nstderr:\n{stderr_text.strip() or '(empty)'}"
+    )
+
+
+def _wait_for_wlk_port(proc: subprocess.Popen | None) -> bool:
+    """Wait until WLK accepts TCP connections, or report startup process output."""
+    while True:
+        if proc is not None and proc.poll() is not None:
+            st.session_state.error = _wlk_startup_error(proc)
+            return False
+        try:
+            with socket.create_connection(
+                (config.WLK_HOST, config.WLK_PORT), timeout=0.5
+            ):
+                return True
+        except OSError:
+            time.sleep(0.25)
+
+
 def _start_wlk_server() -> subprocess.Popen | None:
     """Launch WhisperLiveKit server as a subprocess if auto-launch is enabled."""
     if not config.WLK_AUTO_LAUNCH:
         return None
-    cmd = [
-        "wlk", "serve",
-        "--backend", config.WLK_BACKEND,
-        "--model", config.WLK_MODEL,
-        "--language", config.WLK_LANGUAGE,
-        "--pcm-input",
-        "--host", config.WLK_HOST,
-        "--port", str(config.WLK_PORT),
-    ]
+
+    cmd = _wlk_command()
     logger.info("Launching WLK server: %s", " ".join(cmd))
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
         )
-        time.sleep(2.5)     # give the server a moment to start
-        return proc
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not auto-launch WLK: %s", exc)
-        st.session_state.error = (
-            f"Could not auto-launch WhisperLiveKit: {exc}\n"
-            f"Start it manually: wlk --backend {config.WLK_BACKEND} "
-            f"--model {config.WLK_MODEL} --language {config.WLK_LANGUAGE} --pcm-input"
-        )
+        st.session_state.error = f"Could not auto-launch WhisperLiveKit: {exc}"
         return None
+
+    if not _wait_for_wlk_port(proc):
+        return None
+    return proc
 
 
 def _start_pipeline() -> None:
     _ensure_services()
 
     # 1. WLK server
+    st.session_state.error = None
     if st.session_state.wlk_proc is None:
         st.session_state.wlk_proc = _start_wlk_server()
+        if st.session_state.wlk_proc is None and st.session_state.error:
+            return
+    if not _wait_for_wlk_port(st.session_state.wlk_proc):
+        return
 
     # 2. Audio pipeline (fan-out)
     pipeline = AudioPipeline()
