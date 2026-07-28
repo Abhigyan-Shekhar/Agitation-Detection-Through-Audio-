@@ -37,6 +37,7 @@ Each behaviour has:
 | Complaining | AUDIO_COMPLAINING | complain, complaining, gripe, grumbling | Verbally non-aggressive: complaining | No |
 | Negativism | AUDIO_NEGATIVISM | negative, negativity, no, refuse, refusal, resistant | Verbally non-aggressive: negativism/refusal | No |
 | Constant requests for attention or help | AUDIO_CONSTANT_REQUEST | constant requests, attention, help, help me, please help | Verbally non-aggressive: repeated requests for attention/help | No |
+| Distressed/urgent verbalization | AUDIO_DISTRESSED_URGENT | distressed verbalization, urgent speech, urgent help, help now, emergency help | Verbally non-aggressive: distressed or urgent verbalization | No |
 
 ## 3. Deterministic mapping rules
 

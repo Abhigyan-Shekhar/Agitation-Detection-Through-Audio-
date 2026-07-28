@@ -204,7 +204,7 @@ class TestBehaviourClassifier:
             linguistic=linguistic,
         )
         labels = self._classify(result)
-        assert "Unmapped audio behaviour" in labels
+        assert "Distressed/urgent verbalization" in labels
 
     # ---- Multi-label -------------------------------------------------
 
@@ -221,7 +221,7 @@ class TestBehaviourClassifier:
         )
         labels = self._classify(result)
         assert "Repetitive sentences or questions" in labels
-        assert "Unmapped audio behaviour" in labels
+        assert "Distressed/urgent verbalization" in labels
 
     # ---- No physical labels ------------------------------------------
 
