@@ -652,12 +652,14 @@ with st.sidebar:
         st.session_state.error = None
         try:
             _start_pipeline()
+            st.rerun()
         except Exception as exc:
             logger.exception("Failed to start pipeline")
             st.session_state.error = str(exc)
 
     if col_stop.button("⏹ Stop mic", disabled=not pipeline_running):
         _stop_pipeline()
+        st.rerun()
 
     st.divider()
 

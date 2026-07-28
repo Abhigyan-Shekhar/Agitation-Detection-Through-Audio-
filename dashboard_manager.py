@@ -26,7 +26,8 @@ from whisperlivekit_client import WhisperLiveKitClient
 
 logger = logging.getLogger(__name__)
 
-_WLK_STARTUP_TIMEOUT_SEC = 60.0
+_WLK_STARTUP_TIMEOUT_SEC = float(os.getenv("WLK_STARTUP_TIMEOUT_SEC", "180"))
+_WLK_IMPORT_WARMUP_TIMEOUT_SEC = float(os.getenv("WLK_IMPORT_WARMUP_TIMEOUT_SEC", "35"))
 _WLK_TCP_POLL_SEC = 0.25
 _WLK_TCP_CONNECT_TIMEOUT_SEC = 0.5
 _WLK_TERMINATE_TIMEOUT_SEC = 5.0
@@ -82,6 +83,7 @@ class DashboardManager:
         """Return the supported WhisperLiveKit command for this dashboard."""
         return [
             sys.executable,
+            "-u",
             "-m",
             "whisperlivekit.basic_server",
             "--backend",
@@ -165,13 +167,13 @@ class DashboardManager:
 
         cmd = self.wlk_command
         logger.info("Launching WLK: %s", self._command_text(cmd))
-        env = os.environ.copy()
-        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        env = self._wlk_env()
         self._close_wlk_log()
         self._wlk_log_file = tempfile.NamedTemporaryFile(
             prefix="odu-wlk-", suffix=".log", delete=False
         )
         self._wlk_log_path = self._wlk_log_file.name
+        self._warm_wlk_import_cache(env)
         try:
             self.wlk_proc = subprocess.Popen(
                 cmd,
@@ -185,6 +187,52 @@ class DashboardManager:
             raise DashboardStartupError(
                 f"{self._diagnostics()}\nException: {exc}"
             ) from exc
+
+    def _wlk_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        env["PYTHONUNBUFFERED"] = "1"
+        return env
+
+    def _warm_wlk_import_cache(self, env: dict[str, str]) -> None:
+        """Prime slow WLK imports before launching the long-running server."""
+        if self._wlk_log_file is None:
+            return
+
+        cmd = [
+            sys.executable,
+            "-u",
+            "-c",
+            "import whisperlivekit.basic_server",
+        ]
+        try:
+            self._wlk_log_file.write(b"[dashboard] warming WhisperLiveKit import\\n")
+            self._wlk_log_file.flush()
+            subprocess.run(
+                cmd,
+                stdout=self._wlk_log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=True,
+                timeout=_WLK_IMPORT_WARMUP_TIMEOUT_SEC,
+            )
+            self._wlk_log_file.write(b"[dashboard] WhisperLiveKit import warmed\\n")
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "WLK import warmup exceeded %.0fs; launching server anyway",
+                _WLK_IMPORT_WARMUP_TIMEOUT_SEC,
+            )
+            self._wlk_log_file.write(
+                b"[dashboard] WhisperLiveKit import warmup timed out; launching server\\n"
+            )
+        except subprocess.CalledProcessError as exc:
+            self._wlk_log_file.write(
+                f"[dashboard] WhisperLiveKit import warmup failed: {exc}\\n".encode()
+            )
+            self._wlk_log_file.flush()
+            raise DashboardStartupError(self._exit_diagnostics()) from exc
+        finally:
+            self._wlk_log_file.flush()
 
     def _wait_for_tcp_ready(self) -> None:
         logger.info("Waiting for TCP %s:%s", config.WLK_HOST, config.WLK_PORT)
