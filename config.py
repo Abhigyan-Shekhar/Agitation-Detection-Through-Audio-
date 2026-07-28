@@ -24,7 +24,7 @@ WLK_PATH: str = os.getenv("WLK_PATH", "/asr")
 WLK_URL: str = f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
 
 # WLK model settings (used when auto-launching the server)
-WLK_MODEL: str = os.getenv("WLK_MODEL", "small")
+WLK_MODEL: str = os.getenv("WLK_MODEL", "tiny")
 WLK_LANGUAGE: str = os.getenv("WLK_LANGUAGE", "auto")
 WLK_BACKEND: str = os.getenv("WLK_BACKEND", "faster-whisper")
 # If True, dashboard.py will spawn wlk as a subprocess automatically
