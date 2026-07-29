@@ -22,6 +22,8 @@ import logging
 import queue
 import threading
 import time
+import wave
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -36,6 +38,36 @@ import config
 logger = logging.getLogger(__name__)
 
 _SILENCE_RMS_THRESHOLD = 1e-5
+_CALLBACK_CAPTURE_SECONDS = 5.0
+_CALLBACK_CAPTURE_PATH = Path("callback_capture.wav")
+
+
+def _audio_stats(audio: np.ndarray) -> dict[str, float | int | str | tuple[int, ...]]:
+    arr = np.asarray(audio)
+    return {
+        "object_id": id(audio),
+        "dtype": str(arr.dtype),
+        "shape": tuple(arr.shape),
+        "samples": int(arr.size),
+        "rms": float(np.sqrt(np.nanmean(arr.astype(np.float32) ** 2))) if arr.size else 0.0,
+        "peak": float(np.nanmax(np.abs(arr))) if arr.size else 0.0,
+        "min": float(np.nanmin(arr)) if arr.size else 0.0,
+        "max": float(np.nanmax(arr)) if arr.size else 0.0,
+    }
+
+
+def _float32_to_pcm16(audio: np.ndarray) -> bytes:
+    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    pcm = np.ascontiguousarray((clipped * 32768.0).clip(-32768, 32767).astype("<i2"))
+    return pcm.tobytes()
+
+
+def _write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
 
 
 class TimestampedFrame(NamedTuple):
@@ -87,6 +119,8 @@ class AudioPipeline:
         # Monotonic frame counter for diagnostics
         self._frame_index: int = 0
         self._last_callback_stats: dict[str, float | int | str | bool] = {}
+        self._callback_capture_samples: list[np.ndarray] = []
+        self._callback_capture_written = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -168,6 +202,7 @@ class AudioPipeline:
             logger.debug("sounddevice status: %s", status)
 
         self._log_callback_stats(indata, frames)
+        self._capture_callback_audio(indata)
 
         audio = indata[:, 0].copy()  # mono, float32
         ts = time.time()
@@ -181,10 +216,13 @@ class AudioPipeline:
             frame_index=self._frame_index,
         )
 
+        self._log_audio_stage("timestamped_frame", self._frame_index, audio)
+
         # Fan out to both queues — drop if full rather than block the callback
         for q in (self.acoustic_queue, self.wlk_queue):
             try:
                 q.put_nowait(frame)
+                self._log_audio_stage("queue_insertion", self._frame_index, audio)
             except queue.Full:
                 self._dropped_frames += 1
                 logger.debug(
@@ -192,6 +230,45 @@ class AudioPipeline:
                     self._frame_index,
                     self._dropped_frames,
                 )
+
+    def _log_audio_stage(self, stage: str, frame_index: int, audio: np.ndarray) -> None:
+        stats = _audio_stats(audio)
+        logger.info(
+            "Audio trace stage=%s frame_id=%d object_id=%s dtype=%s shape=%s samples=%d rms=%.8f peak=%.8f min=%.8f max=%.8f",
+            stage,
+            frame_index,
+            stats["object_id"],
+            stats["dtype"],
+            stats["shape"],
+            stats["samples"],
+            stats["rms"],
+            stats["peak"],
+            stats["min"],
+            stats["max"],
+        )
+
+    def _capture_callback_audio(self, indata: np.ndarray) -> None:
+        """Capture the raw callback mono channel before TimestampedFrame creation."""
+        if self._callback_capture_written:
+            return
+        self._callback_capture_samples.append(indata[:, 0].copy())
+        sample_count = sum(chunk.size for chunk in self._callback_capture_samples)
+        if sample_count < int(self.sample_rate * _CALLBACK_CAPTURE_SECONDS):
+            return
+        captured = np.concatenate(self._callback_capture_samples)[: int(self.sample_rate * _CALLBACK_CAPTURE_SECONDS)]
+        _write_pcm16_wav(_CALLBACK_CAPTURE_PATH, _float32_to_pcm16(captured), self.sample_rate)
+        self._callback_capture_written = True
+        self._callback_capture_samples.clear()
+        rms = float(np.sqrt(np.mean(captured ** 2))) if captured.size else 0.0
+        peak = float(np.max(np.abs(captured))) if captured.size else 0.0
+        logger.info(
+            "Diagnostic WAV %s — duration=%.3fs rms=%.8f peak=%.8f sample_rate=%d channels=1 sample_width=2",
+            _CALLBACK_CAPTURE_PATH,
+            captured.size / self.sample_rate if self.sample_rate else 0.0,
+            rms,
+            peak,
+            self.sample_rate,
+        )
 
     def _log_input_device_config(self) -> None:
         """Log sounddevice input-device configuration before opening the stream."""
