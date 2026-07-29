@@ -1,6 +1,6 @@
 """Linguistic feature extraction for completed utterances.
 
-Operates on the committed text from WhisperLiveKit. Maintains a rolling
+Operates on the committed text from local transcriber. Maintains a rolling
 30–60 second transcript history and computes:
 
 A. repetition_score       — word overlap + n-gram + fuzzy similarity
@@ -230,7 +230,9 @@ class LinguisticAnalyzer:
         Updates the rolling history after analysis.
         """
         text = utterance.full_text
+        logger.info("BEHAVIOUR_TRACE linguistic_input transcript=%r", text)
         if not text.strip():
+            logger.info("BEHAVIOUR_TRACE linguistic_output empty_transcript=True")
             return LinguisticFeatures()
 
         self._prune_history(utterance.end_time)
@@ -264,7 +266,7 @@ class LinguisticAnalyzer:
         # Update history
         self._history.append(_TranscriptRecord(text, utterance.end_time))
 
-        return LinguisticFeatures(
+        features = LinguisticFeatures(
             repetition_score=float(np.clip(rep, 0.0, 1.0)),
             question_repetition_score=float(np.clip(q_rep, 0.0, 1.0)),
             negative_sentiment=float(np.clip(neg_sentiment, 0.0, 1.0)),
@@ -274,6 +276,17 @@ class LinguisticAnalyzer:
             imperative_score=float(np.clip(imperative, 0.0, 1.0)),
             evidence=evidence,
         )
+        logger.info(
+            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f",
+            features.repetition_score,
+            features.question_repetition_score,
+            features.negative_sentiment,
+            features.urgency_score,
+            features.threat_score,
+            features.profanity_score,
+            features.imperative_score,
+        )
+        return features
 
     # ------------------------------------------------------------------
     # Sub-scorers

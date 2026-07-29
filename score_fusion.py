@@ -109,6 +109,17 @@ class ScoreFusion:
             acoustic_score, linguistic_score, raw_final, smoothed, severity, reliability,
             trace.durations_ms() if trace else {},
         )
+        logger.info(
+            "BEHAVIOUR_TRACE fusion_output transcript=%r acoustic=%.3f linguistic=%.3f raw=%.3f smoothed=%.3f severity=%s reliability=%.3f acoustic_available=%s",
+            utterance.full_text,
+            acoustic_score,
+            linguistic_score,
+            raw_final,
+            smoothed,
+            severity,
+            reliability,
+            acoustic is not None,
+        )
 
         return FusedResult(
             acoustic_score=round(acoustic_score, 4),
@@ -148,7 +159,7 @@ class ScoreFusion:
         pitch_range_z = bm.z_score("pitch_range", acoustic.pitch_range)
         pitch_var_z = bm.z_score("pitch_variance", acoustic.pitch_variance)
 
-        # Speech rate approximation: voiced_ratio as proxy until WLK word
+        # Speech rate approximation: voiced_ratio as proxy until word
         # timestamps are integrated. Replace with WPM when available.
         speech_rate_z = bm.z_score("voiced_ratio", acoustic.voiced_ratio)
 

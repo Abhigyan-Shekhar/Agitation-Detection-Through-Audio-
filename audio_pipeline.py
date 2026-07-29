@@ -5,16 +5,16 @@ Responsibilities
 * Open a sounddevice InputStream at 16 kHz mono float32.
 * On every callback, put a copy of the raw float32 frame on two queues:
     - ``acoustic_queue``  → acoustic feature worker
-    - ``wlk_queue``       → WhisperLiveKit PCM16 sender
+    - ``transcription_queue`` → local faster-whisper transcriber
 * Track frame timestamps so downstream workers can align features with
   transcript segments.
 * Expose start() / stop() for the dashboard to call.
 
 What this module does NOT do
 -----------------------------
-* No VAD gating — WhisperLiveKit handles its own VAD internally.
+* No VAD gating — transcription and acoustic analysis handle speech decisions downstream.
 * No overlapping window buffering — that moved to acoustic_features.py.
-* No transcription — that moved to whisperlivekit_client.py.
+* No transcription — that lives in transcriber.py.
 """
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ class AudioPipeline:
     Parameters
     ----------
     sample_rate:
-        Capture sample rate in Hz. Must match WhisperLiveKit's expected input.
+        Capture sample rate in Hz. Must match the local transcriber input.
     frame_size:
         Number of samples per sounddevice callback (one ``TimestampedFrame``).
     max_queue_size:
@@ -108,7 +108,7 @@ class AudioPipeline:
         self.acoustic_queue: queue.Queue[TimestampedFrame] = queue.Queue(
             maxsize=max_queue_size
         )
-        self.wlk_queue: queue.Queue[TimestampedFrame] = queue.Queue(
+        self.transcription_queue: queue.Queue[TimestampedFrame] = queue.Queue(
             maxsize=max_queue_size
         )
 
@@ -180,10 +180,10 @@ class AudioPipeline:
             self._stream = None
 
         logger.info(
-            "AudioPipeline stopped — total dropped frames: %d acoustic_q=%d wlk_q=%d",
+            "AudioPipeline stopped — total dropped frames: %d acoustic_q=%d transcription_q=%d",
             self._dropped_frames,
             self.acoustic_queue.qsize(),
-            self.wlk_queue.qsize(),
+            self.transcription_queue.qsize(),
         )
 
     # ------------------------------------------------------------------
@@ -219,7 +219,7 @@ class AudioPipeline:
         self._log_audio_stage("timestamped_frame", self._frame_index, audio)
 
         # Fan out to both queues — drop if full rather than block the callback
-        for q in (self.acoustic_queue, self.wlk_queue):
+        for q in (self.acoustic_queue, self.transcription_queue):
             try:
                 q.put_nowait(frame)
                 self._log_audio_stage("queue_insertion", self._frame_index, audio)
@@ -342,7 +342,7 @@ class AudioPipeline:
 
     def _flush_queues(self) -> None:
         """Drain all queues before (re)starting to avoid stale data."""
-        for q in (self.acoustic_queue, self.wlk_queue):
+        for q in (self.acoustic_queue, self.transcription_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -366,9 +366,9 @@ if __name__ == "__main__":
         pipeline.stop()
 
     acoustic_size = pipeline.acoustic_queue.qsize()
-    wlk_size = pipeline.wlk_queue.qsize()
+    transcription_size = pipeline.transcription_queue.qsize()
     print(
         f"acoustic_queue={acoustic_size} frames, "
-        f"wlk_queue={wlk_size} frames, "
+        f"transcription_queue={transcription_size} frames, "
         f"dropped={pipeline.dropped_frames}"
     )

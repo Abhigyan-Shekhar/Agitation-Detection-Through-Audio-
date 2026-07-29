@@ -194,6 +194,27 @@ class BehaviourClassifier:
         """Evaluate all rules and return an updated ``FusedResult``."""
         acoustic = result.acoustic_features
         linguistic = result.linguistic_features
+        logger.info(
+            "BEHAVIOUR_TRACE classifier_input transcript=%r severity=%s smoothed=%.3f acoustic_score=%.3f linguistic_score=%.3f acoustic_available=%s linguistic_available=%s",
+            result.utterance.full_text if result.utterance else "",
+            result.severity,
+            result.smoothed_score,
+            result.acoustic_score,
+            result.linguistic_score,
+            acoustic is not None,
+            linguistic is not None,
+        )
+        if linguistic is not None:
+            logger.info(
+                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f",
+                linguistic.repetition_score,
+                linguistic.question_repetition_score,
+                linguistic.negative_sentiment,
+                linguistic.urgency_score,
+                linguistic.threat_score,
+                linguistic.profanity_score,
+                linguistic.imperative_score,
+            )
         detected: list[BehaviourLabel] = []
 
         for rule in self._RULES:
@@ -226,4 +247,12 @@ class BehaviourClassifier:
         for b in detected:
             result.linguistic_contributions[f"[{b.label}]"] = round(b.confidence, 4)
 
+        logger.info(
+            "BEHAVIOUR_TRACE classifier_output transcript=%r labels=%s event_labels=%s severity=%s contributions=%s",
+            result.utterance.full_text if result.utterance else "",
+            result.behaviours,
+            [event.canonical_label for event in result.behaviour_events],
+            result.severity,
+            result.linguistic_contributions,
+        )
         return result

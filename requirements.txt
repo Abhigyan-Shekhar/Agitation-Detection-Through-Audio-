@@ -4,11 +4,8 @@ torch==2.3.1
 torchaudio==2.3.1
 scipy==1.13.1
 librosa==0.10.2
-# ASR — WhisperLiveKit pulls faster-whisper as a dep; mlx-whisper for Apple Silicon
-whisperlivekit>=0.1.0
-mlx-whisper
-# WebSocket client for WLK streaming
-websockets>=12.0
+# ASR — local direct transcription
+faster-whisper>=1.0.0
 # Linguistic analysis
 vaderSentiment>=3.3.2
 rapidfuzz>=3.9.0
