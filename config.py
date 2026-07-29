@@ -17,19 +17,13 @@ DTYPE: str = "float32"
 AUDIO_INPUT_DEVICE: str | int | None = os.getenv("AUDIO_INPUT_DEVICE") or None
 
 # ---------------------------------------------------------------------------
-# WhisperLiveKit server
+# Local transcription
 # ---------------------------------------------------------------------------
-WLK_HOST: str = os.getenv("WLK_HOST", "127.0.0.1")
-WLK_PORT: int = int(os.getenv("WLK_PORT", "8000"))
-WLK_PATH: str = os.getenv("WLK_PATH", "/asr")
-WLK_URL: str = f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
-
-# WLK model settings (used when auto-launching the server)
-WLK_MODEL: str = os.getenv("WLK_MODEL", "small")
-WLK_LANGUAGE: str = os.getenv("WLK_LANGUAGE", "auto")
-WLK_BACKEND: str = os.getenv("WLK_BACKEND", "faster-whisper")
-# If True, dashboard.py will spawn wlk as a subprocess automatically
-WLK_AUTO_LAUNCH: bool = os.getenv("WLK_AUTO_LAUNCH", "true").lower() == "true"
+TRANSCRIPTION_ENGINE: str = os.getenv("TRANSCRIPTION_ENGINE", "faster-whisper")
+WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+TRANSCRIPTION_WINDOW_SECONDS: float = float(os.getenv("TRANSCRIPTION_WINDOW_SECONDS", "5"))
+TRANSCRIPTION_INTERVAL_SECONDS: float = float(os.getenv("TRANSCRIPTION_INTERVAL_SECONDS", "1"))
+USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Utterance aggregator

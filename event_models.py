@@ -16,7 +16,7 @@ class LatencyTrace:
 
     microphone_ts: float | None = None
     queue_ts: float | None = None
-    wlk_send_ts: float | None = None
+    transcription_input_ts: float | None = None
     transcript_ts: float | None = None
     feature_extraction_ts: float | None = None
     inference_ts: float | None = None
@@ -29,7 +29,7 @@ class LatencyTrace:
         stages = [
             ("microphone", self.microphone_ts),
             ("queue", self.queue_ts),
-            ("wlk_send", self.wlk_send_ts),
+            ("transcription_input", self.transcription_input_ts),
             ("transcript", self.transcript_ts),
             ("feature_extraction", self.feature_extraction_ts),
             ("inference", self.inference_ts),
@@ -121,7 +121,7 @@ class AcousticFeatureWindow:
 
 @dataclass
 class CommittedLine:
-    """A transcript segment that WhisperLiveKit has confirmed will not change."""
+    """A transcript segment that local transcriber has confirmed will not change."""
 
     text: str
     timestamp: float    # Unix timestamp when line was committed
