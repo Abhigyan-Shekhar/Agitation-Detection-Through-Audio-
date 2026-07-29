@@ -1,6 +1,6 @@
 """Linguistic feature extraction for completed utterances.
 
-Operates on the committed text from WhisperLiveKit. Maintains a rolling
+Operates on the committed text from local transcriber. Maintains a rolling
 30–60 second transcript history and computes:
 
 A. repetition_score       — word overlap + n-gram + fuzzy similarity

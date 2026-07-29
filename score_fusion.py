@@ -148,7 +148,7 @@ class ScoreFusion:
         pitch_range_z = bm.z_score("pitch_range", acoustic.pitch_range)
         pitch_var_z = bm.z_score("pitch_variance", acoustic.pitch_variance)
 
-        # Speech rate approximation: voiced_ratio as proxy until WLK word
+        # Speech rate approximation: voiced_ratio as proxy until word
         # timestamps are integrated. Replace with WPM when available.
         speech_rate_z = bm.z_score("voiced_ratio", acoustic.voiced_ratio)
 

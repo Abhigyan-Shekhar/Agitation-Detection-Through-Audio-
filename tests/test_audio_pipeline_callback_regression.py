@@ -14,14 +14,14 @@ def test_audio_callback_enqueues_frame_without_debug_capture_hook():
     pipeline._audio_callback(indata, frames=4, time_info=None, status=None)
 
     acoustic_frame = pipeline.acoustic_queue.get_nowait()
-    wlk_frame = pipeline.wlk_queue.get_nowait()
+    transcription_frame = pipeline.transcription_queue.get_nowait()
 
     assert isinstance(acoustic_frame, TimestampedFrame)
-    assert isinstance(wlk_frame, TimestampedFrame)
+    assert isinstance(transcription_frame, TimestampedFrame)
     np.testing.assert_array_equal(acoustic_frame.data, indata[:, 0])
-    np.testing.assert_array_equal(wlk_frame.data, indata[:, 0])
+    np.testing.assert_array_equal(transcription_frame.data, indata[:, 0])
     assert acoustic_frame.frame_index == 1
-    assert wlk_frame.frame_index == 1
+    assert transcription_frame.frame_index == 1
 
     try:
         pipeline.acoustic_queue.get_nowait()

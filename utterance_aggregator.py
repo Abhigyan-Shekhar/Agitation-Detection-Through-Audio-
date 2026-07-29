@@ -17,7 +17,7 @@ Design notes
 ------------
 * Runs in a dedicated background thread (``start()`` / ``stop()``).
 * Does not call any ML model — purely time-based heuristics.
-* Duplicate committed lines (same text emitted twice by WLK) are
+* Duplicate committed lines (same text emitted twice by transcriber) are
   de-duplicated via a simple last-line equality check.
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ class UtteranceAggregator:
     Parameters
     ----------
     committed_queue:
-        Source of ``CommittedLine`` objects (from WhisperLiveKitClient).
+        Source of ``CommittedLine`` objects (from TranscriptionWorker).
     utterance_queue:
         Destination for completed ``Utterance`` objects (to fusion pipeline).
     silence_sec:
@@ -168,7 +168,7 @@ class UtteranceAggregator:
             except queue.Empty:
                 return
 
-            # De-duplicate: WLK sometimes re-emits the same line
+            # De-duplicate: The transcriber sometimes re-emits the same line
             if line.text.strip() == self._last_line_text:
                 logger.debug("Duplicate committed line ignored: %r", line.text)
                 continue

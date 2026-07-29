@@ -1,22 +1,20 @@
-"""Audio + Linguistic Agitation Dashboard — WhisperLiveKit edition.
+"""Audio + Linguistic Agitation Dashboard with local faster-whisper transcription.
 
 Architecture overview
 ---------------------
 Microphone (sounddevice)
     │
-    ├─► wlk_queue ──► WhisperLiveKitClient ──► partial_queue  ─► live caption
-    │                                      └──► committed_queue ─► UtteranceAggregator
-    │                                                                     │
-    └─► acoustic_queue ──► AcousticWorker                                 ▼
-                               (rolling ring buffer)            completed utterance_queue
-                                     │                                    │
-                                     └─────────► ScoreFusion ◄────────────┘
-                                                     │
-                                              BehaviourClassifier
-                                                     │
-                                              Streamlit Dashboard
-
-WLK server is launched as a subprocess if WLK_AUTO_LAUNCH=true (default).
+    ├─► transcription_queue ──► TranscriptionWorker ──► partial_queue  ─► live caption
+    │                                               └──► committed_queue ─► UtteranceAggregator
+    │                                                                          │
+    └─► acoustic_queue ──► AcousticWorker                                      ▼
+                               (rolling ring buffer)                 completed utterance_queue
+                                     │                                         │
+                                     └──────────────► ScoreFusion ◄────────────┘
+                                                        │
+                                                 BehaviourClassifier
+                                                        │
+                                                 Streamlit Dashboard
 """
 from __future__ import annotations
 
@@ -71,6 +69,7 @@ def _init() -> None:
         "utterance_queue": queue.Queue(maxsize=50),
         # Display state
         "partial_caption": "",
+        "transcription_metadata": {},
         "committed_lines": [],      # list[str]
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
@@ -539,6 +538,14 @@ def _render() -> None:
             st.subheader("🎙️ Current Recording")
             partial = st.session_state.partial_caption or "_Waiting for speech…_"
             st.markdown(f"> {partial}")
+            manager = st.session_state.get("manager")
+            worker = manager.transcription_worker if manager is not None else None
+            tx = worker.latest_result if worker is not None else None
+            if tx is not None:
+                meta_cols = st.columns(3)
+                meta_cols[0].metric("Transcript time", datetime.fromtimestamp(tx.timestamp).strftime("%H:%M:%S"))
+                meta_cols[1].metric("Confidence", "N/A" if tx.confidence is None else f"{tx.confidence:.0%}")
+                meta_cols[2].metric("Inference", f"{tx.inference_ms:.0f} ms")
             committed = st.session_state.committed_lines
             with st.expander("📝 Current Transcript", expanded=bool(committed)):
                 st.write("  \n".join(committed[-20:]) if committed else "No committed transcript yet.")
@@ -665,9 +672,11 @@ with st.sidebar:
     # Debug
     with st.expander("🔧 Debug"):
         st.write("Pipeline running:", pipeline_running)
-        st.write("WLK auto-launch:", config.WLK_AUTO_LAUNCH)
-        st.write("WLK backend:", config.WLK_BACKEND)
-        st.write("WLK model:", config.WLK_MODEL)
+        st.write("Transcription engine:", config.TRANSCRIPTION_ENGINE)
+        st.write("Whisper model:", config.WHISPER_MODEL)
+        st.write("Transcription window (s):", config.TRANSCRIPTION_WINDOW_SECONDS)
+        st.write("Transcription interval (s):", config.TRANSCRIPTION_INTERVAL_SECONDS)
+        st.write("Use GPU if available:", config.USE_GPU_IF_AVAILABLE)
         st.write("Gemini comparison:", config.ENABLE_GEMINI_COMPARISON)
         manager = st.session_state.get("manager")
         aw = manager.acoustic_worker if manager else None
