@@ -241,8 +241,13 @@ class DashboardManager:
                     if records:
                         window_end = now
                         window_start = window_end - acoustic_worker._window_sec
+                        extract_start = time.monotonic()
                         feat = acoustic_worker._extractor.extract(
                             records, window_start, window_end
+                        )
+                        logger.debug(
+                            "Acoustic feature extraction + baseline feed took %.2f ms",
+                            (time.monotonic() - extract_start) * 1000.0,
                         )
                         with acoustic_worker._lock:
                             acoustic_worker._windows.append(feat)

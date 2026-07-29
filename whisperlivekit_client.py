@@ -25,7 +25,7 @@ except ImportError:
 
 import config
 from audio_pipeline import TimestampedFrame
-from event_models import CommittedLine
+from event_models import CommittedLine, LatencyTrace
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,9 @@ class WhisperLiveKitClient:
         self._bytes_sent = 0
         self._partial_count = 0
         self._committed_count = 0
+        self._last_sent_trace: LatencyTrace | None = None
+        self._send_latency_ms_total = 0.0
+        self._send_latency_samples = 0
 
     def start(self) -> None:
         """Start the single websocket background thread."""
@@ -119,6 +122,9 @@ class WhisperLiveKitClient:
             "bytes_sent": self._bytes_sent,
             "partial_count": self._partial_count,
             "committed_count": self._committed_count,
+            "avg_capture_to_send_ms": int(
+                self._send_latency_ms_total / max(self._send_latency_samples, 1)
+            ),
         }
 
     def _run_event_loop(self) -> None:
@@ -191,6 +197,11 @@ class WhisperLiveKitClient:
             try:
                 while True:
                     frame = self._wlk_queue.get_nowait()
+                    trace = LatencyTrace(
+                        microphone_ts=frame.capture_monotonic,
+                        queue_ts=frame.queued_monotonic,
+                    )
+                    self._last_sent_trace = trace
                     pcm_buffer.extend(float32_to_pcm16(frame.data))
             except queue.Empty:
                 pass
@@ -199,6 +210,12 @@ class WhisperLiveKitClient:
                 chunk = bytes(pcm_buffer[:_SEND_CHUNK_BYTES])
                 del pcm_buffer[:_SEND_CHUNK_BYTES]
                 await ws.send(chunk)
+                send_ts = time.monotonic()
+                if self._last_sent_trace is not None:
+                    self._last_sent_trace.wlk_send_ts = send_ts
+                    if self._last_sent_trace.microphone_ts is not None:
+                        self._send_latency_ms_total += (send_ts - self._last_sent_trace.microphone_ts) * 1000.0
+                        self._send_latency_samples += 1
                 self._bytes_sent += len(chunk)
 
             await asyncio.sleep(0.010)
@@ -238,7 +255,9 @@ class WhisperLiveKitClient:
             return
 
         if msg_type in ("committed", "final", "complete", "completed", ""):
-            line = CommittedLine(text=text.strip(), timestamp=time.time())
+            trace = self._last_sent_trace or LatencyTrace()
+            trace.transcript_ts = time.monotonic()
+            line = CommittedLine(text=text.strip(), timestamp=time.time(), latency_trace=trace)
             try:
                 self._committed_queue.put_nowait(line)
                 self._committed_count += 1
