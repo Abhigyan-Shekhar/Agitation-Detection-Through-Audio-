@@ -148,16 +148,8 @@ def _consume() -> None:
     except queue.Empty:
         pass
 
-    # Committed lines (for the committed transcript display)
-    try:
-        while True:
-            from event_models import CommittedLine
-            line: CommittedLine = st.session_state.committed_queue.get_nowait()
-            st.session_state.committed_lines.append(line.text)
-            if len(st.session_state.committed_lines) > 50:
-                st.session_state.committed_lines.pop(0)
-    except queue.Empty:
-        pass
+    # Do not drain committed_queue here: the UtteranceAggregator owns it.
+    # Committed transcript display is updated from completed utterances below.
 
     # Completed utterances → full analysis pipeline
     manager = st.session_state.get("manager")
@@ -171,12 +163,16 @@ def _consume() -> None:
             utterance: Utterance = st.session_state.utterance_queue.get_nowait()
             logger.info("Processing utterance: %r", utterance.full_text[:60])
 
+            trace = utterance.latency_trace
+
             # Aggregate acoustic features for this utterance's time span
             acoustic = None
             if acoustic_worker is not None:
                 acoustic = acoustic_worker.aggregate(
                     utterance.start_time, utterance.end_time
                 )
+            if trace is not None:
+                trace.feature_extraction_ts = time.monotonic()
 
             # Linguistic features
             linguistic = analyzer.analyze(utterance)
@@ -188,7 +184,13 @@ def _consume() -> None:
             # Behaviour classification
             result = classifier.classify(result)
 
+            if result.latency_trace is not None:
+                result.latency_trace.dashboard_render_ts = time.monotonic()
+                logger.info("Dashboard latency diagnostics: %s", result.latency_trace.durations_ms())
             st.session_state.latest_result = result
+            st.session_state.committed_lines.extend(line.text for line in utterance.lines)
+            if len(st.session_state.committed_lines) > 50:
+                st.session_state.committed_lines = st.session_state.committed_lines[-50:]
             for event in result.behaviour_events:
                 st.session_state.behaviour_log.append(_event_to_record(event, result))
             st.session_state.timeline.append({
@@ -527,6 +529,10 @@ def _render() -> None:
         status_cols[0].success("Microphone active" if _pipeline_running() else "Monitoring stopped")
         status_cols[1].caption("Local decision support only — not a clinical diagnosis.")
         status_cols[2].progress(1.0 if _pipeline_running() else 0.0, text="Audio pipeline status")
+        if result is not None and result.latency_trace is not None:
+            with st.expander("⏱️ Latency diagnostics", expanded=False):
+                latency = result.latency_trace.durations_ms()
+                st.json(latency if latency else {"status": "waiting for complete trace"})
 
         live_col, current_col = st.columns([1, 1])
         with live_col:
@@ -667,6 +673,9 @@ with st.sidebar:
         aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
+            latest = aw.latest_window()
+            if latest:
+                st.write("Latest acoustic window age (ms):", round((time.time() - latest.end_time) * 1000.0, 2))
         ua = manager.utterance_aggregator if manager else None
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)
