@@ -235,6 +235,10 @@ class AudioPipeline:
         """Compatibility no-op for removed callback WAV diagnostics."""
         return None
 
+    def _log_audio_stage(self, *args: object, **kwargs: object) -> None:
+        """Compatibility no-op for removed per-stage audio diagnostics."""
+        return None
+
     def _resolve_input_device(self) -> str | int | None:
         """Return the concrete input device passed to sounddevice.InputStream."""
         assert sd is not None
