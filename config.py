@@ -14,6 +14,7 @@ SAMPLE_RATE: int = 16_000        # Hz — Whisper and Silero both want 16 kHz
 FRAME_SIZE: int = 512            # samples per sounddevice callback (~32 ms)
 CHANNELS: int = 1
 DTYPE: str = "float32"
+AUDIO_INPUT_DEVICE: str | int | None = os.getenv("AUDIO_INPUT_DEVICE") or None
 
 # ---------------------------------------------------------------------------
 # WhisperLiveKit server
