@@ -36,12 +36,80 @@ _RECONNECT_DELAY_SEC: float = 2.0
 _MAX_RECONNECT_ATTEMPTS: int = 5
 _DEBUG_CAPTURE_SECONDS: float = 5.0
 _DEBUG_CAPTURE_PATH = Path("debug_capture.wav")
+_QUEUE_CAPTURE_PATH = Path("queue_capture.wav")
+_PRE_SEND_CAPTURE_PATH = Path("pre_send.wav")
+
+
+def audio_stats(audio: np.ndarray) -> dict[str, float | int | str | tuple[int, ...]]:
+    """Return stable diagnostics for a NumPy audio array without mutating it."""
+    arr = np.asarray(audio)
+    return {
+        "object_id": id(audio),
+        "dtype": str(arr.dtype),
+        "shape": tuple(arr.shape),
+        "samples": int(arr.size),
+        "rms": float(np.sqrt(np.nanmean(arr.astype(np.float32) ** 2))) if arr.size else 0.0,
+        "peak": float(np.nanmax(np.abs(arr))) if arr.size else 0.0,
+        "min": float(np.nanmin(arr)) if arr.size else 0.0,
+        "max": float(np.nanmax(arr)) if arr.size else 0.0,
+    }
+
+
+def log_audio_stage(stage: str, frame: TimestampedFrame, audio: np.ndarray) -> None:
+    """Log one frame at a named audio-pipeline stage."""
+    stats = audio_stats(audio)
+    logger.info(
+        "Audio trace stage=%s frame_id=%d object_id=%s dtype=%s shape=%s samples=%d rms=%.8f peak=%.8f min=%.8f max=%.8f",
+        stage,
+        frame.frame_index,
+        stats["object_id"],
+        stats["dtype"],
+        stats["shape"],
+        stats["samples"],
+        stats["rms"],
+        stats["peak"],
+        stats["min"],
+        stats["max"],
+    )
+
+
+def write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int = config.SAMPLE_RATE) -> None:
+    """Write already-converted PCM16 bytes to a mono WAV without regenerating samples."""
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
+
+
+def log_wav_report(path: Path) -> None:
+    """Report WAV duration and PCM-level statistics for a diagnostic capture."""
+    with wave.open(str(path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.getnframes()
+        payload = wav_file.readframes(frames)
+    samples = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    duration = frames / sample_rate if sample_rate else 0.0
+    logger.info(
+        "Diagnostic WAV %s — duration=%.3fs rms=%.8f peak=%.8f sample_rate=%d channels=%d sample_width=%d",
+        path,
+        duration,
+        rms,
+        peak,
+        sample_rate,
+        channels,
+        sample_width,
+    )
 
 
 def float32_to_pcm16(audio: np.ndarray) -> bytes:
-    """Convert a float32 audio array to signed 16-bit little-endian PCM bytes."""
-    clipped = np.clip(audio, -1.0, 1.0)
-    pcm = (clipped * 32767.0).astype("<i2")
+    """Convert mono float32 audio to contiguous signed 16-bit little-endian PCM."""
+    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    pcm = np.ascontiguousarray((clipped * 32768.0).clip(-32768, 32767).astype("<i2"))
     return pcm.tobytes()
 
 
@@ -82,6 +150,10 @@ class WhisperLiveKitClient:
         self._received_config = False
         self._debug_capture_samples: list[np.ndarray] = []
         self._debug_capture_written = False
+        self._queue_capture_samples: list[np.ndarray] = []
+        self._queue_capture_written = False
+        self._pre_send_capture = bytearray()
+        self._pre_send_capture_written = False
 
     def start(self) -> None:
         """Start the single websocket background thread."""
@@ -221,14 +293,19 @@ class WhisperLiveKitClient:
                         queue_ts=frame.queued_monotonic,
                     )
                     self._last_sent_trace = trace
-                    self._capture_debug_audio(frame.data)
-                    pcm_buffer.extend(float32_to_pcm16(frame.data))
+                    log_audio_stage("queue_retrieval", frame, frame.data)
+                    self._capture_queue_audio(frame.data)
+                    pcm = float32_to_pcm16(frame.data)
+                    self._log_pcm_conversion(frame, frame.data, pcm)
+                    pcm_buffer.extend(pcm)
             except queue.Empty:
                 pass
 
             while len(pcm_buffer) >= _SEND_CHUNK_BYTES:
                 chunk = bytes(pcm_buffer[:_SEND_CHUNK_BYTES])
                 del pcm_buffer[:_SEND_CHUNK_BYTES]
+                self._log_websocket_chunk(chunk)
+                self._capture_pre_send_audio(chunk)
                 await ws.send(chunk)
                 send_ts = time.monotonic()
                 if self._last_sent_trace is not None:
@@ -378,11 +455,7 @@ class WhisperLiveKitClient:
 
         captured = np.concatenate(self._debug_capture_samples)[: int(config.SAMPLE_RATE * _DEBUG_CAPTURE_SECONDS)]
         pcm = float32_to_pcm16(captured)
-        with wave.open(str(_DEBUG_CAPTURE_PATH), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(config.SAMPLE_RATE)
-            wav_file.writeframes(pcm)
+        write_pcm16_wav(_DEBUG_CAPTURE_PATH, pcm)
         self._debug_capture_written = True
         self._debug_capture_samples.clear()
         rms = float(np.sqrt(np.mean(captured ** 2)))
@@ -395,6 +468,67 @@ class WhisperLiveKitClient:
             rms,
             peak,
         )
+        log_wav_report(_DEBUG_CAPTURE_PATH)
+
+    def _capture_queue_audio(self, audio: np.ndarray) -> None:
+        if self._queue_capture_written:
+            return
+        self._queue_capture_samples.append(audio.copy())
+        sample_count = sum(chunk.size for chunk in self._queue_capture_samples)
+        if sample_count < int(config.SAMPLE_RATE * _DEBUG_CAPTURE_SECONDS):
+            return
+        captured = np.concatenate(self._queue_capture_samples)[: int(config.SAMPLE_RATE * _DEBUG_CAPTURE_SECONDS)]
+        write_pcm16_wav(_QUEUE_CAPTURE_PATH, float32_to_pcm16(captured))
+        self._queue_capture_written = True
+        self._queue_capture_samples.clear()
+        log_wav_report(_QUEUE_CAPTURE_PATH)
+
+    def _log_websocket_chunk(self, chunk: bytes) -> None:
+        pcm_array = np.frombuffer(chunk, dtype="<i2")
+        logger.info(
+            "Audio trace stage=websocket_send object_id=%s dtype=%s shape=%s samples=%d rms=%.8f peak=%d min=%d max=%d bytes=%d",
+            id(chunk),
+            pcm_array.dtype,
+            pcm_array.shape,
+            pcm_array.size,
+            float(np.sqrt(np.mean((pcm_array.astype(np.float32) / 32768.0) ** 2))) if pcm_array.size else 0.0,
+            int(np.max(np.abs(pcm_array))) if pcm_array.size else 0,
+            int(np.min(pcm_array)) if pcm_array.size else 0,
+            int(np.max(pcm_array)) if pcm_array.size else 0,
+            len(chunk),
+        )
+
+    def _capture_pre_send_audio(self, chunk: bytes) -> None:
+        if self._pre_send_capture_written:
+            return
+        needed = int(config.SAMPLE_RATE * _DEBUG_CAPTURE_SECONDS * 2) - len(self._pre_send_capture)
+        self._pre_send_capture.extend(chunk[: max(0, needed)])
+        if len(self._pre_send_capture) < int(config.SAMPLE_RATE * _DEBUG_CAPTURE_SECONDS * 2):
+            return
+        write_pcm16_wav(_PRE_SEND_CAPTURE_PATH, bytes(self._pre_send_capture))
+        self._pre_send_capture_written = True
+        self._pre_send_capture.clear()
+        log_wav_report(_PRE_SEND_CAPTURE_PATH)
+
+    def _log_pcm_conversion(self, frame: TimestampedFrame, audio: np.ndarray, pcm: bytes) -> None:
+        pcm_array = np.frombuffer(pcm, dtype="<i2")
+        logger.info(
+            "Audio trace stage=pcm_conversion frame_id=%d float_object_id=%s pcm_object_id=%s dtype=%s shape=%s samples=%d rms=%.8f peak=%d min=%d max=%d",
+            frame.frame_index,
+            id(audio),
+            id(pcm_array),
+            pcm_array.dtype,
+            pcm_array.shape,
+            pcm_array.size,
+            float(np.sqrt(np.mean((pcm_array.astype(np.float32) / 32768.0) ** 2))) if pcm_array.size else 0.0,
+            int(np.max(np.abs(pcm_array))) if pcm_array.size else 0,
+            int(np.min(pcm_array)) if pcm_array.size else 0,
+            int(np.max(pcm_array)) if pcm_array.size else 0,
+        )
+        if frame.frame_index == 1:
+            logger.info("First 100 float32 samples frame_id=%d: %s", frame.frame_index, audio[:100].tolist())
+            logger.info("First 100 int16 samples frame_id=%d: %s", frame.frame_index, pcm_array[:100].tolist())
+            logger.info("First 200 websocket bytes frame_id=%d hex=%s", frame.frame_index, pcm[:200].hex())
 
     def _put_committed(self, text: str) -> None:
         trace = self._last_sent_trace or LatencyTrace()
