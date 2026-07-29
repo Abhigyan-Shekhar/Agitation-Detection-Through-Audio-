@@ -231,6 +231,10 @@ class AudioPipeline:
                     self._dropped_frames,
                 )
 
+    def _capture_callback_audio(self, indata: np.ndarray) -> None:
+        """Compatibility no-op for removed callback WAV diagnostics."""
+        return None
+
     def _resolve_input_device(self) -> str | int | None:
         """Return the concrete input device passed to sounddevice.InputStream."""
         assert sd is not None

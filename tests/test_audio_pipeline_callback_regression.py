@@ -9,6 +9,8 @@ def test_audio_callback_enqueues_frame_without_debug_capture_hook():
     pipeline = AudioPipeline(sample_rate=16000, frame_size=4, max_queue_size=4)
     indata = np.array([[0.01], [-0.02], [0.03], [-0.04]], dtype=np.float32)
 
+    assert pipeline._capture_callback_audio(indata) is None
+
     pipeline._audio_callback(indata, frames=4, time_info=None, status=None)
 
     acoustic_frame = pipeline.acoustic_queue.get_nowait()
