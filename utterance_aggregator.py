@@ -180,6 +180,12 @@ class UtteranceAggregator:
 
             self._lines.append(line)
             self._last_line_time = line.timestamp
+            logger.info(
+                "BEHAVIOUR_TRACE aggregator_received transcript=%r line_count=%d timestamp=%.3f",
+                line.text,
+                len(self._lines),
+                line.timestamp,
+            )
             logger.debug("Accumulated committed line: %r", line.text)
 
     def _emit(self) -> None:
@@ -207,6 +213,13 @@ class UtteranceAggregator:
                 utterance.full_text[:60],
                 utterance.duration(),
                 trace.durations_ms() if trace else {},
+            )
+            logger.info(
+                "BEHAVIOUR_TRACE aggregator_emitted transcript=%r start=%.3f end=%.3f utterance_q=%d",
+                utterance.full_text,
+                utterance.start_time,
+                utterance.end_time,
+                self._utterance_queue.qsize(),
             )
         except queue.Full:
             logger.warning("utterance_queue full — utterance dropped")

@@ -161,6 +161,13 @@ def _consume() -> None:
         while True:
             utterance: Utterance = st.session_state.utterance_queue.get_nowait()
             logger.info("Processing utterance: %r", utterance.full_text[:60])
+            logger.info(
+                "BEHAVIOUR_TRACE dashboard_received_utterance transcript=%r start=%.3f end=%.3f utterance_q=%d",
+                utterance.full_text,
+                utterance.start_time,
+                utterance.end_time,
+                st.session_state.utterance_queue.qsize(),
+            )
 
             trace = utterance.latency_trace
 
@@ -175,6 +182,12 @@ def _consume() -> None:
 
             # Linguistic features
             linguistic = analyzer.analyze(utterance)
+            logger.info(
+                "BEHAVIOUR_TRACE dashboard_classifier_input transcript=%r acoustic_available=%s linguistic=%s",
+                utterance.full_text,
+                acoustic is not None,
+                linguistic,
+            )
 
             # Fusion
             result = fusion.fuse(utterance, acoustic, linguistic)
@@ -182,6 +195,13 @@ def _consume() -> None:
 
             # Behaviour classification
             result = classifier.classify(result)
+            logger.info(
+                "BEHAVIOUR_TRACE dashboard_classifier_output transcript=%r behaviours=%s event_labels=%s severity=%s",
+                utterance.full_text,
+                result.behaviours,
+                [event.canonical_label for event in result.behaviour_events],
+                result.severity,
+            )
 
             if result.latency_trace is not None:
                 result.latency_trace.dashboard_render_ts = time.monotonic()
@@ -476,6 +496,24 @@ def _render_logging_form() -> None:
             st.success("Behaviour event saved.")
 
 
+
+def _displayed_behaviour_label(result: FusedResult) -> str:
+    """Return the label shown in the current-behaviour card and log UI selection."""
+    event_labels = [event.canonical_label for event in result.behaviour_events]
+    candidate_labels = event_labels or [
+        label for label in result.behaviours if label != "No audio agitation detected"
+    ] or result.behaviours
+    displayed = candidate_labels[0] if candidate_labels else "No audio agitation detected"
+    logger.info(
+        "BEHAVIOUR_TRACE ui_display transcript=%r behaviours=%s event_labels=%s severity=%s displayed_behavior=%r",
+        result.utterance.full_text if result.utterance else "",
+        result.behaviours,
+        event_labels,
+        result.severity,
+        displayed,
+    )
+    return displayed
+
 def _render_behaviour_events(result: FusedResult) -> None:
     """Render canonical behaviour events in a compact, research-friendly layout."""
     if result.behaviour_events:
@@ -504,6 +542,11 @@ def _render_behaviour_events(result: FusedResult) -> None:
         return
 
     st.subheader("Detected Behaviours")
+    non_event_labels = [label for label in result.behaviours if label != "No audio agitation detected"]
+    if non_event_labels:
+        for label in non_event_labels:
+            st.info(label)
+        return
     st.success("No audio agitation detected")
 
 
@@ -555,7 +598,7 @@ def _render() -> None:
             if result is None:
                 st.info("Waiting for a completed utterance…")
             else:
-                behaviour_label = result.behaviour_events[0].canonical_label if result.behaviour_events else "No audio agitation detected"
+                behaviour_label = _displayed_behaviour_label(result)
                 st.metric("Behaviour", behaviour_label)
                 st.metric("Current Severity", _severity_badge(result.severity))
                 st.metric("Current Confidence", f"{result.reliability:.0%}")

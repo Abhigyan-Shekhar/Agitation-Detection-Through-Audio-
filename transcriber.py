@@ -206,7 +206,14 @@ class TranscriptionWorker:
                     queue_ts=self._frames[0].queued_monotonic or None,
                     transcript_ts=time.monotonic(),
                 )
-                self._put_latest(self._committed_queue, CommittedLine(text=text, timestamp=result.timestamp, latency_trace=trace))
+                committed = CommittedLine(text=text, timestamp=result.timestamp, latency_trace=trace)
+                logger.info(
+                    "BEHAVIOUR_TRACE transcriber_committed transcript=%r timestamp=%.3f confidence=%s",
+                    committed.text,
+                    committed.timestamp,
+                    "None" if confidence is None else f"{confidence:.3f}",
+                )
+                self._put_latest(self._committed_queue, committed)
                 self._last_text = text
 
     @staticmethod
