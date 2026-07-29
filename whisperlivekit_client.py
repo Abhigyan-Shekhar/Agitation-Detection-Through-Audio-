@@ -72,6 +72,8 @@ class WhisperLiveKitClient:
         self._last_sent_trace: LatencyTrace | None = None
         self._send_latency_ms_total = 0.0
         self._send_latency_samples = 0
+        self._messages_received = 0
+        self._last_committed_keys: set[tuple[str, str, str, str]] = set()
 
     def start(self) -> None:
         """Start the single websocket background thread."""
@@ -110,8 +112,9 @@ class WhisperLiveKitClient:
             self._thread.join(timeout=5.0)
         self._ws = None
         logger.info(
-            "WhisperLiveKitClient stopped — bytes_sent=%d partial=%d committed=%d",
+            "WhisperLiveKitClient stopped — bytes_sent=%d messages=%d partial=%d committed=%d",
             self._bytes_sent,
+            self._messages_received,
             self._partial_count,
             self._committed_count,
         )
@@ -125,6 +128,7 @@ class WhisperLiveKitClient:
             "avg_capture_to_send_ms": int(
                 self._send_latency_ms_total / max(self._send_latency_samples, 1)
             ),
+            "messages_received": self._messages_received,
         }
 
     def _run_event_loop(self) -> None:
@@ -220,49 +224,135 @@ class WhisperLiveKitClient:
 
             await asyncio.sleep(0.010)
 
-        if pcm_buffer:
-            try:
+        try:
+            if pcm_buffer:
                 await ws.send(bytes(pcm_buffer))
                 self._bytes_sent += len(pcm_buffer)
-            except ConnectionClosed:
-                pass
+            await ws.send(b"")
+        except ConnectionClosed:
+            pass
 
     async def _recv_loop(self, ws: Any) -> None:
         """Receive WLK JSON messages and route transcript events."""
         async for raw in ws:
             if self._stop_event.is_set():
                 break
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 logger.debug("Non-JSON WLK message: %r", raw)
                 continue
+            self._messages_received += 1
             self._dispatch(msg)
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
-        """Route a parsed WLK message to the appropriate output queue."""
+        """Route WLK native, diff-mode, and legacy transcript events to queues."""
         msg_type = msg.get("type") or msg.get("status") or ""
-        text: str = msg.get("text", "") or msg.get("transcript", "") or ""
-        if not text:
+
+        if msg_type == "config":
+            logger.info(
+                "WLK config received — useAudioWorklet=%s mode=%s",
+                msg.get("useAudioWorklet"),
+                msg.get("mode"),
+            )
+            return
+
+        if msg_type == "ready_to_stop":
+            logger.info("WLK reported ready_to_stop")
+            return
+
+        if msg.get("error"):
+            logger.warning("WLK websocket error message: %s", msg.get("error"))
+
+        partial = self._extract_partial_text(msg)
+        if partial:
+            self._put_partial(partial)
+
+        committed_lines = self._extract_committed_lines(msg)
+        if committed_lines:
+            logger.info(
+                "WLK transcript event — partial=%r new_committed=%d partial_q=%d committed_q=%d",
+                partial[:80],
+                len(committed_lines),
+                self._partial_queue.qsize(),
+                self._committed_queue.qsize(),
+            )
+            for text in committed_lines:
+                self._put_committed(text)
+            return
+
+        legacy_text = (msg.get("text") or msg.get("transcript") or "").strip()
+        if not legacy_text:
+            logger.debug("WLK message without transcript text: %r", msg)
             return
 
         if msg_type in ("partial", "interim", "processing"):
-            try:
-                self._partial_queue.put_nowait(text)
-                self._partial_count += 1
-            except queue.Full:
-                pass
+            self._put_partial(legacy_text)
             return
 
         if msg_type in ("committed", "final", "complete", "completed", ""):
-            trace = self._last_sent_trace or LatencyTrace()
-            trace.transcript_ts = time.monotonic()
-            line = CommittedLine(text=text.strip(), timestamp=time.time(), latency_trace=trace)
-            try:
-                self._committed_queue.put_nowait(line)
-                self._committed_count += 1
-            except queue.Full:
-                logger.warning("committed_queue full — committed line dropped")
+            self._put_committed(legacy_text)
             return
 
         logger.debug("Unknown WLK message type %r: %r", msg_type, msg)
+
+    def _extract_partial_text(self, msg: dict[str, Any]) -> str:
+        """Return WLK native buffer text, if present."""
+        for key in ("buffer_transcription", "buffer_diarization", "buffer_translation"):
+            value = msg.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _extract_committed_lines(self, msg: dict[str, Any]) -> list[str]:
+        """Return newly committed WLK line texts, de-duplicating full-state updates."""
+        raw_lines: list[Any] = []
+        msg_type = msg.get("type")
+        if msg_type == "diff":
+            raw_lines = list(msg.get("new_lines") or [])
+        elif "lines" in msg:
+            raw_lines = list(msg.get("lines") or [])
+
+        new_texts: list[str] = []
+        for line in raw_lines:
+            if not isinstance(line, dict):
+                continue
+            text = line.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if line.get("speaker") == -2:
+                continue
+            key = (
+                str(line.get("speaker", "")),
+                str(line.get("start", "")),
+                str(line.get("end", "")),
+                text.strip(),
+            )
+            if key in self._last_committed_keys:
+                continue
+            self._last_committed_keys.add(key)
+            new_texts.append(text.strip())
+        return new_texts
+
+    def _put_partial(self, text: str) -> None:
+        try:
+            self._partial_queue.put_nowait(text)
+            self._partial_count += 1
+        except queue.Full:
+            logger.debug("partial_queue full — partial transcript dropped")
+
+    def _put_committed(self, text: str) -> None:
+        trace = self._last_sent_trace or LatencyTrace()
+        trace.transcript_ts = time.monotonic()
+        line = CommittedLine(
+            text=text,
+            timestamp=time.time(),
+            latency_trace=trace,
+        )
+        try:
+            self._committed_queue.put_nowait(line)
+            self._committed_count += 1
+        except queue.Full:
+            logger.warning("committed_queue full — committed line dropped")
