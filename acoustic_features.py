@@ -328,15 +328,9 @@ class AcousticWorker:
     def aggregate(self, start_time: float, end_time: float) -> AcousticFeatureWindow | None:
         """Return the mean of all windows that overlap [start_time, end_time].
 
-        Uses the stored ring buffer audio directly for maximum accuracy.
-        Falls back to averaging stored feature windows if no audio is available.
+        Uses precomputed feature windows so dashboard inference never blocks
+        on synchronous librosa feature extraction.
         """
-        # Re-extract directly from ring buffer audio for the utterance span
-        records = self._ring.slice(start_time - 0.5, end_time + 0.5)
-        if records:
-            return self._extractor.extract(records, start_time, end_time)
-
-        # Fallback: average stored windows
         with self._lock:
             relevant = [
                 w for w in self._windows
@@ -344,7 +338,13 @@ class AcousticWorker:
             ]
         if not relevant:
             return None
-        return self._average_windows(relevant, start_time, end_time)
+        feat = self._average_windows(relevant, start_time, end_time)
+        logger.debug(
+            "Acoustic aggregate used %d precomputed windows over %.2fs",
+            len(relevant),
+            end_time - start_time,
+        )
+        return feat
 
     def latest_window(self) -> AcousticFeatureWindow | None:
         with self._lock:
@@ -370,7 +370,10 @@ class AcousticWorker:
                 if records:
                     window_end = now
                     window_start = window_end - self._window_sec
+                    extract_start = time.monotonic()
                     feat = self._extractor.extract(records, window_start, window_end)
+                    extract_ms = (time.monotonic() - extract_start) * 1000.0
+                    logger.debug("Acoustic feature extraction window took %.2f ms", extract_ms)
                     with self._lock:
                         self._windows.append(feat)
                     self._last_extraction_time = now

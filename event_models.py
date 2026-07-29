@@ -6,7 +6,51 @@ a single source of truth for inter-module data contracts.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any
+
+
+@dataclass
+class LatencyTrace:
+    """Monotonic timestamps for end-to-end audio pipeline latency diagnostics."""
+
+    microphone_ts: float | None = None
+    queue_ts: float | None = None
+    wlk_send_ts: float | None = None
+    transcript_ts: float | None = None
+    feature_extraction_ts: float | None = None
+    inference_ts: float | None = None
+    dashboard_render_ts: float | None = None
+
+    def mark(self, stage: str) -> None:
+        setattr(self, f"{stage}_ts", time.monotonic())
+
+    def durations_ms(self) -> dict[str, float]:
+        stages = [
+            ("microphone", self.microphone_ts),
+            ("queue", self.queue_ts),
+            ("wlk_send", self.wlk_send_ts),
+            ("transcript", self.transcript_ts),
+            ("feature_extraction", self.feature_extraction_ts),
+            ("inference", self.inference_ts),
+            ("dashboard_render", self.dashboard_render_ts),
+        ]
+        out: dict[str, float] = {}
+        previous_name: str | None = None
+        previous_ts: float | None = None
+        first_ts: float | None = None
+        for name, ts in stages:
+            if ts is None:
+                continue
+            if first_ts is None:
+                first_ts = ts
+            if previous_ts is not None and previous_name is not None:
+                out[f"{previous_name}_to_{name}"] = round((ts - previous_ts) * 1000.0, 2)
+            previous_name = name
+            previous_ts = ts
+        if first_ts is not None and previous_ts is not None:
+            out["end_to_end"] = round((previous_ts - first_ts) * 1000.0, 2)
+        return out
 
 
 @dataclass
@@ -81,6 +125,7 @@ class CommittedLine:
 
     text: str
     timestamp: float    # Unix timestamp when line was committed
+    latency_trace: LatencyTrace | None = None
 
 
 @dataclass
@@ -90,6 +135,7 @@ class Utterance:
     lines: list[CommittedLine]
     start_time: float   # Unix timestamp of first word
     end_time: float     # Unix timestamp of last committed line
+    latency_trace: LatencyTrace | None = None
 
     @property
     def full_text(self) -> str:
@@ -152,3 +198,6 @@ class FusedResult:
 
     # Optional Gemini comparison result (disabled by default)
     gemini_result: dict[str, Any] | None = None
+
+    # End-to-end latency diagnostics for the utterance lifecycle
+    latency_trace: LatencyTrace | None = None
