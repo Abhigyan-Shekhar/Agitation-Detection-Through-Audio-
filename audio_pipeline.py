@@ -22,6 +22,8 @@ import logging
 import queue
 import threading
 import time
+import wave
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -36,6 +38,36 @@ import config
 logger = logging.getLogger(__name__)
 
 _SILENCE_RMS_THRESHOLD = 1e-5
+_CALLBACK_CAPTURE_SECONDS = 5.0
+_CALLBACK_CAPTURE_PATH = Path("callback_capture.wav")
+
+
+def _audio_stats(audio: np.ndarray) -> dict[str, float | int | str | tuple[int, ...]]:
+    arr = np.asarray(audio)
+    return {
+        "object_id": id(audio),
+        "dtype": str(arr.dtype),
+        "shape": tuple(arr.shape),
+        "samples": int(arr.size),
+        "rms": float(np.sqrt(np.nanmean(arr.astype(np.float32) ** 2))) if arr.size else 0.0,
+        "peak": float(np.nanmax(np.abs(arr))) if arr.size else 0.0,
+        "min": float(np.nanmin(arr)) if arr.size else 0.0,
+        "max": float(np.nanmax(arr)) if arr.size else 0.0,
+    }
+
+
+def _float32_to_pcm16(audio: np.ndarray) -> bytes:
+    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    pcm = np.ascontiguousarray((clipped * 32768.0).clip(-32768, 32767).astype("<i2"))
+    return pcm.tobytes()
+
+
+def _write_pcm16_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
 
 
 class TimestampedFrame(NamedTuple):
@@ -170,6 +202,7 @@ class AudioPipeline:
             logger.debug("sounddevice status: %s", status)
 
         self._log_callback_stats(indata, frames)
+        self._capture_callback_audio(indata)
 
         audio = indata[:, 0].copy()  # mono, float32
         ts = time.time()
@@ -183,10 +216,13 @@ class AudioPipeline:
             frame_index=self._frame_index,
         )
 
+        self._log_audio_stage("timestamped_frame", self._frame_index, audio)
+
         # Fan out to both queues — drop if full rather than block the callback
         for q in (self.acoustic_queue, self.wlk_queue):
             try:
                 q.put_nowait(frame)
+                self._log_audio_stage("queue_insertion", self._frame_index, audio)
             except queue.Full:
                 self._dropped_frames += 1
                 logger.debug(
