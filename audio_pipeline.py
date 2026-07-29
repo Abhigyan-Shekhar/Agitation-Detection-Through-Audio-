@@ -35,12 +35,17 @@ import config
 
 logger = logging.getLogger(__name__)
 
+_SILENCE_RMS_THRESHOLD = 1e-5
+
 
 class TimestampedFrame(NamedTuple):
     """A single audio callback chunk with wall-clock metadata."""
 
     data: np.ndarray   # float32, shape (frame_size,)
     timestamp: float   # Unix timestamp of the frame's leading edge
+    capture_monotonic: float = 0.0
+    queued_monotonic: float = 0.0
+    frame_index: int = 0
 
 
 class AudioPipeline:
@@ -81,6 +86,7 @@ class AudioPipeline:
 
         # Monotonic frame counter for diagnostics
         self._frame_index: int = 0
+        self._last_callback_stats: dict[str, float | int | str | bool] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,14 +116,17 @@ class AudioPipeline:
         self._flush_queues()
         self._is_running = True
 
+        self._log_input_device_config()
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=config.CHANNELS,
             blocksize=self.frame_size,
             dtype=config.DTYPE,
+            device=config.AUDIO_INPUT_DEVICE,
             callback=self._audio_callback,
         )
         self._stream.start()
+        self._log_stream_config()
         logger.info(
             "AudioPipeline started — sample_rate=%d frame_size=%d",
             self.sample_rate,
@@ -137,8 +146,10 @@ class AudioPipeline:
             self._stream = None
 
         logger.info(
-            "AudioPipeline stopped — total dropped frames: %d",
+            "AudioPipeline stopped — total dropped frames: %d acoustic_q=%d wlk_q=%d",
             self._dropped_frames,
+            self.acoustic_queue.qsize(),
+            self.wlk_queue.qsize(),
         )
 
     # ------------------------------------------------------------------
@@ -156,10 +167,19 @@ class AudioPipeline:
         if status:
             logger.debug("sounddevice status: %s", status)
 
+        self._log_callback_stats(indata, frames)
+
         audio = indata[:, 0].copy()  # mono, float32
         ts = time.time()
-        frame = TimestampedFrame(data=audio, timestamp=ts)
+        capture_monotonic = time.monotonic()
         self._frame_index += 1
+        frame = TimestampedFrame(
+            data=audio,
+            timestamp=ts,
+            capture_monotonic=capture_monotonic,
+            queued_monotonic=time.monotonic(),
+            frame_index=self._frame_index,
+        )
 
         # Fan out to both queues — drop if full rather than block the callback
         for q in (self.acoustic_queue, self.wlk_queue):
@@ -172,6 +192,79 @@ class AudioPipeline:
                     self._frame_index,
                     self._dropped_frames,
                 )
+
+    def _log_input_device_config(self) -> None:
+        """Log sounddevice input-device configuration before opening the stream."""
+        assert sd is not None
+        try:
+            devices = sd.query_devices()
+            default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
+            requested = config.AUDIO_INPUT_DEVICE if config.AUDIO_INPUT_DEVICE is not None else default_input
+            selected = sd.query_devices(requested, "input")
+            logger.info(
+                "Audio input device selected — requested=%r default_input=%r name=%s hostapi=%s max_input_channels=%s default_samplerate=%s",
+                requested,
+                default_input,
+                selected.get("name"),
+                selected.get("hostapi"),
+                selected.get("max_input_channels"),
+                selected.get("default_samplerate"),
+            )
+            logger.debug("Available audio devices: %s", devices)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not query sounddevice input devices: %s", exc)
+
+    def _log_stream_config(self) -> None:
+        """Log the actual PortAudio stream configuration after start."""
+        if self._stream is None:
+            return
+        logger.info(
+            "Audio InputStream started — device=%r samplerate=%s channels=%d dtype=%s blocksize=%d latency=%s",
+            config.AUDIO_INPUT_DEVICE,
+            getattr(self._stream, "samplerate", self.sample_rate),
+            config.CHANNELS,
+            config.DTYPE,
+            self.frame_size,
+            getattr(self._stream, "latency", "unknown"),
+        )
+
+    def _log_callback_stats(self, indata: np.ndarray, frames: int) -> None:
+        """Log raw callback-level audio statistics before any processing."""
+        finite = bool(np.all(np.isfinite(indata)))
+        sample_min = float(np.nanmin(indata)) if indata.size else 0.0
+        sample_max = float(np.nanmax(indata)) if indata.size else 0.0
+        rms = float(np.sqrt(np.nanmean(indata ** 2))) if indata.size else 0.0
+        peak = float(np.nanmax(np.abs(indata))) if indata.size else 0.0
+        clipped = int(np.sum(np.abs(indata) >= 0.99)) if indata.size else 0
+        self._last_callback_stats = {
+            "frames": frames,
+            "samples": int(indata.size),
+            "dtype": str(indata.dtype),
+            "rms": rms,
+            "peak": peak,
+            "min": sample_min,
+            "max": sample_max,
+            "finite": finite,
+            "clipped": clipped,
+        }
+        logger.info(
+            "Audio callback raw stats — frames=%d samples=%d dtype=%s rms=%.8f peak=%.8f min=%.8f max=%.8f finite=%s clipped=%d",
+            frames,
+            int(indata.size),
+            indata.dtype,
+            rms,
+            peak,
+            sample_min,
+            sample_max,
+            finite,
+            clipped,
+        )
+        if not finite:
+            logger.warning("Audio callback received non-finite samples")
+        elif peak == 0.0:
+            logger.warning("Audio callback received all-zero samples")
+        elif rms < _SILENCE_RMS_THRESHOLD:
+            logger.warning("Audio callback amplitude is extremely low: rms=%.8f peak=%.8f", rms, peak)
 
     def _flush_queues(self) -> None:
         """Drain all queues before (re)starting to avoid stale data."""
