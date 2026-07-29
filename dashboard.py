@@ -36,7 +36,7 @@ from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
 from behaviour_classifier import BehaviourClassifier
 from audio_behaviour_taxonomy import get_supported_behaviours
-from event_models import BehaviourEvent, FusedResult, Utterance
+from event_models import BehaviourEvent, CommittedLine, FusedResult, Utterance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +76,11 @@ def _init() -> None:
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
         "latest_result": None,      # FusedResult | None
+        "latest_result_is_provisional": False,
+        "partial_seen_text": "",
+        "partial_seen_at": 0.0,
+        "partial_last_analysis_text": "",
+        "partial_last_analysis_at": 0.0,
         "error": None,
         # Calibration
         "calibrating": False,
@@ -145,6 +150,11 @@ def _current_recording_text() -> str:
 def _start_pipeline() -> None:
     st.session_state.error = None
     st.session_state.partial_caption = ""
+    st.session_state.partial_seen_text = ""
+    st.session_state.partial_seen_at = 0.0
+    st.session_state.partial_last_analysis_text = ""
+    st.session_state.partial_last_analysis_at = 0.0
+    st.session_state.latest_result_is_provisional = False
     _get_manager().start()
 
 
@@ -157,25 +167,118 @@ def _stop_pipeline() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fragment — runs every 1 second
+# Fragment helpers
 # ---------------------------------------------------------------------------
+
+def _utterance_from_text(text: str, timestamp: float | None = None) -> Utterance:
+    """Build a transient utterance object around one transcript string."""
+    now = timestamp or time.time()
+    return Utterance(
+        lines=[CommittedLine(text=text, timestamp=now)],
+        start_time=now,
+        end_time=now,
+    )
+
+
+def _analyse_utterance(
+    utterance: Utterance,
+    acoustic_worker: Any | None,
+    *,
+    provisional: bool,
+) -> FusedResult:
+    """Run the scoring pipeline for committed or live provisional text."""
+    analyzer = LinguisticAnalyzer() if provisional else st.session_state.linguistic_analyzer
+    fusion: ScoreFusion = st.session_state.score_fusion
+    classifier: BehaviourClassifier = st.session_state.behaviour_classifier
+
+    acoustic = None
+    if acoustic_worker is not None:
+        if provisional:
+            now = time.time()
+            acoustic = acoustic_worker.aggregate(
+                now - config.ACOUSTIC_WINDOW_SEC,
+                now,
+            )
+        else:
+            acoustic = acoustic_worker.aggregate(
+                utterance.start_time, utterance.end_time
+            )
+
+    linguistic = analyzer.analyze(utterance)
+    result = fusion.fuse(
+        utterance,
+        acoustic,
+        linguistic,
+        update_state=not provisional,
+    )
+    result.linguistic_features = linguistic
+    result = classifier.classify(result)
+
+    st.session_state.latest_result = result
+    st.session_state.latest_result_is_provisional = provisional
+    return result
+
+
+def _record_final_result(result: FusedResult) -> None:
+    """Append only committed utterance results to durable dashboard history."""
+    for event in result.behaviour_events:
+        st.session_state.behaviour_log.append(_event_to_record(event, result))
+    st.session_state.timeline.append({
+        "time": time.strftime("%H:%M:%S"),
+        "timestamp": datetime.now(),
+        "acoustic_score": result.acoustic_score,
+        "linguistic_score": result.linguistic_score,
+        "smoothed_score": result.smoothed_score,
+        "severity": result.severity,
+    })
+
+
+def _analyse_live_partial_if_ready(acoustic_worker: Any | None) -> None:
+    """Score stable live caption text before WLK emits a committed line."""
+    text = st.session_state.partial_caption.strip()
+    if len(text) < config.PARTIAL_ANALYSIS_MIN_CHARS:
+        return
+
+    now = time.monotonic()
+    if now - st.session_state.partial_seen_at < config.PARTIAL_ANALYSIS_STABLE_SEC:
+        return
+    if (
+        text == st.session_state.partial_last_analysis_text
+        and now - st.session_state.partial_last_analysis_at < config.PARTIAL_ANALYSIS_INTERVAL_SEC
+    ):
+        return
+    if st.session_state.committed_lines and text == st.session_state.committed_lines[-1]:
+        return
+
+    st.session_state.partial_last_analysis_text = text
+    st.session_state.partial_last_analysis_at = now
+    _analyse_utterance(
+        _utterance_from_text(text),
+        acoustic_worker,
+        provisional=True,
+    )
+
 
 def _consume() -> None:
     """Drain queues and run analysis on completed utterances."""
-    # Partial caption (display only — no analysis)
+    # Partial caption (display + provisional analysis)
     try:
         while True:
             text = st.session_state.partial_queue.get_nowait()
             st.session_state.partial_caption = text
+            if text != st.session_state.partial_seen_text:
+                st.session_state.partial_seen_text = text
+                st.session_state.partial_seen_at = time.monotonic()
     except queue.Empty:
         pass
 
     # Committed lines (for the committed transcript display)
     try:
         while True:
-            from event_models import CommittedLine
             line: CommittedLine = st.session_state.committed_display_queue.get_nowait()
             st.session_state.committed_lines.append(line.text)
+            if line.text.strip() == st.session_state.partial_caption.strip():
+                st.session_state.partial_caption = ""
             if len(st.session_state.committed_lines) > 50:
                 st.session_state.committed_lines.pop(0)
     except queue.Empty:
@@ -184,45 +287,21 @@ def _consume() -> None:
     # Completed utterances → full analysis pipeline
     manager = st.session_state.get("manager")
     acoustic_worker = manager.acoustic_worker if manager is not None else None
-    analyzer: LinguisticAnalyzer = st.session_state.linguistic_analyzer
-    fusion: ScoreFusion = st.session_state.score_fusion
-    classifier: BehaviourClassifier = st.session_state.behaviour_classifier
+    _analyse_live_partial_if_ready(acoustic_worker)
 
     try:
         while True:
             utterance: Utterance = st.session_state.utterance_queue.get_nowait()
             logger.info("Processing utterance: %r", utterance.full_text[:60])
-
-            # Aggregate acoustic features for this utterance's time span
-            acoustic = None
-            if acoustic_worker is not None:
-                acoustic = acoustic_worker.aggregate(
-                    utterance.start_time, utterance.end_time
-                )
-
-            # Linguistic features
-            linguistic = analyzer.analyze(utterance)
-
-            # Fusion
-            result = fusion.fuse(utterance, acoustic, linguistic)
-            result.linguistic_features = linguistic
-
-            # Behaviour classification
-            result = classifier.classify(result)
-
-            st.session_state.latest_result = result
-            for event in result.behaviour_events:
-                st.session_state.behaviour_log.append(_event_to_record(event, result))
-            st.session_state.timeline.append({
-                "time": time.strftime("%H:%M:%S"),
-                "timestamp": datetime.now(),
-                "acoustic_score": result.acoustic_score,
-                "linguistic_score": result.linguistic_score,
-                "smoothed_score": result.smoothed_score,
-                "severity": result.severity,
-            })
+            result = _analyse_utterance(
+                utterance,
+                acoustic_worker,
+                provisional=False,
+            )
+            _record_final_result(result)
 
             # Optional Gemini ablation
+            acoustic = result.acoustic_features
             if config.ENABLE_GEMINI_COMPARISON and acoustic is not None:
                 try:
                     from person3_module import analyze_person3
@@ -698,6 +777,12 @@ with st.sidebar:
         st.write("WLK auto-launch:", config.WLK_AUTO_LAUNCH)
         st.write("WLK backend:", config.WLK_BACKEND)
         st.write("WLK model:", config.WLK_MODEL)
+        st.write("WLK language:", config.WLK_LANGUAGE)
+        st.write("WLK output mode:", config.WLK_OUTPUT_MODE)
+        st.write("WLK min chunk sec:", config.WLK_MIN_CHUNK_SEC)
+        st.write("WLK VAC chunk sec:", config.WLK_VAC_CHUNK_SEC)
+        st.write("WLK confidence validation:", config.WLK_CONFIDENCE_VALIDATION)
+        st.write("Latest result provisional:", st.session_state.latest_result_is_provisional)
         st.write("Gemini comparison:", config.ENABLE_GEMINI_COMPARISON)
         manager = st.session_state.get("manager")
         aw = manager.acoustic_worker if manager else None
@@ -729,8 +814,8 @@ st.caption(
 )
 
 
-# ---- Live fragment (polls every second) ----------------------------------
-@st.fragment(run_every=1.0)
+# ---- Live fragment (polls four times per second) -------------------------
+@st.fragment(run_every=0.25)
 def _live() -> None:
     if _pipeline_running():
         _consume()

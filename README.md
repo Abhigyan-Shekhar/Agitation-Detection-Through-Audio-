@@ -12,6 +12,8 @@ This is decision-support only. It is not a clinical diagnosis.
 - macOS with the built-in microphone tested locally
 - WhisperLiveKit auto-launched by the dashboard on `127.0.0.1:8000`
 - Streamlit served on `127.0.0.1:8501`
+- Low-latency WLK defaults: diff WebSocket output, `tiny` model, English
+  language, 0.1 second minimum chunking, and 3 second buffer trimming.
 
 Python 3.10+ should work if the dependency resolver can install compatible
 PyTorch and audio wheels, but Python 3.11 or 3.12 is the safest choice on a new
@@ -69,7 +71,8 @@ Expected state after startup:
 - `Start mic` becomes disabled
 - `Stop mic` becomes enabled
 - `Current Recording` shows speech once you talk
-- `Current Behaviour` updates after a completed utterance
+- `Current Behaviour` updates from stable live speech first, then finalizes
+  after a completed utterance
 
 The first `Start mic` can take 30-120 seconds because WhisperLiveKit may import
 large audio libraries and download the first ASR model. The default model is
@@ -85,6 +88,25 @@ Force English transcription:
 
 ```bash
 WLK_LANGUAGE=en python -m streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1
+```
+
+Use automatic language detection if needed. This can be slower than a fixed
+language:
+
+```bash
+WLK_LANGUAGE=auto python -m streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1
+```
+
+Lower latency further on a fast machine:
+
+```bash
+PARTIAL_ANALYSIS_STABLE_SEC=0.25 PARTIAL_ANALYSIS_INTERVAL_SEC=0.5 python -m streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1
+```
+
+Prefer more conservative ASR finalization:
+
+```bash
+WLK_BUFFER_TRIMMING_SEC=8 PARTIAL_ANALYSIS_STABLE_SEC=1.0 python -m streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1
 ```
 
 Give WhisperLiveKit more startup time on a slow machine:
@@ -228,6 +250,12 @@ For debugging, expand the `Debug` panel in the sidebar. Useful fields:
 - `WLK auto-launch`
 - `WLK backend`
 - `WLK model`
+- `WLK language`
+- `WLK output mode`
+- `WLK min chunk sec`
+- `WLK VAC chunk sec`
+- `WLK confidence validation`
+- `Latest result provisional`
 - `Audio dropped frames`
 - `WLK queue size`
 - `WLK client stats`

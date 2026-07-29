@@ -33,7 +33,7 @@ from event_models import CommittedLine, Utterance
 logger = logging.getLogger(__name__)
 
 # Minimum pause after terminal punctuation to auto-finalise
-_MIN_PUNCT_PAUSE_SEC: float = 0.8
+_MIN_PUNCT_PAUSE_SEC: float = 0.25
 _TERMINAL_PUNCT: frozenset[str] = frozenset(".?!")
 _POLL_INTERVAL_SEC: float = 0.05    # how often the loop checks timing
 

@@ -6,6 +6,7 @@ everywhere rather than scattering magic numbers across the codebase.
 from __future__ import annotations
 
 import os
+from urllib.parse import urlencode
 
 # ---------------------------------------------------------------------------
 # Audio capture
@@ -21,20 +22,37 @@ DTYPE: str = "float32"
 WLK_HOST: str = os.getenv("WLK_HOST", "127.0.0.1")
 WLK_PORT: int = int(os.getenv("WLK_PORT", "8000"))
 WLK_PATH: str = os.getenv("WLK_PATH", "/asr")
-WLK_URL: str = f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
+WLK_OUTPUT_MODE: str = os.getenv("WLK_OUTPUT_MODE", "diff")
+_WLK_QUERY: str = urlencode({"mode": WLK_OUTPUT_MODE}) if WLK_OUTPUT_MODE else ""
+WLK_URL: str = (
+    f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
+    f"{'&' if '?' in WLK_PATH else '?'}{_WLK_QUERY}" if _WLK_QUERY
+    else f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
+)
 
 # WLK model settings (used when auto-launching the server)
 WLK_MODEL: str = os.getenv("WLK_MODEL", "tiny")
-WLK_LANGUAGE: str = os.getenv("WLK_LANGUAGE", "auto")
+WLK_LANGUAGE: str = os.getenv("WLK_LANGUAGE", "en")
 WLK_BACKEND: str = os.getenv("WLK_BACKEND", "faster-whisper")
+WLK_MIN_CHUNK_SEC: float = float(os.getenv("WLK_MIN_CHUNK_SEC", "0.1"))
+WLK_VAC_CHUNK_SEC: float = float(os.getenv("WLK_VAC_CHUNK_SEC", "0.04"))
+WLK_BUFFER_TRIMMING_SEC: float = float(os.getenv("WLK_BUFFER_TRIMMING_SEC", "3.0"))
+WLK_CONFIDENCE_VALIDATION: bool = (
+    os.getenv("WLK_CONFIDENCE_VALIDATION", "true").lower() == "true"
+)
 # If True, dashboard.py will spawn wlk as a subprocess automatically
 WLK_AUTO_LAUNCH: bool = os.getenv("WLK_AUTO_LAUNCH", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Utterance aggregator
 # ---------------------------------------------------------------------------
-UTTERANCE_SILENCE_SEC: float = 1.8   # silence gap that finalises an utterance
+UTTERANCE_SILENCE_SEC: float = 0.8   # silence gap that finalises an utterance
 MAX_UTTERANCE_SEC: float = 12.0      # hard cap — prevents endless accumulation
+
+# Live partial scoring keeps the dashboard responsive before ASR finalization.
+PARTIAL_ANALYSIS_STABLE_SEC: float = float(os.getenv("PARTIAL_ANALYSIS_STABLE_SEC", "0.45"))
+PARTIAL_ANALYSIS_INTERVAL_SEC: float = float(os.getenv("PARTIAL_ANALYSIS_INTERVAL_SEC", "0.75"))
+PARTIAL_ANALYSIS_MIN_CHARS: int = int(os.getenv("PARTIAL_ANALYSIS_MIN_CHARS", "2"))
 
 # ---------------------------------------------------------------------------
 # Acoustic feature extraction

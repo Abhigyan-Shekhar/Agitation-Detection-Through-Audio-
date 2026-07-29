@@ -23,6 +23,17 @@ def test_wlk_command_uses_unbuffered_python_for_startup_logs():
     assert manager.wlk_command[1:3] == ["-u", "-m"]
 
 
+def test_wlk_command_uses_low_latency_transcription_flags():
+    manager = _manager()
+
+    command = manager.wlk_command
+
+    assert "--min-chunk-size" in command
+    assert "--vac-chunk-size" in command
+    assert "--buffer_trimming_sec" in command
+    assert "--confidence-validation" in command
+
+
 def test_wlk_import_warmup_timeout_does_not_abort_launch(monkeypatch):
     manager = _manager()
     run_calls = []

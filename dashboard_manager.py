@@ -92,12 +92,18 @@ class DashboardManager:
             config.WLK_MODEL,
             "--language",
             config.WLK_LANGUAGE,
+            "--min-chunk-size",
+            str(config.WLK_MIN_CHUNK_SEC),
+            "--vac-chunk-size",
+            str(config.WLK_VAC_CHUNK_SEC),
+            "--buffer_trimming_sec",
+            str(config.WLK_BUFFER_TRIMMING_SEC),
             "--pcm-input",
             "--host",
             config.WLK_HOST,
             "--port",
             str(config.WLK_PORT),
-        ]
+        ] + (["--confidence-validation"] if config.WLK_CONFIDENCE_VALIDATION else [])
 
     def start(self) -> None:
         """Start WLK, connect websocket, then start microphone capture."""
@@ -350,6 +356,11 @@ class DashboardManager:
             f"Port: {config.WLK_PORT}",
             f"Backend: {config.WLK_BACKEND}",
             f"Model: {config.WLK_MODEL}",
+            f"Language: {config.WLK_LANGUAGE}",
+            f"Output mode: {config.WLK_OUTPUT_MODE}",
+            f"Min chunk: {config.WLK_MIN_CHUNK_SEC}s",
+            f"VAC chunk: {config.WLK_VAC_CHUNK_SEC}s",
+            f"Buffer trimming: {config.WLK_BUFFER_TRIMMING_SEC}s",
             f"WLK log: {self._wlk_log_path or '(not started)'}",
         ])
 

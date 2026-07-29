@@ -68,6 +68,7 @@ class ScoreFusion:
         utterance: Utterance,
         acoustic: AcousticFeatureWindow | None,
         linguistic: LinguisticFeatures,
+        update_state: bool = True,
     ) -> FusedResult:
         """Compute and return a ``FusedResult`` for one utterance."""
 
@@ -91,7 +92,8 @@ class ScoreFusion:
             alpha = config.EMA_ALPHA_DOWN
         smoothed = alpha * raw_final + (1 - alpha) * self._prev_smoothed
         smoothed = _clamp(smoothed)
-        self._prev_smoothed = smoothed
+        if update_state:
+            self._prev_smoothed = smoothed
 
         # ---- Reliability --------------------------------------------
         reliability = self._reliability(acoustic, linguistic, acoustic_score, linguistic_score)

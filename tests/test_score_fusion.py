@@ -184,3 +184,18 @@ class TestScoreFusion:
         high = self.fusion._prev_smoothed
         self.fusion.reset()
         assert self.fusion._prev_smoothed == pytest.approx(0.0)
+
+    def test_preview_fusion_does_not_update_smoothing_state(self):
+        preview = self.fusion.fuse(
+            _make_utterance("preview"),
+            _make_acoustic(),
+            _make_linguistic(urgency_score=1.0),
+            update_state=False,
+        )
+        committed = self.fusion.fuse(
+            _make_utterance("committed"),
+            _make_acoustic(),
+            _make_linguistic(urgency_score=1.0),
+        )
+
+        assert preview.smoothed_score == committed.smoothed_score
