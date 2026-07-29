@@ -87,6 +87,7 @@ class AudioPipeline:
         # Monotonic frame counter for diagnostics
         self._frame_index: int = 0
         self._last_callback_stats: dict[str, float | int | str | bool] = {}
+        self._input_device: str | int | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -116,13 +117,14 @@ class AudioPipeline:
         self._flush_queues()
         self._is_running = True
 
+        self._input_device = self._resolve_input_device()
         self._log_input_device_config()
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=config.CHANNELS,
             blocksize=self.frame_size,
             dtype=config.DTYPE,
-            device=config.AUDIO_INPUT_DEVICE,
+            device=self._input_device,
             callback=self._audio_callback,
         )
         self._stream.start()
@@ -193,18 +195,45 @@ class AudioPipeline:
                     self._dropped_frames,
                 )
 
+    def _resolve_input_device(self) -> str | int | None:
+        """Return the concrete input device passed to sounddevice.InputStream."""
+        assert sd is not None
+        if config.AUDIO_INPUT_DEVICE is not None:
+            return self._coerce_input_device(config.AUDIO_INPUT_DEVICE)
+
+        default_device = sd.default.device
+        try:
+            return default_device[0]
+        except (TypeError, IndexError, KeyError):
+            return default_device
+
+    def _coerce_input_device(self, device: str | int) -> str | int:
+        """Convert numeric environment values to sounddevice input-device indexes."""
+        if isinstance(device, str):
+            value = device.strip()
+            if "," in value:
+                value = value.split(",", 1)[0].strip()
+            if value.isdigit():
+                return int(value)
+        return device
+
     def _log_input_device_config(self) -> None:
-        """Log sounddevice input-device configuration before opening the stream."""
+        """Log the exact input device that will be passed to InputStream."""
         assert sd is not None
         try:
             devices = sd.query_devices()
-            default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-            requested = config.AUDIO_INPUT_DEVICE if config.AUDIO_INPUT_DEVICE is not None else default_input
-            selected = sd.query_devices(requested, "input")
+            default_device = sd.default.device
+            try:
+                default_input = default_device[0]
+            except (TypeError, IndexError, KeyError):
+                default_input = default_device
+            selected = sd.query_devices(self._input_device, "input")
             logger.info(
-                "Audio input device selected — requested=%r default_input=%r name=%s hostapi=%s max_input_channels=%s default_samplerate=%s",
-                requested,
+                "Audio input device selected — requested_config=%r default_device=%r default_input=%r resolved_input=%r name=%s hostapi=%s max_input_channels=%s default_samplerate=%s",
+                config.AUDIO_INPUT_DEVICE,
+                default_device,
                 default_input,
+                self._input_device,
                 selected.get("name"),
                 selected.get("hostapi"),
                 selected.get("max_input_channels"),
@@ -219,8 +248,9 @@ class AudioPipeline:
         if self._stream is None:
             return
         logger.info(
-            "Audio InputStream started — device=%r samplerate=%s channels=%d dtype=%s blocksize=%d latency=%s",
+            "Audio InputStream started — requested_config=%r resolved_device=%r samplerate=%s channels=%d dtype=%s blocksize=%d latency=%s",
             config.AUDIO_INPUT_DEVICE,
+            self._input_device,
             getattr(self._stream, "samplerate", self.sample_rate),
             config.CHANNELS,
             config.DTYPE,
