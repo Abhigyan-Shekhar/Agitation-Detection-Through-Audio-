@@ -41,6 +41,7 @@ def _make_result(
     linguistic: LinguisticFeatures | None = None,
     acoustic: AcousticFeatureWindow | None = None,
     acoustic_contributions: dict | None = None,
+    utterance_text: str = "test",
 ) -> FusedResult:
     if linguistic is None:
         linguistic = LinguisticFeatures()
@@ -52,7 +53,7 @@ def _make_result(
         smoothed_score=smoothed_score,
         severity="Low" if smoothed_score < 0.35 else "Mild" if smoothed_score < 0.6 else "Moderate" if smoothed_score < 0.8 else "High",
         reliability=0.9,
-        utterance=_make_utterance(),
+        utterance=_make_utterance(utterance_text),
         linguistic_features=linguistic,
         acoustic_features=acoustic,
         acoustic_contributions=acoustic_contributions or {},
@@ -193,6 +194,23 @@ class TestBehaviourClassifier:
         result = _make_result(linguistic=linguistic, smoothed_score=0.45)
         labels = self._classify(result)
         assert "Repetitive sentences or questions" in labels
+
+    def test_repeated_leave_me_alone_detected_as_request_not_no_agitation(self):
+        linguistic = LinguisticFeatures(
+            repetition_score=0.85,
+            urgency_score=0.33,
+            imperative_score=1.0,
+            evidence={"repetition": {"rep": 0.85, "q_rep": 0.0, "req_rep": 0.85}},
+        )
+        result = _make_result(
+            linguistic=linguistic,
+            smoothed_score=0.20,
+            utterance_text="Hello? Leave me alone. Leave me alone. Leave me alone.",
+        )
+        classified = self.clf.classify(result)
+        assert "No audio agitation detected" not in classified.behaviours
+        assert "Constant unwarranted requests for attention/help" in classified.behaviours
+        assert classified.behaviour_events[0].canonical_label == "Constant unwarranted requests for attention/help"
 
     # ---- Distressed verbalization ------------------------------------
 

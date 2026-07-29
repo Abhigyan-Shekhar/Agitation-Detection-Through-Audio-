@@ -21,8 +21,10 @@ AUDIO_INPUT_DEVICE: str | int | None = os.getenv("AUDIO_INPUT_DEVICE") or None
 # ---------------------------------------------------------------------------
 TRANSCRIPTION_ENGINE: str = os.getenv("TRANSCRIPTION_ENGINE", "faster-whisper")
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+WHISPER_LANGUAGE: str | None = os.getenv("WHISPER_LANGUAGE", "en") or None
 TRANSCRIPTION_WINDOW_SECONDS: float = float(os.getenv("TRANSCRIPTION_WINDOW_SECONDS", "5"))
 TRANSCRIPTION_INTERVAL_SECONDS: float = float(os.getenv("TRANSCRIPTION_INTERVAL_SECONDS", "1"))
+TRANSCRIPTION_STOP_TIMEOUT_SECONDS: float = float(os.getenv("TRANSCRIPTION_STOP_TIMEOUT_SECONDS", "30"))
 USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() == "true"
 
 # ---------------------------------------------------------------------------

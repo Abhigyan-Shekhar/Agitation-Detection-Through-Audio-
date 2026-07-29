@@ -749,8 +749,7 @@ st.caption(
 # ---- Live fragment (polls every second) ----------------------------------
 @st.fragment(run_every=1.0)
 def _live() -> None:
-    if _pipeline_running():
-        _consume()
+    _consume()
     _render()
 
 

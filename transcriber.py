@@ -54,6 +54,7 @@ class DirectWhisperTranscriber:
         self,
         model_size: str = config.WHISPER_MODEL,
         sample_rate: int = config.SAMPLE_RATE,
+        language: str | None = config.WHISPER_LANGUAGE,
         use_gpu_if_available: bool = config.USE_GPU_IF_AVAILABLE,
         model: Any | None = None,
     ) -> None:
@@ -61,6 +62,7 @@ class DirectWhisperTranscriber:
             raise ValueError(f"Unsupported Whisper model {model_size!r}; expected one of {sorted(_ALLOWED_MODELS)}")
         self.model_size = model_size
         self.sample_rate = sample_rate
+        self.language = language
         self.use_gpu_if_available = use_gpu_if_available
         self.model = model if model is not None else self._load_model()
 
@@ -91,7 +93,7 @@ class DirectWhisperTranscriber:
             return "", [], None
         segments_iter, _info = self.model.transcribe(
             np.asarray(audio, dtype=np.float32),
-            language=None,
+            language=self.language,
             vad_filter=True,
             beam_size=1,
         )
@@ -153,7 +155,16 @@ class TranscriptionWorker:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=config.TRANSCRIPTION_STOP_TIMEOUT_SECONDS)
+        if self._thread and self._thread.is_alive():
+            logger.warning(
+                "Transcription worker did not stop within %.1fs; final buffered audio may be delayed",
+                config.TRANSCRIPTION_STOP_TIMEOUT_SECONDS,
+            )
+        else:
+            self._drain_audio_queue()
+            if self._sample_count:
+                self._transcribe_buffer()
         logger.info("Transcription worker stopped.")
 
     def _run(self) -> None:

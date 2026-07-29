@@ -146,11 +146,16 @@ def _check_repeated_requests(
         return None
     rep = linguistic.repetition_score
     urgency = linguistic.urgency_score
-    combined = 0.5 * rep + 0.5 * urgency
+    req_rep = float(linguistic.evidence.get("repetition", {}).get("req_rep", 0.0))
+    request_signal = max(urgency, req_rep)
+    combined = 0.5 * rep + 0.5 * request_signal
     if combined >= config.BEHAVIOUR_REQUEST_REP_THRESHOLD:
         return BehaviourLabel(
             label=_canonical_label("Repeated requests"),
-            evidence=f"Combined request+urgency score={combined:.2f}",
+            evidence=(
+                f"Combined repeated request score={combined:.2f}; "
+                f"repetition={rep:.2f}, urgency={urgency:.2f}, request repetition={req_rep:.2f}"
+            ),
             confidence=round(min(1.0, combined), 3),
         )
     return None
@@ -184,9 +189,9 @@ class BehaviourClassifier:
     _RULES = [
         _check_screaming,
         _check_verbal_aggression,
+        _check_repeated_requests,
         _check_repetitive_verbalization,
         _check_repeated_questioning,
-        _check_repeated_requests,
         _check_distressed_verbalization,
     ]
 

@@ -116,13 +116,15 @@ THREAT_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Hinglish negative lexicon (supplement for VADER)
+# Negative lexicon (supplement for VADER)
 # ---------------------------------------------------------------------------
 
 NEGATIVE_HINGLISH: frozenset[str] = frozenset({
     "nahi", "mat", "chhodo", "jao", "gussa", "dard", "pareshan",
     "bekaar", "band karo", "rona", "takleef", "mushkil", "bura",
     "galat", "bekar", "dukh", "taklif", "khafa", "chinta",
+    "terrible", "hate", "angry", "upset", "bad", "awful", "scared",
+    "afraid", "hurt", "pain", "leave", "alone",
 })
 
 PROFANITY_PATTERNS: list[re.Pattern[str]] = [
@@ -164,7 +166,8 @@ def _is_question(text: str) -> bool:
 
 def _is_request(text: str) -> bool:
     lower = _normalize(text)
-    return any(term in lower for term in REQUEST_TERMS)
+    request_like_terms = REQUEST_TERMS | HELP_TERMS | STOP_TERMS | ESCAPE_TERMS
+    return any(term in lower for term in request_like_terms)
 
 
 def _keyword_score(text: str, terms: frozenset[str]) -> float:
@@ -183,6 +186,15 @@ def _fuzzy_similarity(a: str, b: str) -> float:
             return 0.0
         return len(wa & wb) / len(wa | wb)
     return fuzz.token_sort_ratio(a, b) / 100.0
+
+
+def _sentence_fragments(text: str) -> list[str]:
+    """Return normalized utterance fragments split on sentence punctuation."""
+    return [
+        normalized
+        for fragment in re.split(r"[.!?;]+", text)
+        if (normalized := _normalize(fragment))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -294,9 +306,7 @@ class LinguisticAnalyzer:
 
     def _repetition_scores(self, text: str) -> tuple[float, float, float]:
         """Return (repetition_score, question_repetition_score, request_repetition_score)."""
-        if not self._history:
-            return 0.0, 0.0, 0.0
-
+        intra_rep, intra_q_rep, intra_req_rep = self._intra_utterance_repetition_scores(text)
         current_words = _content_words(text)
         current_3grams = _ngrams(current_words, 3)
         is_q = _is_question(text)
@@ -335,15 +345,64 @@ class LinguisticAnalyzer:
         def _agg(sims: list[float]) -> float:
             return float(np.max(sims)) if sims else 0.0
 
-        rep = (
+        history_rep = (
             0.25 * _agg(word_sims)
             + 0.35 * _agg(phrase_sims)
             + 0.40 * _agg(fuzzy_sims)
         )
-        q_rep = _agg(q_sims)
-        req_rep = _agg(req_sims)
+        rep = max(intra_rep, history_rep)
+        q_rep = max(intra_q_rep, _agg(q_sims))
+        req_rep = max(intra_req_rep, _agg(req_sims))
 
         return rep, q_rep, req_rep
+
+    def _intra_utterance_repetition_scores(self, text: str) -> tuple[float, float, float]:
+        fragments = _sentence_fragments(text)
+        phrase_scores: list[float] = []
+        q_scores: list[float] = []
+        req_scores: list[float] = []
+
+        for i, fragment in enumerate(fragments):
+            count = 1
+            for other in fragments[i + 1 :]:
+                if _fuzzy_similarity(fragment, other) >= 0.92:
+                    count += 1
+            if count < 2:
+                continue
+            score = min(1.0, 0.55 + 0.15 * count)
+            phrase_scores.append(score)
+            if _is_question(fragment):
+                q_scores.append(score)
+            if _is_request(fragment):
+                req_scores.append(score)
+
+        token_score = self._repeated_token_sequence_score(text)
+        return (
+            max(phrase_scores + [token_score], default=0.0),
+            max(q_scores, default=0.0),
+            max(req_scores, default=0.0),
+        )
+
+    @staticmethod
+    def _repeated_token_sequence_score(text: str) -> float:
+        words = _normalize(text).split()
+        if len(words) < 4:
+            return 0.0
+
+        best = 0.0
+        max_n = min(6, len(words) // 2)
+        for n in range(2, max_n + 1):
+            counts: dict[tuple[str, ...], int] = {}
+            for i in range(len(words) - n + 1):
+                gram = tuple(words[i : i + n])
+                if not any(word not in STOP_WORDS for word in gram):
+                    continue
+                counts[gram] = counts.get(gram, 0) + 1
+            if counts:
+                count = max(counts.values())
+                if count >= 2:
+                    best = max(best, min(1.0, 0.55 + 0.10 * count + 0.03 * n))
+        return best
 
     def _sentiment_score(self, text: str) -> float:
         score = 0.0

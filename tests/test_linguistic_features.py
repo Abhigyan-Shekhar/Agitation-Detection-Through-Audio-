@@ -72,6 +72,19 @@ class TestLinguisticAnalyzer:
         feats = self.analyzer.analyze(_make_utterance("Why can't I go home?"))
         assert feats.repetition_score > 0.40
 
+    def test_repetition_within_single_utterance_scores_high(self):
+        feats = self.analyzer.analyze(
+            _make_utterance("Leave me alone. Leave me alone. Leave me alone.")
+        )
+        assert feats.repetition_score >= 0.65
+        assert feats.evidence["repetition"]["req_rep"] >= 0.65
+
+    def test_repetition_within_single_utterance_without_punctuation_scores_high(self):
+        feats = self.analyzer.analyze(
+            _make_utterance("leave me alone leave me alone leave me alone")
+        )
+        assert feats.repetition_score >= 0.65
+
     def test_question_repetition(self):
         self.analyzer.analyze(_make_utterance("Why can't I go home?"))
         self.analyzer.analyze(_make_utterance("Where is my home?"))

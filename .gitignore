@@ -2,3 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .venv/
+.cache/
+.playwright-mcp/
+.streamlit/

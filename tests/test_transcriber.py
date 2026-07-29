@@ -12,9 +12,11 @@ from transcriber import DirectWhisperTranscriber, TranscriptionWorker
 class FakeModel:
     def __init__(self):
         self.calls = 0
+        self.kwargs = None
 
     def transcribe(self, audio, **kwargs):
         self.calls += 1
+        self.kwargs = kwargs
         return [SimpleNamespace(text="hello world", start=0.0, end=0.5, avg_logprob=-0.1)], SimpleNamespace(language="en")
 
 
@@ -35,9 +37,19 @@ def test_direct_transcriber_reuses_injected_model_and_returns_confidence():
     text, segments, confidence = transcriber.transcribe(np.ones(1600, dtype=np.float32))
 
     assert model.calls == 1
+    assert model.kwargs["language"] == "en"
     assert text == "hello world"
     assert segments[0].start == 0.0
     assert confidence is not None
+
+
+def test_direct_transcriber_allows_auto_language_override():
+    model = FakeModel()
+    transcriber = DirectWhisperTranscriber(model_size="small", model=model, language=None)
+
+    transcriber.transcribe(np.ones(1600, dtype=np.float32))
+
+    assert model.kwargs["language"] is None
 
 
 def test_worker_rolls_buffer_and_emits_transcript_without_blocking():
@@ -91,3 +103,26 @@ def test_worker_logs_and_continues_when_transcription_fails(caplog):
     worker._transcribe_buffer()
 
     assert "Transcription failed" in caplog.text
+
+
+def test_worker_stop_flushes_final_buffer():
+    audio_q = queue.Queue()
+    partial_q = queue.Queue(maxsize=2)
+    committed_q = queue.Queue(maxsize=2)
+    model = FakeModel()
+    transcriber = DirectWhisperTranscriber(model_size="small", model=model)
+    worker = TranscriptionWorker(
+        audio_queue=audio_q,
+        partial_queue=partial_q,
+        committed_queue=committed_q,
+        transcriber=transcriber,
+        window_seconds=1,
+        interval_seconds=100,
+        sample_rate=1000,
+    )
+    audio_q.put(frame(80))
+
+    worker.stop()
+
+    assert model.calls == 1
+    assert committed_q.get_nowait().text == "hello world"
