@@ -41,6 +41,9 @@ class TimestampedFrame(NamedTuple):
 
     data: np.ndarray   # float32, shape (frame_size,)
     timestamp: float   # Unix timestamp of the frame's leading edge
+    capture_monotonic: float = 0.0
+    queued_monotonic: float = 0.0
+    frame_index: int = 0
 
 
 class AudioPipeline:
@@ -137,8 +140,10 @@ class AudioPipeline:
             self._stream = None
 
         logger.info(
-            "AudioPipeline stopped — total dropped frames: %d",
+            "AudioPipeline stopped — total dropped frames: %d acoustic_q=%d wlk_q=%d",
             self._dropped_frames,
+            self.acoustic_queue.qsize(),
+            self.wlk_queue.qsize(),
         )
 
     # ------------------------------------------------------------------
@@ -158,8 +163,15 @@ class AudioPipeline:
 
         audio = indata[:, 0].copy()  # mono, float32
         ts = time.time()
-        frame = TimestampedFrame(data=audio, timestamp=ts)
+        capture_monotonic = time.monotonic()
         self._frame_index += 1
+        frame = TimestampedFrame(
+            data=audio,
+            timestamp=ts,
+            capture_monotonic=capture_monotonic,
+            queued_monotonic=time.monotonic(),
+            frame_index=self._frame_index,
+        )
 
         # Fan out to both queues — drop if full rather than block the callback
         for q in (self.acoustic_queue, self.wlk_queue):

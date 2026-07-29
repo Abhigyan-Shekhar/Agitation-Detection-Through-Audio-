@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 
 import numpy as np
 
@@ -99,9 +100,14 @@ class ScoreFusion:
         # ---- Severity -----------------------------------------------
         severity = self._severity(smoothed)
 
+        trace = utterance.latency_trace
+        if trace is not None:
+            trace.inference_ts = time.monotonic()
+
         logger.info(
-            "Fused — acoustic=%.3f linguistic=%.3f raw=%.3f smoothed=%.3f severity=%s reliability=%.2f",
+            "Fused — acoustic=%.3f linguistic=%.3f raw=%.3f smoothed=%.3f severity=%s reliability=%.2f latency=%s",
             acoustic_score, linguistic_score, raw_final, smoothed, severity, reliability,
+            trace.durations_ms() if trace else {},
         )
 
         return FusedResult(
@@ -117,6 +123,7 @@ class ScoreFusion:
             utterance=utterance,
             acoustic_features=acoustic,
             linguistic_features=linguistic,
+            latency_trace=trace,
         )
 
     def reset(self) -> None:

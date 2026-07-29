@@ -187,10 +187,12 @@ class UtteranceAggregator:
         if not self._lines:
             return
 
+        trace = self._lines[-1].latency_trace
         utterance = Utterance(
             lines=list(self._lines),
             start_time=self._utterance_start or self._lines[0].timestamp,
             end_time=self._lines[-1].timestamp,
+            latency_trace=trace,
         )
         self._lines.clear()
         self._utterance_start = None
@@ -201,9 +203,10 @@ class UtteranceAggregator:
             self._utterance_queue.put_nowait(utterance)
             self._emitted_count += 1
             logger.info(
-                "Utterance emitted — text=%r duration=%.2fs",
+                "Utterance emitted — text=%r duration=%.2fs latency=%s",
                 utterance.full_text[:60],
                 utterance.duration(),
+                trace.durations_ms() if trace else {},
             )
         except queue.Full:
             logger.warning("utterance_queue full — utterance dropped")
