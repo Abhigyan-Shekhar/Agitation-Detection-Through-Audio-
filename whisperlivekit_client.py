@@ -31,7 +31,8 @@ from event_models import CommittedLine, LatencyTrace
 
 logger = logging.getLogger(__name__)
 
-_SEND_CHUNK_BYTES: int = int(config.SAMPLE_RATE * 0.040 * 2)
+_SEND_CHUNK_DURATION_SEC: float = 0.5
+_SEND_CHUNK_BYTES: int = int(config.SAMPLE_RATE * _SEND_CHUNK_DURATION_SEC * 2)
 _RECONNECT_DELAY_SEC: float = 2.0
 _MAX_RECONNECT_ATTEMPTS: int = 5
 _DEBUG_CAPTURE_SECONDS: float = 5.0
@@ -209,8 +210,22 @@ class WhisperLiveKitClient:
                 self._connected_event.clear()
                 self._ws = None
 
+    async def _wait_for_server_config_before_audio(self) -> None:
+        """Match WLK reference client: read the server config before sending audio."""
+        while not self._stop_event.is_set() and not self._config_received_event.is_set():
+            await asyncio.sleep(0.010)
+        if not self._received_config:
+            return
+        logger.info(
+            "WLK audio sender starting — chunk_duration=%.3fs chunk_bytes=%d format=pcm_s16le sample_rate=%d channels=1",
+            _SEND_CHUNK_DURATION_SEC,
+            _SEND_CHUNK_BYTES,
+            config.SAMPLE_RATE,
+        )
+
     async def _send_loop(self, ws: Any) -> None:
         """Drain queued audio and stream PCM16 chunks to WLK."""
+        await self._wait_for_server_config_before_audio()
         pcm_buffer = bytearray()
         while not self._stop_event.is_set():
             try:
