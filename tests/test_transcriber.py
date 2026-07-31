@@ -30,6 +30,16 @@ def frame(samples, idx=1):
     )
 
 
+def frame_at(samples, timestamp, idx=1):
+    return TimestampedFrame(
+        data=np.ones(samples, dtype=np.float32) * 0.1,
+        timestamp=timestamp,
+        capture_monotonic=time.monotonic(),
+        queued_monotonic=time.monotonic(),
+        frame_index=idx,
+    )
+
+
 def test_direct_transcriber_reuses_injected_model_and_returns_confidence():
     model = FakeModel()
     transcriber = DirectWhisperTranscriber(model="small", model_size="small") if False else DirectWhisperTranscriber(model_size="small", model=model)
@@ -81,6 +91,31 @@ def test_worker_rolls_buffer_and_emits_transcript_without_blocking():
     assert committed.text == "hello world"
     assert worker.latest_result is not None
     assert worker.latest_result.buffer_duration <= 0.1
+
+
+def test_worker_committed_timestamp_uses_audio_time_not_inference_time():
+    audio_q = queue.Queue()
+    partial_q = queue.Queue(maxsize=2)
+    committed_q = queue.Queue(maxsize=2)
+    transcriber = DirectWhisperTranscriber(model_size="small", model=FakeModel())
+    worker = TranscriptionWorker(
+        audio_queue=audio_q,
+        partial_queue=partial_q,
+        committed_queue=committed_q,
+        transcriber=transcriber,
+        window_seconds=1,
+        interval_seconds=1,
+        sample_rate=1000,
+    )
+    audio_q.put(frame_at(100, 1000.0, 1))
+    audio_q.put(frame_at(100, 1000.1, 2))
+
+    worker._drain_audio_queue()
+    worker._transcribe_buffer()
+
+    committed = committed_q.get_nowait()
+    assert committed.timestamp == 1000.2
+    assert committed.timestamp < time.time() - 100
 
 
 def test_worker_logs_and_continues_when_transcription_fails(caplog):

@@ -154,6 +154,47 @@ class TestBehaviourClassifier:
         assert "Screaming" in labels
         assert "No audio agitation detected" not in labels
 
+    def test_absolute_loud_clipped_audio_triggers_screaming_without_baseline_score(self):
+        acoustic = AcousticFeatureWindow(
+            start_time=time.time() - 2,
+            end_time=time.time(),
+            rms_mean=0.42,
+            rms_max=1.05,
+            voiced_ratio=0.0,
+            clipping_ratio=0.08,
+        )
+        result = _make_result(
+            acoustic_score=0.10,
+            smoothed_score=0.20,
+            acoustic=acoustic,
+            linguistic=LinguisticFeatures(),
+            acoustic_contributions={},
+            utterance_text="Ah",
+        )
+        labels = self._classify(result)
+        assert "Screaming" in labels
+        assert "No audio agitation detected" not in labels
+
+    def test_normal_volume_audio_does_not_trigger_screaming_absolute_fallback(self):
+        acoustic = AcousticFeatureWindow(
+            start_time=time.time() - 2,
+            end_time=time.time(),
+            rms_mean=0.04,
+            rms_max=0.16,
+            voiced_ratio=0.8,
+            clipping_ratio=0.0,
+        )
+        result = _make_result(
+            acoustic_score=0.10,
+            smoothed_score=0.20,
+            acoustic=acoustic,
+            linguistic=LinguisticFeatures(),
+            acoustic_contributions={},
+            utterance_text="Ah",
+        )
+        labels = self._classify(result)
+        assert "Screaming" not in labels
+
     def test_verbal_sexual_advance_triggers_canonical_label(self):
         linguistic = LinguisticFeatures(sexual_advance_score=0.85)
         result = _make_result(

@@ -34,7 +34,7 @@ from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
 from behaviour_classifier import BehaviourClassifier
 from audio_behaviour_taxonomy import get_supported_behaviours
-from event_models import BehaviourEvent, FusedResult, Utterance
+from event_models import AcousticFeatureWindow, BehaviourEvent, FusedResult, LinguisticFeatures, Utterance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +74,7 @@ def _init() -> None:
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
         "latest_result": None,      # FusedResult | None
+        "last_acoustic_scream_ts": 0.0,
         "error": None,
         # Calibration
         "calibrating": False,
@@ -235,6 +236,81 @@ def _consume() -> None:
 
     except queue.Empty:
         pass
+
+    _consume_acoustic_only_screaming(acoustic_worker, classifier)
+
+
+def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
+    if acoustic is None:
+        return 0.0
+    energy_score = min(1.0, acoustic.rms_mean / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6))
+    peak_score = min(1.0, acoustic.rms_max / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6))
+    clipping_score = min(1.0, acoustic.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
+    if clipping_score > 0 and energy_score >= 0.65:
+        return max(energy_score, peak_score, clipping_score)
+    if energy_score >= 1.0 and peak_score >= 1.0:
+        return max(energy_score, peak_score)
+    return 0.0
+
+
+def _consume_acoustic_only_screaming(
+    acoustic_worker: Any,
+    classifier: BehaviourClassifier,
+) -> None:
+    if acoustic_worker is None:
+        return
+    acoustic = acoustic_worker.latest_window()
+    scream_score = _acoustic_scream_score(acoustic)
+    if scream_score < 0.65:
+        return
+
+    now = time.time()
+    last_ts = float(st.session_state.get("last_acoustic_scream_ts", 0.0) or 0.0)
+    if now - last_ts < 2.0:
+        return
+
+    severity = "High" if scream_score >= 0.85 else "Moderate"
+    result = FusedResult(
+        acoustic_score=round(scream_score, 4),
+        linguistic_score=0.0,
+        raw_final_score=round(scream_score, 4),
+        smoothed_score=round(scream_score, 4),
+        severity=severity,
+        reliability=max(0.0, 1.0 - (0.25 if acoustic and acoustic.clipping_ratio > 0.10 else 0.0)),
+        utterance=None,
+        acoustic_features=acoustic,
+        linguistic_features=LinguisticFeatures(),
+        acoustic_contributions={
+            "absolute_rms": round(acoustic.rms_mean if acoustic else 0.0, 4),
+            "absolute_peak": round(acoustic.rms_max if acoustic else 0.0, 4),
+            "clipping": round(acoustic.clipping_ratio if acoustic else 0.0, 4),
+        },
+        linguistic_contributions={},
+    )
+    result = classifier.classify(result)
+    if "Screaming" not in result.behaviours:
+        return
+
+    logger.info(
+        "BEHAVIOUR_TRACE acoustic_only_screaming rms_mean=%.3f rms_max=%.3f clipping=%.3f labels=%s severity=%s",
+        acoustic.rms_mean if acoustic else 0.0,
+        acoustic.rms_max if acoustic else 0.0,
+        acoustic.clipping_ratio if acoustic else 0.0,
+        result.behaviours,
+        result.severity,
+    )
+    st.session_state.last_acoustic_scream_ts = now
+    st.session_state.latest_result = result
+    for event in result.behaviour_events:
+        st.session_state.behaviour_log.append(_event_to_record(event, result))
+    st.session_state.timeline.append({
+        "time": time.strftime("%H:%M:%S"),
+        "timestamp": datetime.now(),
+        "acoustic_score": result.acoustic_score,
+        "linguistic_score": result.linguistic_score,
+        "smoothed_score": result.smoothed_score,
+        "severity": result.severity,
+    })
 
 
 def _taxonomy_labels() -> list[str]:

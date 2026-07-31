@@ -197,6 +197,9 @@ class TranscriptionWorker:
             return
         audio = np.concatenate([frame.data for frame in self._frames]).astype(np.float32, copy=False)
         buffer_duration = float(audio.size / self._sample_rate)
+        audio_start_ts = self._frames[0].timestamp
+        frame_duration = float(self._frames[-1].data.size / self._sample_rate)
+        audio_end_ts = self._frames[-1].timestamp + frame_duration
         logger.info("Transcribing... Buffer duration: %.3f seconds", buffer_duration)
         start = time.monotonic()
         try:
@@ -205,7 +208,11 @@ class TranscriptionWorker:
             logger.exception("Transcription failed")
             return
         inference_ms = (time.monotonic() - start) * 1000.0
-        result = TranscriptionResult(text, time.time(), segments, confidence, inference_ms, buffer_duration)
+        transcript_ts = audio_end_ts
+        segment_ends = [segment.end for segment in segments if segment.end is not None]
+        if segment_ends:
+            transcript_ts = min(audio_start_ts + max(segment_ends), audio_end_ts)
+        result = TranscriptionResult(text, transcript_ts, segments, confidence, inference_ms, buffer_duration)
         self.latest_result = result
         logger.info('Transcript:\n"%s"', text)
         logger.info("Inference time: %.2f ms", inference_ms)

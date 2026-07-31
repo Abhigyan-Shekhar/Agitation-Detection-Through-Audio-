@@ -56,17 +56,32 @@ def _check_screaming(
 
     energy_high = energy_contrib >= (config.ACOUSTIC_WEIGHTS["energy_z"] * config.BEHAVIOUR_ENERGY_Z_SHOUT / config.Z_CLIP)
     burst_high = burst_contrib >= (config.ACOUSTIC_WEIGHTS["energy_burst_z"] * config.BEHAVIOUR_ENERGY_BURST_SHOUT)
-    voiced_present = acoustic.voiced_ratio >= 0.30
+    absolute_energy_high = (
+        acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT
+        and acoustic.rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT
+    )
+    clipping_high = (
+        acoustic.clipping_ratio >= config.BEHAVIOUR_CLIPPING_SHOUT
+        and acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * 0.65
+    )
+    voiced_present = acoustic.voiced_ratio >= 0.30 or absolute_energy_high or clipping_high
     high_acoustic_agitation = result.acoustic_score >= config.BEHAVIOUR_VERBAL_AGGR_ACOUSTIC
 
-    if voiced_present and ((energy_high and burst_high) or high_acoustic_agitation):
-        conf = min(1.0, max((energy_contrib + burst_contrib) * 4.0, result.acoustic_score))
+    if voiced_present and ((energy_high and burst_high) or high_acoustic_agitation or absolute_energy_high or clipping_high):
+        absolute_conf = max(
+            min(1.0, acoustic.rms_mean / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6) * 0.75),
+            min(1.0, acoustic.rms_max / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6) * 0.65),
+            min(1.0, acoustic.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6) * 0.70),
+        )
+        conf = min(1.0, max((energy_contrib + burst_contrib) * 4.0, result.acoustic_score, absolute_conf))
         return BehaviourLabel(
             label=_canonical_label("Screaming/shouting"),
             evidence=(
                 f"Energy far above baseline (contribution={energy_contrib:.3f}), "
                 f"high energy burst (contribution={burst_contrib:.3f}), "
-                f"voiced ratio={acoustic.voiced_ratio:.2f}"
+                f"voiced ratio={acoustic.voiced_ratio:.2f}, "
+                f"rms_mean={acoustic.rms_mean:.3f}, rms_max={acoustic.rms_max:.3f}, "
+                f"clipping={acoustic.clipping_ratio:.3f}"
             ),
             confidence=round(conf, 3),
         )
