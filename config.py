@@ -66,12 +66,13 @@ ACOUSTIC_WEIGHTS: dict[str, float] = {
 
 # Linguistic branch weights (must sum to 1.0)
 LINGUISTIC_WEIGHTS: dict[str, float] = {
-    "repetition_score":          0.30,
-    "question_repetition_score": 0.20,
+    "repetition_score":          0.28,
+    "question_repetition_score": 0.18,
     "negative_sentiment":        0.15,
     "urgency_score":             0.15,
     "threat_score":              0.15,
     "profanity_score":           0.05,
+    "sexual_advance_score":      0.04,
 }
 
 # Final fusion

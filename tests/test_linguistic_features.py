@@ -167,6 +167,22 @@ class TestLinguisticAnalyzer:
         feats = self.analyzer.analyze(_make_utterance("STOP!! LISTEN!!"))
         assert feats.yelling_score >= 0.50
 
+    # ---- Verbal sexual advances -------------------------------------
+
+    def test_verbal_sexual_advance_proposition_detected(self):
+        feats = self.analyzer.analyze(_make_utterance("Come to bed with me."))
+        assert feats.sexual_advance_score >= 0.60
+
+    def test_verbal_sexualized_comment_detected(self):
+        feats = self.analyzer.analyze(_make_utterance("You look so sexy."))
+        assert feats.sexual_advance_score >= 0.60
+
+    def test_clinical_verbal_sexual_advance_phrase_not_patient_utterance(self):
+        feats = self.analyzer.analyze(
+            _make_utterance("The DAVE dataset includes verbal sexual advances.")
+        )
+        assert feats.sexual_advance_score == 0.0
+
     # ---- Empty / edge cases ------------------------------------------
 
     def test_empty_utterance_returns_zero_scores(self):
@@ -183,6 +199,7 @@ class TestLinguisticAnalyzer:
             "repetition_score", "question_repetition_score",
             "negative_sentiment", "urgency_score", "threat_score",
             "profanity_score", "imperative_score", "yelling_score",
+            "sexual_advance_score",
         ]:
             val = getattr(feats, attr)
             assert 0.0 <= val <= 1.0, f"{attr}={val} out of bounds"

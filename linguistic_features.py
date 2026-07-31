@@ -11,6 +11,7 @@ E. threat_score           — regex pattern matching
 F. profanity_score        — weighted common profanity matches
 G. imperative_score       — command patterns (modifier for verbal-aggr rule)
 H. yelling_score          — transcript yelling/shouting cues
+I. sexual_advance_score   — sexualized verbal propositions/comments
 
 Design notes
 ------------
@@ -161,6 +162,22 @@ LOUD_INTERJECTIONS: frozenset[str] = frozenset({
 ALL_CAPS_WORD_RE = re.compile(r"\b[A-Z]{3,}\b")
 EXCLAMATION_RE = re.compile(r"!{1,}")
 
+SEXUAL_ADVANCE_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile(r"\b(?:have sex|sleep with me|go to bed with me|come to bed|make love)\b", re.I), 0.95),
+    (re.compile(r"\b(?:kiss me|let me kiss you|give me a kiss)\b", re.I), 0.65),
+    (re.compile(r"\b(?:touch me|let me touch you|can i touch you)\b", re.I), 0.70),
+    (re.compile(r"\b(?:take off|remove|open) (?:your )?(?:clothes|shirt|pants|dress|bra)\b", re.I), 0.85),
+    (re.compile(r"\bshow me your (?:body|breasts|boobs|chest|ass|butt|private parts)\b", re.I), 0.90),
+    (re.compile(r"\b(?:you are|you're|you look) (?:so )?(?:sexy|hot)\b", re.I), 0.60),
+    (re.compile(r"\b(?:nice|beautiful|sexy|hot) (?:body|legs|breasts|boobs|ass|butt)\b", re.I), 0.80),
+    (re.compile(r"\b(?:come here|come closer).{0,20}\b(?:kiss|touch|bed|sexy|hot)\b", re.I), 0.65),
+)
+
+SEXUAL_ADVANCE_CLINICAL_CONTEXT_RE = re.compile(
+    r"\b(?:verbal sexual advances?|sexual advances?|sexual comments?|sexually inappropriate remarks?)\b",
+    re.I,
+)
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -303,6 +320,10 @@ class LinguisticAnalyzer:
         yelling = self._yelling_score(text)
         evidence["yelling"] = yelling
 
+        # H. Verbal sexual advances
+        sexual_advance = self._sexual_advance_score(text)
+        evidence["sexual_advance"] = sexual_advance
+
         # Update history
         self._history.append(_TranscriptRecord(text, utterance.end_time))
 
@@ -315,10 +336,11 @@ class LinguisticAnalyzer:
             profanity_score=float(np.clip(profanity, 0.0, 1.0)),
             imperative_score=float(np.clip(imperative, 0.0, 1.0)),
             yelling_score=float(np.clip(yelling, 0.0, 1.0)),
+            sexual_advance_score=float(np.clip(sexual_advance, 0.0, 1.0)),
             evidence=evidence,
         )
         logger.info(
-            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f",
+            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f sexual_advance=%.3f",
             features.repetition_score,
             features.question_repetition_score,
             features.negative_sentiment,
@@ -327,6 +349,7 @@ class LinguisticAnalyzer:
             features.profanity_score,
             features.imperative_score,
             features.yelling_score,
+            features.sexual_advance_score,
         )
         return features
 
@@ -492,6 +515,11 @@ class LinguisticAnalyzer:
             score += min(0.45, 0.15 + 0.05 * exclamation_count)
 
         return min(1.0, score)
+
+    def _sexual_advance_score(self, text: str) -> float:
+        if SEXUAL_ADVANCE_CLINICAL_CONTEXT_RE.search(text):
+            return 0.0
+        return min(1.0, sum(weight for pattern, weight in SEXUAL_ADVANCE_PATTERNS if pattern.search(text)))
 
     def _imperative_score(self, text: str) -> float:
         """Simple heuristic: imperatives tend to start with a base verb."""

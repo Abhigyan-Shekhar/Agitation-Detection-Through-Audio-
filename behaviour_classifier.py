@@ -131,6 +131,21 @@ def _check_verbal_aggression(
     return None
 
 
+def _check_verbal_sexual_advances(
+    result: FusedResult,
+    linguistic: LinguisticFeatures | None,
+) -> BehaviourLabel | None:
+    if linguistic is None:
+        return None
+    if linguistic.sexual_advance_score >= 0.60:
+        return BehaviourLabel(
+            label=_canonical_label("Making verbal sexual advances"),
+            evidence=f"Sexual advance score={linguistic.sexual_advance_score:.2f}",
+            confidence=round(min(1.0, linguistic.sexual_advance_score), 3),
+        )
+    return None
+
+
 def _check_repetitive_verbalization(
     result: FusedResult,
     linguistic: LinguisticFeatures | None,
@@ -218,6 +233,7 @@ class BehaviourClassifier:
         _check_screaming,
         _check_yelling_language,
         _check_verbal_aggression,
+        _check_verbal_sexual_advances,
         _check_repeated_requests,
         _check_repetitive_verbalization,
         _check_repeated_questioning,
@@ -240,7 +256,7 @@ class BehaviourClassifier:
         )
         if linguistic is not None:
             logger.info(
-                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f",
+                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f sexual_advance=%.3f",
                 linguistic.repetition_score,
                 linguistic.question_repetition_score,
                 linguistic.negative_sentiment,
@@ -249,6 +265,7 @@ class BehaviourClassifier:
                 linguistic.profanity_score,
                 linguistic.imperative_score,
                 linguistic.yelling_score,
+                linguistic.sexual_advance_score,
             )
         detected: list[BehaviourLabel] = []
 

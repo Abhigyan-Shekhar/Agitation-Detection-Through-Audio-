@@ -161,6 +161,7 @@ class LinguisticFeatures:
     profanity_score: float = 0.0
     imperative_score: float = 0.0
     yelling_score: float = 0.0
+    sexual_advance_score: float = 0.0
 
     # Raw evidence strings (for explainability panel)
     evidence: dict[str, Any] = field(default_factory=dict)

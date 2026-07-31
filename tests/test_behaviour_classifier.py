@@ -154,6 +154,18 @@ class TestBehaviourClassifier:
         assert "Screaming" in labels
         assert "No audio agitation detected" not in labels
 
+    def test_verbal_sexual_advance_triggers_canonical_label(self):
+        linguistic = LinguisticFeatures(sexual_advance_score=0.85)
+        result = _make_result(
+            acoustic_score=0.10,
+            smoothed_score=0.20,
+            linguistic=linguistic,
+            utterance_text="Come to bed with me.",
+        )
+        labels = self._classify(result)
+        assert "Making verbal sexual advances" in labels
+        assert "No audio agitation detected" not in labels
+
     # ---- Calm threat → threat detected, not necessarily verbal aggression
 
     def test_calm_explicit_threat(self):
