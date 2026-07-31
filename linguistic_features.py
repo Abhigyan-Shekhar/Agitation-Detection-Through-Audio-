@@ -74,7 +74,7 @@ STOP_WORDS: frozenset[str] = frozenset({
 
 HELP_TERMS: frozenset[str] = frozenset({
     "help", "bachao", "doctor", "nurse", "ambulance", "emergency",
-    "please help", "somebody help",
+    "please help", "somebody help", "save me", "help me",
 })
 
 IMMEDIACY_TERMS: frozenset[str] = frozenset({
@@ -94,7 +94,8 @@ ESCAPE_TERMS: frozenset[str] = frozenset({
 })
 
 REQUEST_TERMS: frozenset[str] = frozenset({
-    "please", "can you", "could you", "will you", "would you",
+    "please help", "help me", "save me", "somebody help",
+    "could you help", "will you help", "would you help",
     "i need", "i want", "give me", "bring me", "take me", "mujhe chahiye",
     "mujhe do",
 })
@@ -379,8 +380,8 @@ class LinguisticAnalyzer:
         token_score = self._repeated_token_sequence_score(text)
         return (
             max(phrase_scores + [token_score], default=0.0),
-            max(q_scores, default=0.0),
-            max(req_scores, default=0.0),
+            max(q_scores + ([token_score] if token_score and _is_question(text) else []), default=0.0),
+            max(req_scores + ([token_score] if token_score and _is_request(text) else []), default=0.0),
         )
 
     @staticmethod

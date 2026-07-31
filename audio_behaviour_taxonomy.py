@@ -191,6 +191,21 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "attention requests",
         ),
     ),
+    BehaviourTaxonomyEntry(
+        internal_code="AUDIO_URGENT_DISTRESS",
+        canonical_label="Distressed/urgent verbalization",
+        cmai_category="Verbally non-aggressive: urgent distress/help seeking",
+        modality="audio",
+        description="Urgent verbal distress, help-seeking, or immediate refusal cues detected from speech.",
+        aliases=(
+            "distressed urgent verbalization",
+            "distressed verbalization",
+            "urgent verbalization",
+            "urgent distress",
+            "help seeking",
+            "help-seeking",
+        ),
+    ),
 )
 
 
@@ -271,6 +286,11 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
         has_request = _contains_any(normalized, ("request", "requests", "help", "attention"))
         has_repeat_or_constant = _contains_any(normalized, ("constant", "repeated", "repeatedly", "repetition"))
         return has_request and has_repeat_or_constant
+
+    if entry.internal_code == "AUDIO_URGENT_DISTRESS":
+        has_distress = _contains_any(normalized, ("distress", "distressed", "urgent", "help seeking"))
+        has_verbal = _contains_any(normalized, ("verbalization", "verbalisation", "speech", "help", "plea"))
+        return has_distress and has_verbal
 
     return False
 

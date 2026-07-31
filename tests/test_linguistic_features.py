@@ -85,6 +85,20 @@ class TestLinguisticAnalyzer:
         )
         assert feats.repetition_score >= 0.65
 
+    def test_repeated_save_me_counts_as_request_repetition(self):
+        feats = self.analyzer.analyze(
+            _make_utterance("save me save me save me help help help")
+        )
+        assert feats.repetition_score >= 0.65
+        assert feats.evidence["repetition"]["req_rep"] >= 0.65
+        assert feats.urgency_score > 0.30
+
+    def test_mic_check_question_is_not_request_repetition(self):
+        feats = self.analyzer.analyze(
+            _make_utterance("Can you hear me? Can you hear me?")
+        )
+        assert feats.evidence["repetition"]["req_rep"] == 0.0
+
     def test_question_repetition(self):
         self.analyzer.analyze(_make_utterance("Why can't I go home?"))
         self.analyzer.analyze(_make_utterance("Where is my home?"))

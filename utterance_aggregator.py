@@ -94,7 +94,7 @@ class UtteranceAggregator:
     def stop(self) -> None:
         """Flush any pending lines and stop the thread."""
         self._stop_event.set()
-        # Emit whatever is buffered on shutdown
+        self._drain_committed_queue()
         self.flush()
         if self._thread:
             self._thread.join(timeout=3.0)

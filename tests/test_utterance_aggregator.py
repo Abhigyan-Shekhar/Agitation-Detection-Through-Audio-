@@ -79,6 +79,15 @@ class TestUtteranceAggregator:
         finally:
             agg.stop()
 
+    def test_stop_drains_committed_queue_before_flush(self):
+        agg = self._make_aggregator(silence_sec=10.0)
+        _send_line(self.committed_q, "Final line.")
+
+        agg.stop()
+
+        assert not self.utterance_q.empty()
+        assert self.utterance_q.get_nowait().full_text == "Final line."
+
     def test_utterance_full_text_property(self):
         agg = self._make_aggregator(silence_sec=0.3)
         agg.start()

@@ -212,6 +212,30 @@ class TestBehaviourClassifier:
         assert "Constant unwarranted requests for attention/help" in classified.behaviours
         assert classified.behaviour_events[0].canonical_label == "Constant unwarranted requests for attention/help"
 
+    def test_repeated_save_me_detected_as_request_not_no_agitation(self):
+        linguistic = LinguisticFeatures(
+            repetition_score=0.94,
+            urgency_score=0.67,
+            evidence={"repetition": {"rep": 0.94, "q_rep": 0.0, "req_rep": 0.94}},
+        )
+        result = _make_result(
+            linguistic=linguistic,
+            smoothed_score=0.20,
+            utterance_text="save me save me save me help help help",
+        )
+        classified = self.clf.classify(result)
+        assert "No audio agitation detected" not in classified.behaviours
+        assert "Constant unwarranted requests for attention/help" in classified.behaviours
+
+    def test_duplicate_canonical_labels_are_deduplicated(self):
+        linguistic = LinguisticFeatures(
+            repetition_score=0.95,
+            question_repetition_score=0.95,
+        )
+        result = _make_result(linguistic=linguistic, smoothed_score=0.40)
+        labels = self._classify(result)
+        assert labels.count("Repetitive sentences or questions") == 1
+
     # ---- Distressed verbalization ------------------------------------
 
     def test_distressed_verbalization(self):
@@ -222,7 +246,7 @@ class TestBehaviourClassifier:
             linguistic=linguistic,
         )
         labels = self._classify(result)
-        assert "Unmapped audio behaviour" in labels
+        assert "Distressed/urgent verbalization" in labels
 
     # ---- Multi-label -------------------------------------------------
 
@@ -239,7 +263,7 @@ class TestBehaviourClassifier:
         )
         labels = self._classify(result)
         assert "Repetitive sentences or questions" in labels
-        assert "Unmapped audio behaviour" in labels
+        assert "Distressed/urgent verbalization" in labels
 
     # ---- No physical labels ------------------------------------------
 

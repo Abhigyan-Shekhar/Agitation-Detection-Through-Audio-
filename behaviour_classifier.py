@@ -169,9 +169,13 @@ def _check_distressed_verbalization(
         return None
     if (
         linguistic.urgency_score >= config.BEHAVIOUR_URGENCY_THRESHOLD
-        and result.acoustic_score >= config.BEHAVIOUR_URGENCY_ACOUSTIC
+        and (
+            result.acoustic_score >= config.BEHAVIOUR_URGENCY_ACOUSTIC
+            or result.reliability < 0.90
+        )
     ):
-        conf = min(1.0, (linguistic.urgency_score + result.acoustic_score) / 2.0)
+        acoustic_component = result.acoustic_score if result.acoustic_features is not None else linguistic.urgency_score
+        conf = min(1.0, (linguistic.urgency_score + acoustic_component) / 2.0)
         return BehaviourLabel(
             label=_canonical_label("Distressed/urgent verbalization"),
             evidence=(
@@ -225,7 +229,11 @@ class BehaviourClassifier:
         for rule in self._RULES:
             label = rule(result, acoustic if rule == _check_screaming else linguistic)
             if label is not None:
-                detected.append(label)
+                existing = next((item for item in detected if item.label == label.label), None)
+                if existing is None:
+                    detected.append(label)
+                elif label.confidence > existing.confidence:
+                    detected[detected.index(existing)] = label
                 logger.info("Behaviour detected: %s (confidence=%.3f)", label.label, label.confidence)
 
         if not detected and result.smoothed_score < config.SEVERITY_LOW_MAX:

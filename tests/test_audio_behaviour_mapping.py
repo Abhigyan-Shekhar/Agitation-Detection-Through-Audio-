@@ -20,6 +20,7 @@ def test_supported_audio_behaviours_have_expected_canonical_labels():
         "AUDIO_COMPLAINING",
         "AUDIO_NEGATIVISM",
         "AUDIO_CONSTANT_REQUEST",
+        "AUDIO_URGENT_DISTRESS",
     }
 
 
@@ -108,6 +109,12 @@ def test_help_me_alone_does_not_map_to_constant_requests():
 def test_repeated_requests_for_help_map_to_constant_requests():
     mapped = map_observed_behaviour("repeated requests for help")
     assert mapped.internal_code == "AUDIO_CONSTANT_REQUEST"
+
+
+def test_urgent_distress_maps_to_distressed_verbalization():
+    mapped = map_observed_behaviour("Distressed/urgent verbalization")
+    assert mapped.internal_code == "AUDIO_URGENT_DISTRESS"
+    assert mapped.canonical_label == "Distressed/urgent verbalization"
 
 
 def test_physical_behaviours_remain_review_required():
