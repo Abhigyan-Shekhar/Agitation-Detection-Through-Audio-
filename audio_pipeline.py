@@ -23,6 +23,7 @@ import queue
 import threading
 import time
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -80,6 +81,17 @@ class TimestampedFrame(NamedTuple):
     frame_index: int = 0
 
 
+@dataclass(frozen=True)
+class LoudnessSnapshot:
+    """Recent raw callback loudness used for immediate screaming detection."""
+
+    timestamp: float
+    rms: float
+    peak: float
+    clipping_ratio: float
+    frame_index: int
+
+
 class AudioPipeline:
     """Captures microphone audio and fans frames out to downstream workers.
 
@@ -119,6 +131,7 @@ class AudioPipeline:
         # Monotonic frame counter for diagnostics
         self._frame_index: int = 0
         self._last_callback_stats: dict[str, float | int | str | bool] = {}
+        self._latest_loudness: LoudnessSnapshot | None = None
         self._input_device: str | int | None = None
 
     # ------------------------------------------------------------------
@@ -132,6 +145,10 @@ class AudioPipeline:
     @property
     def dropped_frames(self) -> int:
         return self._dropped_frames
+
+    @property
+    def latest_loudness(self) -> LoudnessSnapshot | None:
+        return self._latest_loudness
 
     def start(self) -> None:
         """Open the microphone stream and begin fanning frames to queues."""
@@ -217,6 +234,7 @@ class AudioPipeline:
         )
 
         self._log_audio_stage("timestamped_frame", self._frame_index, audio)
+        self._latest_loudness = self._loudness_snapshot(audio, ts, self._frame_index)
 
         # Fan out to both queues — drop if full rather than block the callback
         for q in (self.acoustic_queue, self.transcription_queue):
@@ -230,6 +248,19 @@ class AudioPipeline:
                     self._frame_index,
                     self._dropped_frames,
                 )
+
+    @staticmethod
+    def _loudness_snapshot(audio: np.ndarray, timestamp: float, frame_index: int) -> LoudnessSnapshot:
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.size == 0:
+            return LoudnessSnapshot(timestamp=timestamp, rms=0.0, peak=0.0, clipping_ratio=0.0, frame_index=frame_index)
+        return LoudnessSnapshot(
+            timestamp=timestamp,
+            rms=float(np.sqrt(np.nanmean(arr ** 2))),
+            peak=float(np.nanmax(np.abs(arr))),
+            clipping_ratio=float(np.mean(np.abs(arr) >= 0.99)),
+            frame_index=frame_index,
+        )
 
     def _capture_callback_audio(self, indata: np.ndarray) -> None:
         """Compatibility no-op for removed callback WAV diagnostics."""

@@ -34,6 +34,7 @@ from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
 from behaviour_classifier import BehaviourClassifier
 from audio_behaviour_taxonomy import get_supported_behaviours
+from audio_pipeline import LoudnessSnapshot
 from event_models import AcousticFeatureWindow, BehaviourEvent, FusedResult, LinguisticFeatures, Utterance
 
 logging.basicConfig(
@@ -237,7 +238,8 @@ def _consume() -> None:
     except queue.Empty:
         pass
 
-    _consume_acoustic_only_screaming(acoustic_worker, classifier)
+    pipeline = manager.pipeline if manager is not None else None
+    _consume_acoustic_only_screaming(acoustic_worker, classifier, pipeline.latest_loudness if pipeline else None)
 
 
 def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
@@ -253,14 +255,31 @@ def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
     return 0.0
 
 
+def _loudness_scream_score(loudness: LoudnessSnapshot | None) -> float:
+    if loudness is None:
+        return 0.0
+    age = time.time() - loudness.timestamp
+    if age > 1.0:
+        return 0.0
+    rms_score = min(1.0, loudness.rms / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6))
+    peak_score = min(1.0, loudness.peak / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6))
+    clipping_score = min(1.0, loudness.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
+    if rms_score >= 1.0 and peak_score >= 0.75:
+        return max(rms_score, peak_score)
+    if clipping_score > 0 and rms_score >= 0.50:
+        return max(rms_score, peak_score, clipping_score)
+    return 0.0
+
+
 def _consume_acoustic_only_screaming(
     acoustic_worker: Any,
     classifier: BehaviourClassifier,
+    loudness: LoudnessSnapshot | None = None,
 ) -> None:
-    if acoustic_worker is None:
-        return
-    acoustic = acoustic_worker.latest_window()
-    scream_score = _acoustic_scream_score(acoustic)
+    acoustic = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    loudness_score = _loudness_scream_score(loudness)
+    acoustic_score = _acoustic_scream_score(acoustic)
+    scream_score = max(loudness_score, acoustic_score)
     if scream_score < 0.65:
         return
 
@@ -270,17 +289,28 @@ def _consume_acoustic_only_screaming(
         return
 
     severity = "High" if scream_score >= 0.85 else "Moderate"
+    acoustic_for_result = acoustic or AcousticFeatureWindow(
+        start_time=(loudness.timestamp if loudness else now),
+        end_time=(loudness.timestamp if loudness else now),
+        rms_mean=(loudness.rms if loudness else 0.0),
+        rms_max=(loudness.peak if loudness else 0.0),
+        clipping_ratio=(loudness.clipping_ratio if loudness else 0.0),
+        voiced_ratio=1.0 if loudness else 0.0,
+    )
     result = FusedResult(
         acoustic_score=round(scream_score, 4),
         linguistic_score=0.0,
         raw_final_score=round(scream_score, 4),
         smoothed_score=round(scream_score, 4),
         severity=severity,
-        reliability=max(0.0, 1.0 - (0.25 if acoustic and acoustic.clipping_ratio > 0.10 else 0.0)),
+        reliability=max(0.0, 1.0 - (0.25 if acoustic_for_result.clipping_ratio > 0.10 else 0.0)),
         utterance=None,
-        acoustic_features=acoustic,
+        acoustic_features=acoustic_for_result,
         linguistic_features=LinguisticFeatures(),
         acoustic_contributions={
+            "raw_callback_rms": round(loudness.rms if loudness else 0.0, 4),
+            "raw_callback_peak": round(loudness.peak if loudness else 0.0, 4),
+            "raw_callback_clipping": round(loudness.clipping_ratio if loudness else 0.0, 4),
             "absolute_rms": round(acoustic.rms_mean if acoustic else 0.0, 4),
             "absolute_peak": round(acoustic.rms_max if acoustic else 0.0, 4),
             "clipping": round(acoustic.clipping_ratio if acoustic else 0.0, 4),
@@ -292,7 +322,10 @@ def _consume_acoustic_only_screaming(
         return
 
     logger.info(
-        "BEHAVIOUR_TRACE acoustic_only_screaming rms_mean=%.3f rms_max=%.3f clipping=%.3f labels=%s severity=%s",
+        "BEHAVIOUR_TRACE acoustic_only_screaming raw_rms=%.3f raw_peak=%.3f raw_clipping=%.3f window_rms=%.3f window_peak=%.3f window_clipping=%.3f labels=%s severity=%s",
+        loudness.rms if loudness else 0.0,
+        loudness.peak if loudness else 0.0,
+        loudness.clipping_ratio if loudness else 0.0,
         acoustic.rms_mean if acoustic else 0.0,
         acoustic.rms_max if acoustic else 0.0,
         acoustic.clipping_ratio if acoustic else 0.0,
