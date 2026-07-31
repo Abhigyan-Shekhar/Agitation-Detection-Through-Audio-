@@ -80,7 +80,7 @@ class TestBehaviourClassifier:
 
     def test_calm_swearing_no_verbal_aggression(self):
         linguistic = LinguisticFeatures(
-            profanity_score=0.33,
+            profanity_score=0.25,
             negative_sentiment=0.3,
             threat_score=0.0,
             imperative_score=0.2,
@@ -93,6 +93,23 @@ class TestBehaviourClassifier:
         )
         labels = self._classify(result)
         assert "Cursing / verbal aggression" not in labels
+
+    def test_explicit_curse_word_triggers_cursing_without_repetition(self):
+        linguistic = LinguisticFeatures(
+            profanity_score=0.70,
+            negative_sentiment=0.2,
+            threat_score=0.0,
+            imperative_score=0.0,
+        )
+        result = _make_result(
+            acoustic_score=0.20,
+            smoothed_score=0.20,
+            linguistic=linguistic,
+            utterance_text="What the fuck is going on?",
+        )
+        labels = self._classify(result)
+        assert "No audio agitation detected" not in labels
+        assert "Cursing / verbal aggression" in labels
 
     # ---- Shouted neutral → Screaming but not verbal aggression --------
 
@@ -124,6 +141,18 @@ class TestBehaviourClassifier:
         labels = self._classify(result)
         assert "Cursing / verbal aggression" not in labels
         assert "Screaming" in labels
+
+    def test_transcript_yelling_terms_trigger_screaming(self):
+        linguistic = LinguisticFeatures(yelling_score=0.65)
+        result = _make_result(
+            acoustic_score=0.10,
+            smoothed_score=0.20,
+            linguistic=linguistic,
+            utterance_text="Stop yelling at me.",
+        )
+        labels = self._classify(result)
+        assert "Screaming" in labels
+        assert "No audio agitation detected" not in labels
 
     # ---- Calm threat → threat detected, not necessarily verbal aggression
 

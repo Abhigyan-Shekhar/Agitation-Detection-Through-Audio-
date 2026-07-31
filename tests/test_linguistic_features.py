@@ -137,11 +137,35 @@ class TestLinguisticAnalyzer:
 
     def test_profanity_detected(self):
         feats = self.analyzer.analyze(_make_utterance("What the fuck is going on?"))
-        assert feats.profanity_score > 0.0
+        assert feats.profanity_score >= 0.50
+
+    def test_common_english_curse_words_detected(self):
+        for phrase in [
+            "You are an asshole.",
+            "This is bullshit.",
+            "Stop being a bitch.",
+            "What a dick.",
+        ]:
+            feats = self.analyzer.analyze(_make_utterance(phrase))
+            assert feats.profanity_score >= 0.50
 
     def test_profanity_score_bounded(self):
         feats = self.analyzer.analyze(_make_utterance("fuck shit damn bastard"))
         assert feats.profanity_score <= 1.0
+
+    def test_mild_damn_is_low_strength_profanity(self):
+        feats = self.analyzer.analyze(_make_utterance("Oh damn, I forgot."))
+        assert 0.0 < feats.profanity_score < 0.50
+
+    # ---- Yelling ------------------------------------------------------
+
+    def test_yelling_terms_detected(self):
+        feats = self.analyzer.analyze(_make_utterance("Stop yelling at me."))
+        assert feats.yelling_score >= 0.50
+
+    def test_exclamation_and_caps_yelling_cues_detected(self):
+        feats = self.analyzer.analyze(_make_utterance("STOP!! LISTEN!!"))
+        assert feats.yelling_score >= 0.50
 
     # ---- Empty / edge cases ------------------------------------------
 
@@ -158,7 +182,7 @@ class TestLinguisticAnalyzer:
         for attr in [
             "repetition_score", "question_repetition_score",
             "negative_sentiment", "urgency_score", "threat_score",
-            "profanity_score", "imperative_score",
+            "profanity_score", "imperative_score", "yelling_score",
         ]:
             val = getattr(feats, attr)
             assert 0.0 <= val <= 1.0, f"{attr}={val} out of bounds"

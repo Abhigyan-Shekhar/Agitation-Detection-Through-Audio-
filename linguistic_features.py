@@ -8,8 +8,9 @@ B. question_repetition    — interrogative sentence matching
 C. negative_sentiment     — VADER neg score + Hinglish lexicon
 D. urgency_score          — weighted keyword matching
 E. threat_score           — regex pattern matching
-F. profanity_score        — raw count, intentionally weak weight
+F. profanity_score        — weighted common profanity matches
 G. imperative_score       — command patterns (modifier for verbal-aggr rule)
+H. yelling_score          — transcript yelling/shouting cues
 
 Design notes
 ------------
@@ -128,15 +129,37 @@ NEGATIVE_HINGLISH: frozenset[str] = frozenset({
     "afraid", "hurt", "pain", "leave", "alone",
 })
 
-PROFANITY_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\bf+u+c+k+\b", re.I),
-    re.compile(r"\bsh+i+t+\b", re.I),
-    re.compile(r"\bd+a+m+n+\b", re.I),
-    re.compile(r"\bb+a+s+t+a+r+d+\b", re.I),
-    re.compile(r"\bsaala\b", re.I),
-    re.compile(r"\bkamina\b", re.I),
-    re.compile(r"\bharamzada\b", re.I),
-]
+PROFANITY_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile(r"\bmother\s*f+u+c+k+(?:er|ing)?\b", re.I), 0.9),
+    (re.compile(r"\bf+u+c+k+(?:er|ing|ed)?\b", re.I), 0.7),
+    (re.compile(r"\bsh+i+t+(?:ty|head)?\b", re.I), 0.55),
+    (re.compile(r"\bb+u+l+l+s+h+i+t+\b", re.I), 0.6),
+    (re.compile(r"\ba+s+s+h+o+l+e+s?\b", re.I), 0.7),
+    (re.compile(r"\bb+i+t+c+h+(?:es|ing)?\b", re.I), 0.65),
+    (re.compile(r"\bb+a+s+t+a+r+d+s?\b", re.I), 0.55),
+    (re.compile(r"\bd+i+c+k+s?\b", re.I), 0.55),
+    (re.compile(r"\bp+r+i+c+k+s?\b", re.I), 0.55),
+    (re.compile(r"\bc+u+n+t+s?\b", re.I), 0.75),
+    (re.compile(r"\bson\s+of\s+a\s+b+i+t+c+h+\b", re.I), 0.8),
+    (re.compile(r"\bd+a+m+n+(?:ed|it)?\b", re.I), 0.25),
+    (re.compile(r"\bcr+a+p+\b", re.I), 0.2),
+    (re.compile(r"\bsaala\b", re.I), 0.45),
+    (re.compile(r"\bkamina\b", re.I), 0.45),
+    (re.compile(r"\bharamzada\b", re.I), 0.55),
+)
+
+YELLING_TERMS: frozenset[str] = frozenset({
+    "shout", "shouting", "yell", "yelling", "scream", "screaming",
+    "shut up", "shut the hell up", "stop shouting", "stop yelling",
+    "stop screaming", "loud voice",
+})
+
+LOUD_INTERJECTIONS: frozenset[str] = frozenset({
+    "hey", "stop", "no", "help", "leave", "listen",
+})
+
+ALL_CAPS_WORD_RE = re.compile(r"\b[A-Z]{3,}\b")
+EXCLAMATION_RE = re.compile(r"!{1,}")
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -276,6 +299,10 @@ class LinguisticAnalyzer:
         imperative = self._imperative_score(text)
         evidence["imperative"] = imperative
 
+        # G. Yelling cues
+        yelling = self._yelling_score(text)
+        evidence["yelling"] = yelling
+
         # Update history
         self._history.append(_TranscriptRecord(text, utterance.end_time))
 
@@ -287,10 +314,11 @@ class LinguisticAnalyzer:
             threat_score=float(np.clip(threat, 0.0, 1.0)),
             profanity_score=float(np.clip(profanity, 0.0, 1.0)),
             imperative_score=float(np.clip(imperative, 0.0, 1.0)),
+            yelling_score=float(np.clip(yelling, 0.0, 1.0)),
             evidence=evidence,
         )
         logger.info(
-            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f",
+            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f",
             features.repetition_score,
             features.question_repetition_score,
             features.negative_sentiment,
@@ -298,6 +326,7 @@ class LinguisticAnalyzer:
             features.threat_score,
             features.profanity_score,
             features.imperative_score,
+            features.yelling_score,
         )
         return features
 
@@ -445,8 +474,24 @@ class LinguisticAnalyzer:
         return min(1.0, matches / 2.0)
 
     def _profanity_score(self, text: str) -> float:
-        matches = sum(1 for p in PROFANITY_PATTERNS if p.search(text))
-        return min(1.0, matches / 3.0)
+        return min(1.0, sum(weight for pattern, weight in PROFANITY_PATTERNS if pattern.search(text)))
+
+    def _yelling_score(self, text: str) -> float:
+        normalized = _normalize(text)
+        score = 0.0
+        term_matches = sum(1 for term in YELLING_TERMS if term in normalized)
+        if term_matches:
+            score += min(0.8, 0.45 + 0.15 * term_matches)
+
+        caps_words = ALL_CAPS_WORD_RE.findall(text)
+        if caps_words and any(word.lower() in LOUD_INTERJECTIONS for word in caps_words):
+            score += min(0.6, 0.25 + 0.10 * len(caps_words))
+
+        exclamation_count = sum(len(match.group(0)) for match in EXCLAMATION_RE.finditer(text))
+        if exclamation_count >= 2:
+            score += min(0.45, 0.15 + 0.05 * exclamation_count)
+
+        return min(1.0, score)
 
     def _imperative_score(self, text: str) -> float:
         """Simple heuristic: imperatives tend to start with a base verb."""

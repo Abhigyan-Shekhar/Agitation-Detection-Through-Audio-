@@ -47,7 +47,7 @@ def _check_screaming(
     result: FusedResult,
     acoustic: AcousticFeatureWindow | None,
 ) -> BehaviourLabel | None:
-    """Screaming/shouting — acoustic-only, works even if transcript fails."""
+    """Screaming/shouting from acoustic energy, works even if transcript fails."""
     if acoustic is None:
         return None
 
@@ -57,9 +57,10 @@ def _check_screaming(
     energy_high = energy_contrib >= (config.ACOUSTIC_WEIGHTS["energy_z"] * config.BEHAVIOUR_ENERGY_Z_SHOUT / config.Z_CLIP)
     burst_high = burst_contrib >= (config.ACOUSTIC_WEIGHTS["energy_burst_z"] * config.BEHAVIOUR_ENERGY_BURST_SHOUT)
     voiced_present = acoustic.voiced_ratio >= 0.30
+    high_acoustic_agitation = result.acoustic_score >= config.BEHAVIOUR_VERBAL_AGGR_ACOUSTIC
 
-    if energy_high and burst_high and voiced_present:
-        conf = min(1.0, (energy_contrib + burst_contrib) * 4.0)
+    if voiced_present and ((energy_high and burst_high) or high_acoustic_agitation):
+        conf = min(1.0, max((energy_contrib + burst_contrib) * 4.0, result.acoustic_score))
         return BehaviourLabel(
             label=_canonical_label("Screaming/shouting"),
             evidence=(
@@ -72,13 +73,36 @@ def _check_screaming(
     return None
 
 
+def _check_yelling_language(
+    result: FusedResult,
+    linguistic: LinguisticFeatures | None,
+) -> BehaviourLabel | None:
+    if linguistic is None:
+        return None
+    if linguistic.yelling_score >= 0.50:
+        return BehaviourLabel(
+            label=_canonical_label("Screaming/shouting"),
+            evidence=f"Transcript yelling score={linguistic.yelling_score:.2f}",
+            confidence=round(min(1.0, linguistic.yelling_score), 3),
+        )
+    return None
+
+
 def _check_verbal_aggression(
     result: FusedResult,
     linguistic: LinguisticFeatures | None,
 ) -> BehaviourLabel | None:
-    """Possible verbal aggression — requires high acoustics + threat/sentiment."""
+    """Cursing/verbal aggression from explicit profanity or threat + high acoustics."""
     if linguistic is None:
         return None
+
+    if linguistic.profanity_score >= 0.50:
+        conf = min(1.0, max(linguistic.profanity_score, 0.55 + 0.15 * result.acoustic_score))
+        return BehaviourLabel(
+            label=_canonical_label("Possible verbal aggression"),
+            evidence=f"Explicit profanity score={linguistic.profanity_score:.2f}",
+            confidence=round(conf, 3),
+        )
 
     threat_ok = linguistic.threat_score >= config.BEHAVIOUR_VERBAL_AGGR_THREAT
     profanity_imperative_ok = (
@@ -192,6 +216,7 @@ class BehaviourClassifier:
 
     _RULES = [
         _check_screaming,
+        _check_yelling_language,
         _check_verbal_aggression,
         _check_repeated_requests,
         _check_repetitive_verbalization,
@@ -215,7 +240,7 @@ class BehaviourClassifier:
         )
         if linguistic is not None:
             logger.info(
-                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f",
+                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f",
                 linguistic.repetition_score,
                 linguistic.question_repetition_score,
                 linguistic.negative_sentiment,
@@ -223,6 +248,7 @@ class BehaviourClassifier:
                 linguistic.threat_score,
                 linguistic.profanity_score,
                 linguistic.imperative_score,
+                linguistic.yelling_score,
             )
         detected: list[BehaviourLabel] = []
 
