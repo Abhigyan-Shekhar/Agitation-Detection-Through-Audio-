@@ -12,6 +12,7 @@ F. profanity_score        — weighted common profanity matches
 G. imperative_score       — command patterns (modifier for verbal-aggr rule)
 H. yelling_score          — transcript yelling/shouting cues
 I. sexual_advance_score   — sexualized verbal propositions/comments
+J. complaint_score         — dissatisfaction/discomfort complaint semantics
 
 Design notes
 ------------
@@ -178,6 +179,23 @@ SEXUAL_ADVANCE_CLINICAL_CONTEXT_RE = re.compile(
     re.I,
 )
 
+COMPLAINT_PATTERNS: tuple[tuple[str, re.Pattern[str], float], ...] = (
+    ("tired_of_this", re.compile(r"\b(?:i am|i'm|im)\s+tired\s+of\s+(?:this|it|everything)\b", re.I), 0.70),
+    ("dislike_this", re.compile(r"\bi\s+don'?t\s+like\s+(?:this|it|that|this place|this food)\b", re.I), 0.70),
+    ("pain_or_discomfort", re.compile(r"\b(?:this\s+hurts|it\s+hurts|i'?m\s+uncomfortable|i\s+am\s+uncomfortable|this\s+is\s+uncomfortable)\b", re.I), 0.75),
+    ("not_listened_to", re.compile(r"\bnobody\s+(?:listens|cares)(?:\s+to|\s+about)?\s+me\b", re.I), 0.80),
+    ("why_bad_happening", re.compile(r"\bwhy\s+(?:is\s+this\s+happening|won'?t\s+anyone\s+help\s+me)\b", re.I), 0.75),
+    ("terrible_or_wrong", re.compile(r"\b(?:this\s+is\s+terrible|everything\s+is\s+wrong|this\s+food\s+is\s+awful)\b", re.I), 0.75),
+    ("dont_want_this", re.compile(r"\bi\s+don'?t\s+want\s+(?:this|it|that)\b", re.I), 0.70),
+    ("too_noisy", re.compile(r"\bthis\s+place\s+is\s+too\s+noisy\b", re.I), 0.70),
+    ("cant_stand", re.compile(r"\bi\s+can'?t\s+stand\s+(?:this|it|that|this\s+anymore|it\s+anymore)\b", re.I), 0.80),
+)
+
+COMPLAINT_KEYWORD_RE = re.compile(
+    r"\b(?:tired of|don'?t like|hurts?|uncomfortable|nobody listens|nobody cares|terrible|wrong|awful|too noisy|can'?t stand|won'?t anyone help)\b",
+    re.I,
+)
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -229,6 +247,10 @@ def _fuzzy_similarity(a: str, b: str) -> float:
     return fuzz.token_sort_ratio(a, b) / 100.0
 
 
+
+def _has_complaint_semantics(text: str) -> bool:
+    return any(pattern.search(text) for _, pattern, _ in COMPLAINT_PATTERNS)
+
 def _sentence_fragments(text: str) -> list[str]:
     """Return normalized utterance fragments split on sentence punctuation."""
     return [
@@ -243,13 +265,14 @@ def _sentence_fragments(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class _TranscriptRecord:
-    __slots__ = ("text", "timestamp", "is_question", "is_request")
+    __slots__ = ("text", "timestamp", "is_question", "is_request", "is_complaint")
 
     def __init__(self, text: str, timestamp: float) -> None:
         self.text = text
         self.timestamp = timestamp
         self.is_question = _is_question(text)
         self.is_request = _is_request(text)
+        self.is_complaint = _has_complaint_semantics(text)
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +347,17 @@ class LinguisticAnalyzer:
         sexual_advance = self._sexual_advance_score(text)
         evidence["sexual_advance"] = sexual_advance
 
+        # I. Complaining
+        complaint_score, complaint_keywords, complaint_patterns, complaint_confidence = (
+            self._complaint_details(text, neg_sentiment)
+        )
+        evidence["complaint"] = {
+            "complaint_score": complaint_score,
+            "complaint_keywords": complaint_keywords,
+            "complaint_patterns_matched": complaint_patterns,
+            "complaint_confidence": complaint_confidence,
+        }
+
         # Update history
         self._history.append(_TranscriptRecord(text, utterance.end_time))
 
@@ -337,10 +371,11 @@ class LinguisticAnalyzer:
             imperative_score=float(np.clip(imperative, 0.0, 1.0)),
             yelling_score=float(np.clip(yelling, 0.0, 1.0)),
             sexual_advance_score=float(np.clip(sexual_advance, 0.0, 1.0)),
+            complaint_score=float(np.clip(complaint_score, 0.0, 1.0)),
             evidence=evidence,
         )
         logger.info(
-            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f sexual_advance=%.3f",
+            "BEHAVIOUR_TRACE linguistic_output repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f sexual_advance=%.3f complaint_score=%.3f complaint_keywords=%s complaint_patterns_matched=%s complaint_confidence=%.3f",
             features.repetition_score,
             features.question_repetition_score,
             features.negative_sentiment,
@@ -350,6 +385,10 @@ class LinguisticAnalyzer:
             features.imperative_score,
             features.yelling_score,
             features.sexual_advance_score,
+            features.complaint_score,
+            complaint_keywords,
+            complaint_patterns,
+            complaint_confidence,
         )
         return features
 
@@ -520,6 +559,25 @@ class LinguisticAnalyzer:
         if SEXUAL_ADVANCE_CLINICAL_CONTEXT_RE.search(text):
             return 0.0
         return min(1.0, sum(weight for pattern, weight in SEXUAL_ADVANCE_PATTERNS if pattern.search(text)))
+
+
+    def _complaint_details(self, text: str, negative_sentiment: float) -> tuple[float, list[str], list[str], float]:
+        """Score explicit complaint semantics without treating plain sadness as complaining."""
+        matched: list[tuple[str, float]] = [
+            (name, weight) for name, pattern, weight in COMPLAINT_PATTERNS if pattern.search(text)
+        ]
+        keywords = sorted({match.group(0).lower() for match in COMPLAINT_KEYWORD_RE.finditer(text)})
+        if not matched:
+            return 0.0, keywords, [], 0.0
+
+        base = max(weight for _, weight in matched)
+        repeated_recent = any(rec.is_complaint for rec in self._history)
+        if repeated_recent:
+            base += 0.15
+        if negative_sentiment >= 0.20:
+            base += 0.10
+        score = min(1.0, base)
+        return score, keywords, [name for name, _ in matched], score
 
     def _imperative_score(self, text: str) -> float:
         """Simple heuristic: imperatives tend to start with a base verb."""

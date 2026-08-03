@@ -199,7 +199,39 @@ class TestLinguisticAnalyzer:
             "repetition_score", "question_repetition_score",
             "negative_sentiment", "urgency_score", "threat_score",
             "profanity_score", "imperative_score", "yelling_score",
-            "sexual_advance_score",
+            "sexual_advance_score", "complaint_score",
         ]:
             val = getattr(feats, attr)
             assert 0.0 <= val <= 1.0, f"{attr}={val} out of bounds"
+
+
+class TestComplaintDetection:
+    def setup_method(self):
+        self.analyzer = LinguisticAnalyzer()
+
+    @pytest.mark.parametrize("phrase", [
+        "I'm tired of this.",
+        "Nobody listens to me.",
+        "Everything is wrong.",
+        "This hurts.",
+        "I don't like this.",
+    ])
+    def test_complaint_positive_examples(self, phrase):
+        feats = self.analyzer.analyze(_make_utterance(phrase))
+        assert feats.complaint_score >= 0.55
+        assert feats.evidence["complaint"]["complaint_patterns_matched"]
+        assert feats.evidence["complaint"]["complaint_confidence"] >= 0.55
+
+    @pytest.mark.parametrize("phrase", [
+        "Hello.",
+        "Thank you.",
+        "Good morning.",
+        "It is raining.",
+        "My name is John.",
+        "I am sad.",
+        "I'm worried.",
+        "I want to go home.",
+    ])
+    def test_complaint_negative_and_boundary_examples(self, phrase):
+        feats = self.analyzer.analyze(_make_utterance(phrase))
+        assert feats.complaint_score == pytest.approx(0.0, abs=0.01)

@@ -371,3 +371,25 @@ class TestBehaviourClassifier:
         result.acoustic_features = acoustic
         labels = set(self._classify(result))
         assert len(labels & physical) == 0
+
+    def test_complaint_score_triggers_complaining_label(self):
+        linguistic = LinguisticFeatures(
+            complaint_score=0.75,
+            evidence={
+                "complaint": {
+                    "complaint_score": 0.75,
+                    "complaint_keywords": ["tired of"],
+                    "complaint_patterns_matched": ["tired_of_this"],
+                    "complaint_confidence": 0.75,
+                }
+            },
+        )
+        result = _make_result(
+            linguistic=linguistic,
+            smoothed_score=0.20,
+            utterance_text="I'm tired of this.",
+        )
+        classified = self.clf.classify(result)
+        assert "Complaining" in classified.behaviours
+        assert "No audio agitation detected" not in classified.behaviours
+        assert classified.behaviour_events[0].canonical_label == "Complaining"
