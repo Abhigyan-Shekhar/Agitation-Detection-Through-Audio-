@@ -393,3 +393,24 @@ class TestBehaviourClassifier:
         assert "Complaining" in classified.behaviours
         assert "No audio agitation detected" not in classified.behaviours
         assert classified.behaviour_events[0].canonical_label == "Complaining"
+
+    def test_negativism_triggers_when_threshold_is_exceeded(self):
+        linguistic = LinguisticFeatures(
+            negativism_score=0.80,
+            evidence={
+                "negativism": {
+                    "negativism_score": 0.80,
+                    "categories": ["refusal"],
+                    "matched_phrases": ["i won't"],
+                }
+            },
+        )
+        result = _make_result(
+            linguistic=linguistic,
+            smoothed_score=0.20,
+            utterance_text="I won't take my medicine.",
+        )
+        classified = self.clf.classify(result)
+        assert "Negativism" in classified.behaviours
+        assert "No audio agitation detected" not in classified.behaviours
+        assert classified.behaviour_events[0].canonical_label == "Negativism"

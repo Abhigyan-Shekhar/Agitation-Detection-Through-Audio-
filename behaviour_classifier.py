@@ -237,6 +237,30 @@ def _check_complaining(
         )
     return None
 
+
+def _check_negativism(
+    result: FusedResult,
+    linguistic: LinguisticFeatures | None,
+) -> BehaviourLabel | None:
+    if linguistic is None:
+        return None
+    if linguistic.negativism_score >= config.BEHAVIOUR_NEGATIVISM_THRESHOLD:
+        details = linguistic.evidence.get("negativism", {}) if linguistic.evidence else {}
+        categories = details.get("categories", [])
+        phrases = details.get("matched_phrases", [])
+        evidence = f"Negativism score={linguistic.negativism_score:.2f}"
+        if categories:
+            evidence += f", categories={categories}"
+        if phrases:
+            evidence += f", phrases={phrases}"
+        return BehaviourLabel(
+            label=_canonical_label("Negativism"),
+            evidence=evidence,
+            confidence=round(min(1.0, linguistic.negativism_score), 3),
+        )
+    return None
+
+
 def _check_distressed_verbalization(
     result: FusedResult,
     linguistic: LinguisticFeatures | None,
@@ -275,6 +299,7 @@ class BehaviourClassifier:
         _check_repetitive_verbalization,
         _check_repeated_questioning,
         _check_complaining,
+        _check_negativism,
         _check_distressed_verbalization,
     ]
 

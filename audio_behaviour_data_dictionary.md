@@ -103,6 +103,56 @@ The pipeline emits structured behaviour events through the shared event model.
 | fused_score | float | Combined score after fusion |
 | behaviour_events | list[BehaviourEvent] | Structured behaviour events associated with the utterance |
 
-## 6. Notes for dashboard and downstream consumers
+## 6. Negativism detector (clinical heuristic)
+
+Negativism is detected through a deterministic, weighted heuristic that is intentionally narrow and clinically aligned with the CMAI concept of oppositional, resistant, refusing, or non-cooperative verbal behaviour.
+
+### Taxonomy categories
+
+The detector groups explicit oppositional behaviour into four semantic buckets:
+
+- Refusal: phrases such as “I won't”, “I will not”, “I'm not doing that”, “I refuse”, “No”, or “No way”.
+- Resistance: phrases such as “Don't touch me”, “Stop bothering me”, “Leave me alone”, “Go away”, or “Stop”.
+- Non-compliance: phrases such as “I'm not taking my medicine”, “I'm not going”, “I'm staying here”, or “I don't want to”.
+- Defiance: phrases such as “You can't make me”, “Don't tell me what to do”, “I decide”, or “I said no”.
+
+### Regex aliases and scoring logic
+
+Each category uses multiple regex aliases and phrase variants, including conversational contractions and variants such as “I wont”, “I'm not”, “I am not”, “Don't”, and “Do not”.
+
+The score is built by category rather than by individual words:
+
+- Refusal → strong weight
+- Resistance → moderate weight
+- Non-compliance → moderate weight
+- Defiance → strong weight
+
+The detector adds the weighted category contribution for each matched category and caps the final Negativism score at 1.0. Repeated matches within a category add a modest boost, but the score is still bounded.
+
+### Thresholding and explainability
+
+Negativism is emitted only when the accumulated Negativism score exceeds the configurable threshold in the classifier configuration. The current default threshold is 0.55 and can be tuned later without changing the taxonomy logic.
+
+### Examples that trigger
+
+- “I won't take my medicine.”
+- “Don't touch me.”
+- “I'm not taking my medicine.”
+- “You can't make me.”
+- “I'm sad but I won't take my medicine.”
+- “I don't want to go, please leave me alone.”
+
+### Examples intentionally excluded
+
+The detector does not classify general negative sentiment, sadness, depression, loneliness, grief, pain, fear, anxiety, frustration, disappointment, or documentation text:
+
+- “I'm sad.”
+- “I miss my daughter.”
+- “Today is terrible.”
+- “Life is hard.”
+- “I'm depressed.”
+- “The CMAI includes Negativism.”
+
+## 7. Notes for dashboard and downstream consumers
 
 Downstream components should prefer the structured behaviour events over free-form labels. This keeps the behaviour taxonomy explicit, auditable, and consistent across the dashboard and tests.

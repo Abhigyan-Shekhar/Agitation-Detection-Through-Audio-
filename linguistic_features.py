@@ -13,6 +13,7 @@ G. imperative_score       — command patterns (modifier for verbal-aggr rule)
 H. yelling_score          — transcript yelling/shouting cues
 I. sexual_advance_score   — sexualized verbal propositions/comments
 J. complaint_score         — dissatisfaction/discomfort complaint semantics
+K. negativism_score       — clinically-oriented refusal/resistance/non-compliance/defiance heuristic
 
 Design notes
 ------------
@@ -196,6 +197,55 @@ COMPLAINT_KEYWORD_RE = re.compile(
     re.I,
 )
 
+NEGATIVISM_EMOTIONAL_STATE_RE = re.compile(
+    r"\b(?:sad|depressed|lonely|grief|pain|fear|anxiety|frustrated|frustration|disappointed|disappointment|awful|terrible|hard|bad|miss)\b",
+    re.I,
+)
+
+NEGATIVISM_TAXONOMY: tuple[tuple[str, float, tuple[re.Pattern[str], ...]], ...] = (
+    (
+        "refusal",
+        0.75,
+        (
+            re.compile(r"\b(?:i|i['’]m|i am)\s+(?:won't|wont|will not|willn't)\b", re.I),
+            re.compile(r"\b(?:i|i['’]m|i am)\s+(?:don'?t|do not)\s+(?:want(?:\s+to)?|like|need|care|go|take|do|listen|cooperate|touch|leave|come|talk)\b", re.I),
+            re.compile(r"\b(?:i|i['’]m|i am)\s+refuse(?:s|d)?\b", re.I),
+            re.compile(r"\b(?:i|i['’]m|i am)\s+not\b(?!\s+(?:sad|depressed|lonely|grief|pain|fear|anxiety|frustrated|frustration|disappointed|disappointment|awful|terrible|hard|bad|miss))", re.I),
+            re.compile(r"(?<!\w)(?:don'?t|do not)(?!\w)", re.I),
+            re.compile(r"(?<!\w)(?:no(?: way)?|nah)(?!\w)", re.I),
+        ),
+    ),
+    (
+        "resistance",
+        0.65,
+        (
+            re.compile(r"\b(?:don'?t|do not)\s+(?:touch|bother|tell|leave|go|come|talk|disturb|make)\b", re.I),
+            re.compile(r"\b(?:leave me alone|go away|get away|get lost|back off|please stop)\b", re.I),
+            re.compile(r"\bstop\b", re.I),
+        ),
+    ),
+    (
+        "non_compliance",
+        0.65,
+        (
+            re.compile(r"\b(?:i|i['’]m|i am)\s+not\s+(?:taking|going|staying|doing|leaving|eating|drinking|listening|cooperating)\b", re.I),
+            re.compile(r"\b(?:i|i['’]m|i am)\s+not\s+going\b", re.I),
+            re.compile(r"\b(?:i|i['’]m|i am)\s+staying\s+here\b", re.I),
+            re.compile(r"\b(?:i|i['’]m|i am)\s+don'?t\s+want\s+to\b", re.I),
+        ),
+    ),
+    (
+        "defiance",
+        0.75,
+        (
+            re.compile(r"\byou\s+(?:can't|cannot|can not)\s+make\s+me\b", re.I),
+            re.compile(r"\b(?:don'?t|do not)\s+tell\s+me\s+what\s+to\s+do\b", re.I),
+            re.compile(r"\bi\s+decide\b", re.I),
+            re.compile(r"\bi\s+said\s+no\b", re.I),
+        ),
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -358,6 +408,14 @@ class LinguisticAnalyzer:
             "complaint_confidence": complaint_confidence,
         }
 
+        # J. Negativism (refusal / resistance / non-compliance / defiance)
+        negativism_score, negativism_categories, negativism_phrases = self._negativism_details(text)
+        evidence["negativism"] = {
+            "negativism_score": negativism_score,
+            "categories": negativism_categories,
+            "matched_phrases": negativism_phrases,
+        }
+
         # Update history
         self._history.append(_TranscriptRecord(text, utterance.end_time))
 
@@ -372,6 +430,7 @@ class LinguisticAnalyzer:
             yelling_score=float(np.clip(yelling, 0.0, 1.0)),
             sexual_advance_score=float(np.clip(sexual_advance, 0.0, 1.0)),
             complaint_score=float(np.clip(complaint_score, 0.0, 1.0)),
+            negativism_score=float(np.clip(negativism_score, 0.0, 1.0)),
             evidence=evidence,
         )
         logger.info(
@@ -389,6 +448,12 @@ class LinguisticAnalyzer:
             complaint_keywords,
             complaint_patterns,
             complaint_confidence,
+        )
+        logger.info(
+            "BEHAVIOUR_TRACE linguistic_output negativism=%.3f categories=%s phrases=%s",
+            features.negativism_score,
+            negativism_categories,
+            negativism_phrases,
         )
         return features
 
@@ -578,6 +643,45 @@ class LinguisticAnalyzer:
             base += 0.10
         score = min(1.0, base)
         return score, keywords, [name for name, _ in matched], score
+
+    def _negativism_details(self, text: str) -> tuple[float, list[str], list[str]]:
+        """Heuristically score oppositional refusal/resistance/non-compliance/defiance.
+
+        The taxonomy is intentionally narrow: it targets explicit oppositional
+        behaviour such as refusing care, resisting contact, refusing to comply,
+        or openly defying instructions. It avoids generic negative sentiment.
+        """
+        lower = _normalize(text)
+        if not lower:
+            return 0.0, [], []
+
+        categories: list[str] = []
+        matched_phrases: list[str] = []
+        aggregate_score = 0.0
+
+        for category_name, base_weight, patterns in NEGATIVISM_TAXONOMY:
+            category_match_count = 0
+            category_phrases: list[str] = []
+            for pattern in patterns:
+                matches = list(pattern.finditer(text))
+                if not matches:
+                    continue
+                count = len(matches)
+                category_match_count += count
+                category_phrases.extend(match.group(0).strip() for match in matches)
+            if category_match_count == 0:
+                continue
+
+            category_score = min(1.0, base_weight + 0.15 * max(0, category_match_count - 1))
+            aggregate_score += category_score
+            categories.append(category_name)
+            matched_phrases.extend(category_phrases)
+
+        if not categories:
+            return 0.0, [], []
+
+        score = min(1.0, aggregate_score)
+        return score, categories, sorted(set(matched_phrases))
 
     def _imperative_score(self, text: str) -> float:
         """Simple heuristic: imperatives tend to start with a base verb."""
