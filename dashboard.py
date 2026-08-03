@@ -240,6 +240,7 @@ def _consume() -> None:
 
     pipeline = manager.pipeline if manager is not None else None
     _consume_acoustic_only_screaming(acoustic_worker, classifier, pipeline.latest_loudness if pipeline else None)
+    _consume_acoustic_only_strange_noise(acoustic_worker, classifier)
 
 
 def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
@@ -333,6 +334,67 @@ def _consume_acoustic_only_screaming(
         result.severity,
     )
     st.session_state.last_acoustic_scream_ts = now
+    st.session_state.latest_result = result
+    for event in result.behaviour_events:
+        st.session_state.behaviour_log.append(_event_to_record(event, result))
+    st.session_state.timeline.append({
+        "time": time.strftime("%H:%M:%S"),
+        "timestamp": datetime.now(),
+        "acoustic_score": result.acoustic_score,
+        "linguistic_score": result.linguistic_score,
+        "smoothed_score": result.smoothed_score,
+        "severity": result.severity,
+    })
+
+
+def _consume_acoustic_only_strange_noise(
+    acoustic_worker: Any,
+    classifier: BehaviourClassifier,
+) -> None:
+    acoustic = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    if acoustic is None:
+        return
+
+    score = acoustic.non_speech_vocalization_score
+    if score < config.BEHAVIOUR_STRANGE_NOISE_THRESHOLD:
+        return
+
+    now = time.time()
+    last_ts = float(st.session_state.get("last_acoustic_strange_noise_ts", 0.0) or 0.0)
+    if now - last_ts < 2.0:
+        return
+
+    severity = "Moderate" if score >= 0.80 else "Mild"
+    result = FusedResult(
+        acoustic_score=round(score, 4),
+        linguistic_score=0.0,
+        raw_final_score=round(score, 4),
+        smoothed_score=round(score, 4),
+        severity=severity,
+        reliability=0.85,
+        utterance=None,
+        acoustic_features=acoustic,
+        linguistic_features=LinguisticFeatures(),
+        acoustic_contributions={
+            "non_speech_vocalization": round(score, 4),
+            "rms": round(acoustic.rms_mean, 4),
+            "peak": round(acoustic.rms_max, 4),
+        },
+        linguistic_contributions={},
+    )
+    result = classifier.classify(result)
+    if "Making strange noises" not in result.behaviours:
+        return
+
+    logger.info(
+        "BEHAVIOUR_TRACE acoustic_only_strange_noise score=%.3f label=%s evidence=%s labels=%s severity=%s",
+        score,
+        acoustic.non_speech_vocalization_label,
+        acoustic.non_speech_vocalization_evidence,
+        result.behaviours,
+        result.severity,
+    )
+    st.session_state.last_acoustic_strange_noise_ts = now
     st.session_state.latest_result = result
     for event in result.behaviour_events:
         st.session_state.behaviour_log.append(_event_to_record(event, result))

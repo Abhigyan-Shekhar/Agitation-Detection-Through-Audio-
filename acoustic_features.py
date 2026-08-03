@@ -39,6 +39,7 @@ except ImportError:
     torch = None  # type: ignore[assignment]
 
 import config
+from acoustic_vocalization_detector import detect_acoustic_vocalization
 from audio_pipeline import TimestampedFrame
 from event_models import AcousticFeatureWindow
 
@@ -207,6 +208,8 @@ class AcousticExtractor:
         except Exception:  # noqa: BLE001
             hnr = 0.0
 
+        vocalization = detect_acoustic_vocalization(audio, self._sr)
+
         # --- Voice activity mask ---
         voiced_records = [r for r in records if r.is_speech]
         voiced_ratio = _safe(len(voiced_records) / max(len(records), 1))
@@ -250,6 +253,9 @@ class AcousticExtractor:
             spectral_centroid=spectral_centroid,
             spectral_rolloff=spectral_rolloff,
             harmonic_to_noise_ratio=hnr,
+            non_speech_vocalization_score=vocalization.score,
+            non_speech_vocalization_label=vocalization.label,
+            non_speech_vocalization_evidence=vocalization.evidence or None,
             voiced_ratio=voiced_ratio,
             pause_ratio=pause_ratio,
             clipping_ratio=clipping_ratio,
@@ -401,6 +407,13 @@ class AcousticWorker:
         end_time: float,
     ) -> AcousticFeatureWindow:
         """Compute element-wise mean across a list of feature windows."""
-        fields = [f for f in AcousticFeatureWindow.__dataclass_fields__ if f not in ("start_time", "end_time")]
+        text_fields = {"non_speech_vocalization_label", "non_speech_vocalization_evidence"}
+        fields = [
+            f for f in AcousticFeatureWindow.__dataclass_fields__
+            if f not in ("start_time", "end_time") and f not in text_fields
+        ]
         averaged = {f: float(np.mean([getattr(w, f) for w in windows])) for f in fields}
+        strongest = max(windows, key=lambda w: w.non_speech_vocalization_score)
+        averaged["non_speech_vocalization_label"] = strongest.non_speech_vocalization_label
+        averaged["non_speech_vocalization_evidence"] = strongest.non_speech_vocalization_evidence
         return AcousticFeatureWindow(start_time=start_time, end_time=end_time, **averaged)

@@ -94,7 +94,7 @@ def test_unusual_vocalization_maps_to_strange_noises():
 
 
 def test_source_examples_map_to_strange_noises():
-    for raw_behaviour in ("weird laughter", "crying"):
+    for raw_behaviour in ("weird laughter", "crying", "throat clearing", "teeth chattering", "lip smacking"):
         mapped = map_observed_behaviour(raw_behaviour)
         assert mapped.internal_code == "AUDIO_STRANGE_NOISE"
         assert mapped.canonical_label == "Making strange noises"

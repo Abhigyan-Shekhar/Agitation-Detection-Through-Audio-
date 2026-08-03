@@ -135,6 +135,8 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "unusual vocalisation",
             "non speech vocalization",
             "non speech vocalisation",
+            "nonverbal vocalization",
+            "nonverbal vocalisation",
             "grunting",
             "groaning",
             "moaning",
@@ -144,6 +146,20 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "crying",
             "sobbing",
             "weeping",
+            "sighing",
+            "panting",
+            "yawning",
+            "throat clearing",
+            "coughing",
+            "sneezing",
+            "sniffing",
+            "breathing",
+            "teeth chattering",
+            "teeth grinding",
+            "tongue clicking",
+            "nose blowing",
+            "lip popping",
+            "lip smacking",
         ),
     ),
     BehaviourTaxonomyEntry(
@@ -273,7 +289,32 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
     if entry.internal_code == "AUDIO_STRANGE_NOISE":
         has_noise = _contains_any(normalized, ("noise", "noises"))
         has_strange = _contains_any(normalized, ("strange", "weird"))
-        has_vocal = _contains_any(normalized, ("groan", "grunt", "moan", "laugh", "cry", "sob", "weep"))
+        has_vocal = _contains_any(
+            normalized,
+            (
+                "groan",
+                "grunt",
+                "moan",
+                "laugh",
+                "cry",
+                "sob",
+                "weep",
+                "sigh",
+                "pant",
+                "yawn",
+                "throat clearing",
+                "cough",
+                "sneeze",
+                "sniff",
+                "breathing",
+                "teeth chattering",
+                "teeth grinding",
+                "tongue clicking",
+                "nose blowing",
+                "lip popping",
+                "lip smacking",
+            ),
+        )
         return (has_noise and has_strange) or has_vocal
 
     if entry.internal_code == "AUDIO_COMPLAINING":

@@ -206,6 +206,7 @@ class ScoreFusion:
             + w["threat_score"] * linguistic.threat_score
             + w["profanity_score"] * linguistic.profanity_score
             + w["sexual_advance_score"] * linguistic.sexual_advance_score
+            + w["strange_noise_score"] * linguistic.strange_noise_score
         )
         score = _clamp(raw)
 
@@ -217,6 +218,7 @@ class ScoreFusion:
             "threat_language": round(w["threat_score"] * linguistic.threat_score, 4),
             "profanity": round(w["profanity_score"] * linguistic.profanity_score, 4),
             "sexual_advance": round(w["sexual_advance_score"] * linguistic.sexual_advance_score, 4),
+            "strange_noise": round(w["strange_noise_score"] * linguistic.strange_noise_score, 4),
         }
         return score, contributions
 

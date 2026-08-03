@@ -199,7 +199,7 @@ class TestLinguisticAnalyzer:
             "repetition_score", "question_repetition_score",
             "negative_sentiment", "urgency_score", "threat_score",
             "profanity_score", "imperative_score", "yelling_score",
-            "sexual_advance_score", "complaint_score",
+            "sexual_advance_score", "complaint_score", "strange_noise_score",
         ]:
             val = getattr(feats, attr)
             assert 0.0 <= val <= 1.0, f"{attr}={val} out of bounds"
@@ -333,3 +333,31 @@ class TestComplaintDetection:
     def test_complaint_negative_and_boundary_examples(self, phrase):
         feats = self.analyzer.analyze(_make_utterance(phrase))
         assert feats.complaint_score == pytest.approx(0.0, abs=0.01)
+
+
+class TestStrangeNoiseDetection:
+    def setup_method(self):
+        self.analyzer = LinguisticAnalyzer()
+
+    @pytest.mark.parametrize("phrase,expected_label", [
+        ("[moaning]", "moaning"),
+        ("Patient is groaning and sighing.", "groaning"),
+        ("[throat clearing]", "throat clearing"),
+        ("teeth chattering", "teeth chattering"),
+        ("lip smacking", "lip smacking"),
+        ("non-speech human vocalization", "non-speech human vocalization"),
+    ])
+    def test_dataset_labels_score_as_strange_noise(self, phrase, expected_label):
+        feats = self.analyzer.analyze(_make_utterance(phrase))
+        assert feats.strange_noise_score >= 0.60
+        assert expected_label in feats.evidence["strange_noise"]["matched_labels"]
+        assert feats.evidence["strange_noise"]["source_datasets"]
+
+    @pytest.mark.parametrize("phrase", [
+        "The OpenSLR dataset includes coughing and laughing labels.",
+        "The CMAI category is making strange noises.",
+        "The dataset contains throat clearing as a class.",
+    ])
+    def test_documentation_text_does_not_trigger_strange_noise(self, phrase):
+        feats = self.analyzer.analyze(_make_utterance(phrase))
+        assert feats.strange_noise_score == pytest.approx(0.0, abs=0.01)
