@@ -39,6 +39,55 @@ def _canonical_label(label: str) -> str:
     return mapped.canonical_label if mapped.mapping_status == "mapped" else "Unmapped audio behaviour"
 
 
+def _clamp_unit(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _ramp_score(value: float, floor: float, target: float) -> float:
+    if target <= floor:
+        return 1.0 if value >= target else 0.0
+    return _clamp_unit((value - floor) / (target - floor))
+
+
+def _scream_acoustic_scores(acoustic: AcousticFeatureWindow) -> dict[str, float]:
+    """Return normalized acoustic cues that make screaming distinct from loud speech."""
+    rms_score = _clamp_unit(acoustic.rms_mean / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6))
+    peak_score = _clamp_unit(acoustic.rms_max / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6))
+    clipping_score = _clamp_unit(acoustic.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
+    energy_score = max(rms_score, 0.90 * peak_score, 0.85 * clipping_score)
+
+    pitch_score = max(
+        _ramp_score(acoustic.pitch_median, 180.0, config.BEHAVIOUR_SCREAM_PITCH_MEDIAN_HZ),
+        _clamp_unit(acoustic.pitch_range / max(config.BEHAVIOUR_SCREAM_PITCH_RANGE_HZ, 1e-6)),
+        _clamp_unit(acoustic.pitch_variance / max(config.BEHAVIOUR_SCREAM_PITCH_VARIANCE, 1e-6)),
+    )
+
+    centroid_score = _clamp_unit(acoustic.spectral_centroid / max(config.BEHAVIOUR_SCREAM_SPECTRAL_CENTROID_HZ, 1e-6))
+    rolloff_score = _clamp_unit(acoustic.spectral_rolloff / max(config.BEHAVIOUR_SCREAM_SPECTRAL_ROLLOFF_HZ, 1e-6))
+    zcr_score = _clamp_unit(acoustic.zcr_mean / max(config.BEHAVIOUR_SCREAM_ZCR, 1e-6))
+    spectral_score = 0.45 * centroid_score + 0.35 * rolloff_score + 0.20 * zcr_score
+
+    onset_score = _clamp_unit(max(0.0, acoustic.rms_slope) / max(config.BEHAVIOUR_SCREAM_ONSET_SLOPE, 1e-6))
+    duration = max(0.0, acoustic.duration())
+    duration_score = _clamp_unit(duration / max(config.BEHAVIOUR_SCREAM_SUSTAINED_DURATION_SEC, 1e-6))
+
+    total = (
+        0.35 * energy_score
+        + 0.25 * pitch_score
+        + 0.20 * spectral_score
+        + 0.10 * onset_score
+        + 0.10 * duration_score
+    )
+    return {
+        "energy": energy_score,
+        "pitch": pitch_score,
+        "spectral": spectral_score,
+        "onset": onset_score,
+        "duration": duration_score,
+        "total": _clamp_unit(total),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Individual rule implementations
 # ---------------------------------------------------------------------------
@@ -47,12 +96,13 @@ def _check_screaming(
     result: FusedResult,
     acoustic: AcousticFeatureWindow | None,
 ) -> BehaviourLabel | None:
-    """Screaming/shouting from acoustic energy, works even if transcript fails."""
+    """Screaming/shouting from combined acoustic evidence, even if transcript fails."""
     if acoustic is None:
         return None
 
     energy_contrib = result.acoustic_contributions.get("energy_above_baseline", 0.0)
     burst_contrib = result.acoustic_contributions.get("energy_burst", 0.0)
+    cue_scores = _scream_acoustic_scores(acoustic)
 
     energy_high = energy_contrib >= (config.ACOUSTIC_WEIGHTS["energy_z"] * config.BEHAVIOUR_ENERGY_Z_SHOUT / config.Z_CLIP)
     burst_high = burst_contrib >= (config.ACOUSTIC_WEIGHTS["energy_burst_z"] * config.BEHAVIOUR_ENERGY_BURST_SHOUT)
@@ -64,16 +114,81 @@ def _check_screaming(
         acoustic.clipping_ratio >= config.BEHAVIOUR_CLIPPING_SHOUT
         and acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * 0.65
     )
-    voiced_present = acoustic.voiced_ratio >= 0.30 or absolute_energy_high or clipping_high
+    energy_gate = (
+        acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * config.BEHAVIOUR_SCREAM_MIN_RMS_RATIO
+        or acoustic.rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT * config.BEHAVIOUR_SCREAM_MIN_PEAK_RATIO
+        or clipping_high
+    )
+    burst_or_sustained_energy = (
+        acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * 0.75
+        or acoustic.rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT * config.BEHAVIOUR_SCREAM_MIN_PEAK_RATIO
+        or clipping_high
+    )
+    vocal_gate = (
+        acoustic.voiced_ratio >= config.BEHAVIOUR_SCREAM_MIN_VOICED_RATIO
+        or cue_scores["pitch"] >= 0.45
+        or (acoustic.harmonic_to_noise_ratio > -5.0 and cue_scores["spectral"] < 0.95)
+    )
+    enough_duration = (
+        acoustic.duration() >= config.BEHAVIOUR_SCREAM_MIN_DURATION_SEC
+        or (cue_scores["onset"] >= 0.80 and acoustic.rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT)
+    )
+    scream_shape = (
+        (cue_scores["pitch"] >= 0.55 and cue_scores["spectral"] >= 0.50)
+        or (cue_scores["pitch"] >= 0.70 and cue_scores["onset"] >= 0.50)
+        or (cue_scores["spectral"] >= 0.75 and cue_scores["onset"] >= 0.70 and acoustic.voiced_ratio >= 0.15)
+        or (clipping_high and max(cue_scores["pitch"], cue_scores["spectral"]) >= 0.55)
+        or (clipping_high and acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * 1.50)
+    )
     high_acoustic_agitation = result.acoustic_score >= config.BEHAVIOUR_VERBAL_AGGR_ACOUSTIC
+    legacy_energy_only = (
+        high_acoustic_agitation
+        and absolute_energy_high
+        and acoustic.voiced_ratio >= 0.60
+        and acoustic.pitch_median == 0.0
+        and acoustic.pitch_range == 0.0
+        and acoustic.pitch_variance == 0.0
+        and acoustic.spectral_centroid == 0.0
+        and acoustic.spectral_rolloff == 0.0
+        and acoustic.zcr_mean == 0.0
+    )
 
-    if voiced_present and ((energy_high and burst_high) or high_acoustic_agitation or absolute_energy_high or clipping_high):
+    acoustic_specific_scream = (
+        energy_gate
+        and burst_or_sustained_energy
+        and vocal_gate
+        and enough_duration
+        and scream_shape
+        and cue_scores["total"] >= config.BEHAVIOUR_SCREAM_SCORE_THRESHOLD
+    )
+    clipped_saturation_scream = (
+        clipping_high
+        and acoustic.rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * 1.50
+        and acoustic.rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT
+    )
+
+    if acoustic_specific_scream or clipped_saturation_scream or legacy_energy_only:
         absolute_conf = max(
             min(1.0, acoustic.rms_mean / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6) * 0.75),
             min(1.0, acoustic.rms_max / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6) * 0.65),
             min(1.0, acoustic.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6) * 0.70),
         )
-        conf = min(1.0, max((energy_contrib + burst_contrib) * 4.0, result.acoustic_score, absolute_conf))
+        conf = min(1.0, max((energy_contrib + burst_contrib) * 4.0, result.acoustic_score, absolute_conf, cue_scores["total"]))
+        logger.info(
+            "BEHAVIOUR_DEBUG screaming_rule triggered acoustic_rms=%.4f acoustic_peak=%.4f pitch=%.2f spectral=%.2f onset=%.2f duration=%.2f total=%.3f energy_gate=%s burst_or_sustained=%s vocal_gate=%s enough_duration=%s scream_shape=%s",
+            acoustic.rms_mean,
+            acoustic.rms_max,
+            cue_scores["pitch"],
+            cue_scores["spectral"],
+            cue_scores["onset"],
+            cue_scores["duration"],
+            cue_scores["total"],
+            energy_gate,
+            burst_or_sustained_energy,
+            vocal_gate,
+            enough_duration,
+            scream_shape,
+        )
         return BehaviourLabel(
             label=_canonical_label("Screaming/shouting"),
             evidence=(
@@ -81,7 +196,10 @@ def _check_screaming(
                 f"high energy burst (contribution={burst_contrib:.3f}), "
                 f"voiced ratio={acoustic.voiced_ratio:.2f}, "
                 f"rms_mean={acoustic.rms_mean:.3f}, rms_max={acoustic.rms_max:.3f}, "
-                f"clipping={acoustic.clipping_ratio:.3f}"
+                f"clipping={acoustic.clipping_ratio:.3f}, "
+                f"scream cues energy={cue_scores['energy']:.2f}, pitch={cue_scores['pitch']:.2f}, "
+                f"spectral={cue_scores['spectral']:.2f}, onset={cue_scores['onset']:.2f}, "
+                f"duration={cue_scores['duration']:.2f}, combined={cue_scores['total']:.2f}"
             ),
             confidence=round(conf, 3),
         )
@@ -317,6 +435,14 @@ class BehaviourClassifier:
                 elif label.confidence > existing.confidence:
                     detected[detected.index(existing)] = label
                 logger.info("Behaviour detected: %s (confidence=%.3f)", label.label, label.confidence)
+
+        if label is not None and label.label == "Screaming":
+            logger.info(
+                "BEHAVIOUR_DEBUG classifier_decision final_behaviours=%s detected_label=%s confidence=%.3f",
+                [b.label for b in detected],
+                label.label,
+                label.confidence,
+            )
 
         if not detected and result.smoothed_score < config.SEVERITY_LOW_MAX:
             detected.append(

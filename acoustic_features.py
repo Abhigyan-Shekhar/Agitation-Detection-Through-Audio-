@@ -169,6 +169,25 @@ class AcousticExtractor:
     def __init__(self, sample_rate: int = config.SAMPLE_RATE) -> None:
         self._sr = sample_rate
 
+    def _pitch_features(self, audio: np.ndarray) -> tuple[float, float, float]:
+        try:
+            f0, voiced_flag, _ = librosa.pyin(
+                audio,
+                fmin=librosa.note_to_hz("C2"),
+                fmax=librosa.note_to_hz("C7"),
+                sr=self._sr,
+            )
+            f0_voiced = f0[voiced_flag & np.isfinite(f0)]
+            if f0_voiced.size >= 2:
+                return (
+                    _safe(float(np.median(f0_voiced))),
+                    _safe(float(np.ptp(f0_voiced))),
+                    _safe(float(np.var(f0_voiced))),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return 0.0, 0.0, 0.0
+
     def extract(self, records: list[_AudioRecord], window_start: float, window_end: float) -> AcousticFeatureWindow:
         if not records:
             return AcousticFeatureWindow(start_time=window_start, end_time=window_end)
@@ -215,25 +234,17 @@ class AcousticExtractor:
         # --- Clipping ratio ---
         clipping_ratio = _safe(float(np.mean(np.abs(audio) >= 0.99)))
 
-        # --- Pitch (voiced frames only) ---
+        # --- Pitch ---
         if voiced_records:
             voiced_audio = np.concatenate([r.data for r in voiced_records]).astype(np.float32)
-            try:
-                f0, voiced_flag, _ = librosa.pyin(
-                    voiced_audio,
-                    fmin=librosa.note_to_hz("C2"),
-                    fmax=librosa.note_to_hz("C7"),
-                    sr=self._sr,
-                )
-                f0_voiced = f0[voiced_flag & np.isfinite(f0)]
-                if f0_voiced.size >= 2:
-                    pitch_median = _safe(float(np.median(f0_voiced)))
-                    pitch_range = _safe(float(np.ptp(f0_voiced)))   # max - min
-                    pitch_variance = _safe(float(np.var(f0_voiced)))
-                else:
-                    pitch_median = pitch_range = pitch_variance = 0.0
-            except Exception:  # noqa: BLE001
-                pitch_median = pitch_range = pitch_variance = 0.0
+            pitch_median, pitch_range, pitch_variance = self._pitch_features(voiced_audio)
+        elif (
+            rms_mean >= config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT * config.BEHAVIOUR_SCREAM_MIN_RMS_RATIO
+            or rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT * config.BEHAVIOUR_SCREAM_MIN_PEAK_RATIO
+        ):
+            # Scream-like vocalisations are sometimes rejected by speech VAD.
+            # Preserve their F0 evidence by estimating pitch on the full high-energy window.
+            pitch_median, pitch_range, pitch_variance = self._pitch_features(audio)
         else:
             pitch_median = pitch_range = pitch_variance = 0.0
 
@@ -401,6 +412,23 @@ class AcousticWorker:
         end_time: float,
     ) -> AcousticFeatureWindow:
         """Compute element-wise mean across a list of feature windows."""
+        peak_fields = {
+            "rms_max",
+            "rms_slope",
+            "pitch_median",
+            "pitch_range",
+            "pitch_variance",
+            "zcr_mean",
+            "spectral_centroid",
+            "spectral_rolloff",
+            "clipping_ratio",
+        }
         fields = [f for f in AcousticFeatureWindow.__dataclass_fields__ if f not in ("start_time", "end_time")]
-        averaged = {f: float(np.mean([getattr(w, f) for w in windows])) for f in fields}
+        averaged = {}
+        for field in fields:
+            values = [getattr(w, field) for w in windows]
+            if field in peak_fields:
+                averaged[field] = float(np.max(values))
+            else:
+                averaged[field] = float(np.mean(values))
         return AcousticFeatureWindow(start_time=start_time, end_time=end_time, **averaged)

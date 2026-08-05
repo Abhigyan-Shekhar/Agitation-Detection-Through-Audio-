@@ -69,6 +69,28 @@ class TestBehaviourClassifier:
     def _classify(self, result: FusedResult) -> list[str]:
         return self.clf.classify(result).behaviours
 
+    def _scream_like_acoustic(self, **kwargs) -> AcousticFeatureWindow:
+        now = time.time()
+        defaults = dict(
+            start_time=now - 2.0,
+            end_time=now,
+            rms_mean=0.23,
+            rms_max=0.82,
+            rms_slope=0.003,
+            pitch_median=430.0,
+            pitch_range=260.0,
+            pitch_variance=9000.0,
+            zcr_mean=0.12,
+            spectral_centroid=3800.0,
+            spectral_rolloff=6500.0,
+            harmonic_to_noise_ratio=1.0,
+            voiced_ratio=0.45,
+            pause_ratio=0.55,
+            clipping_ratio=0.0,
+        )
+        defaults.update(kwargs)
+        return AcousticFeatureWindow(**defaults)
+
     # ---- No agitation -------------------------------------------------
 
     def test_calm_produces_no_agitation_label(self):
@@ -194,6 +216,163 @@ class TestBehaviourClassifier:
         )
         labels = self._classify(result)
         assert "Screaming" not in labels
+
+    def test_obvious_acoustic_screaming_detected_without_transcript_keywords(self):
+        result = _make_result(
+            acoustic_score=0.30,
+            smoothed_score=0.30,
+            acoustic=self._scream_like_acoustic(),
+            linguistic=LinguisticFeatures(),
+            utterance_text="ah",
+        )
+        labels = self._classify(result)
+        assert "Screaming" in labels
+        assert "No audio agitation detected" not in labels
+
+    def test_repeated_scream_bursts_detected_from_peak_and_pitch_variability(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.14,
+            rms_max=0.88,
+            rms_slope=0.004,
+            pitch_median=360.0,
+            pitch_range=340.0,
+            pitch_variance=14000.0,
+            voiced_ratio=0.35,
+        )
+        result = _make_result(
+            acoustic_score=0.40,
+            smoothed_score=0.35,
+            acoustic=acoustic,
+            linguistic=LinguisticFeatures(),
+        )
+        assert "Screaming" in self._classify(result)
+
+    def test_short_scream_event_detected_when_onset_and_peak_are_strong(self):
+        now = time.time()
+        acoustic = self._scream_like_acoustic(
+            start_time=now - 0.18,
+            end_time=now,
+            rms_mean=0.12,
+            rms_max=0.92,
+            rms_slope=0.006,
+            pitch_median=520.0,
+            spectral_centroid=4300.0,
+            spectral_rolloff=7200.0,
+        )
+        result = _make_result(acoustic_score=0.35, smoothed_score=0.25, acoustic=acoustic)
+        assert "Screaming" in self._classify(result)
+
+    def test_prolonged_screaming_detected_without_abrupt_onset(self):
+        acoustic = self._scream_like_acoustic(
+            start_time=time.time() - 3.0,
+            end_time=time.time(),
+            rms_mean=0.21,
+            rms_max=0.70,
+            rms_slope=0.0001,
+            pitch_median=390.0,
+            pitch_range=220.0,
+        )
+        result = _make_result(acoustic_score=0.35, smoothed_score=0.35, acoustic=acoustic)
+        assert "Screaming" in self._classify(result)
+
+    def test_loud_talking_does_not_trigger_screaming(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.24,
+            rms_max=0.74,
+            rms_slope=0.0002,
+            pitch_median=170.0,
+            pitch_range=45.0,
+            pitch_variance=250.0,
+            zcr_mean=0.04,
+            spectral_centroid=1700.0,
+            spectral_rolloff=3100.0,
+            voiced_ratio=0.92,
+        )
+        result = _make_result(acoustic_score=0.82, smoothed_score=0.75, acoustic=acoustic)
+        assert "Screaming" not in self._classify(result)
+
+    def test_laughter_does_not_trigger_screaming(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.16,
+            rms_max=0.72,
+            rms_slope=0.001,
+            pitch_median=210.0,
+            pitch_range=80.0,
+            pitch_variance=900.0,
+            zcr_mean=0.11,
+            spectral_centroid=2600.0,
+            spectral_rolloff=5200.0,
+            harmonic_to_noise_ratio=-8.0,
+            voiced_ratio=0.30,
+        )
+        result = _make_result(acoustic_score=0.65, smoothed_score=0.55, acoustic=acoustic)
+        assert "Screaming" not in self._classify(result)
+
+    def test_crying_like_vocalization_does_not_trigger_screaming(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.10,
+            rms_max=0.38,
+            rms_slope=0.0004,
+            pitch_median=280.0,
+            pitch_range=120.0,
+            pitch_variance=1500.0,
+            zcr_mean=0.04,
+            spectral_centroid=1600.0,
+            spectral_rolloff=3000.0,
+            voiced_ratio=0.55,
+        )
+        result = _make_result(acoustic_score=0.50, smoothed_score=0.45, acoustic=acoustic)
+        assert "Screaming" not in self._classify(result)
+
+    def test_caregiver_shouting_style_low_pitch_loud_speech_is_not_screaming(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.26,
+            rms_max=0.82,
+            rms_slope=0.0005,
+            pitch_median=155.0,
+            pitch_range=60.0,
+            pitch_variance=500.0,
+            zcr_mean=0.05,
+            spectral_centroid=1900.0,
+            spectral_rolloff=3600.0,
+            voiced_ratio=0.90,
+        )
+        result = _make_result(acoustic_score=0.86, smoothed_score=0.80, acoustic=acoustic)
+        assert "Screaming" not in self._classify(result)
+
+    def test_television_noise_does_not_trigger_screaming(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.19,
+            rms_max=0.76,
+            rms_slope=0.0015,
+            pitch_median=0.0,
+            pitch_range=0.0,
+            pitch_variance=0.0,
+            zcr_mean=0.13,
+            spectral_centroid=3600.0,
+            spectral_rolloff=7200.0,
+            harmonic_to_noise_ratio=-12.0,
+            voiced_ratio=0.05,
+        )
+        result = _make_result(acoustic_score=0.78, smoothed_score=0.70, acoustic=acoustic)
+        assert "Screaming" not in self._classify(result)
+
+    def test_background_environmental_sound_does_not_trigger_screaming(self):
+        acoustic = self._scream_like_acoustic(
+            rms_mean=0.12,
+            rms_max=0.58,
+            rms_slope=0.003,
+            pitch_median=0.0,
+            pitch_range=0.0,
+            pitch_variance=0.0,
+            zcr_mean=0.16,
+            spectral_centroid=5000.0,
+            spectral_rolloff=7800.0,
+            harmonic_to_noise_ratio=-15.0,
+            voiced_ratio=0.0,
+        )
+        result = _make_result(acoustic_score=0.70, smoothed_score=0.60, acoustic=acoustic)
+        assert "Screaming" not in self._classify(result)
 
     def test_verbal_sexual_advance_triggers_canonical_label(self):
         linguistic = LinguisticFeatures(sexual_advance_score=0.85)

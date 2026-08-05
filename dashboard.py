@@ -250,6 +250,8 @@ def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
     clipping_score = min(1.0, acoustic.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
     if clipping_score > 0 and energy_score >= 0.65:
         return max(energy_score, peak_score, clipping_score)
+    if acoustic.rms_max >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT and energy_score >= 0.25:
+        return max(0.75, peak_score, energy_score)
     if energy_score >= 1.0 and peak_score >= 1.0:
         return max(energy_score, peak_score)
     return 0.0
@@ -264,10 +266,12 @@ def _loudness_scream_score(loudness: LoudnessSnapshot | None) -> float:
     rms_score = min(1.0, loudness.rms / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6))
     peak_score = min(1.0, loudness.peak / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6))
     clipping_score = min(1.0, loudness.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
-    if rms_score >= 1.0 and peak_score >= 0.75:
-        return max(rms_score, peak_score)
     if clipping_score > 0 and rms_score >= 0.50:
         return max(rms_score, peak_score, clipping_score)
+    if loudness.peak >= config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT and rms_score >= 0.25:
+        return max(0.75, peak_score, rms_score)
+    if rms_score >= 1.0 and peak_score >= 0.75:
+        return max(rms_score, peak_score)
     return 0.0
 
 
@@ -280,6 +284,18 @@ def _consume_acoustic_only_screaming(
     loudness_score = _loudness_scream_score(loudness)
     acoustic_score = _acoustic_scream_score(acoustic)
     scream_score = max(loudness_score, acoustic_score)
+    logger.info(
+        "BEHAVIOUR_DEBUG dashboard_scream_input loudness_rms=%.4f loudness_peak=%.4f loudness_clipping=%.4f acoustic_rms=%.4f acoustic_peak=%.4f acoustic_clipping=%.4f loudness_score=%.3f acoustic_score=%.3f combined_score=%.3f",
+        loudness.rms if loudness else 0.0,
+        loudness.peak if loudness else 0.0,
+        loudness.clipping_ratio if loudness else 0.0,
+        acoustic.rms_mean if acoustic else 0.0,
+        acoustic.rms_max if acoustic else 0.0,
+        acoustic.clipping_ratio if acoustic else 0.0,
+        loudness_score,
+        acoustic_score,
+        scream_score,
+    )
     if scream_score < 0.65:
         return
 
@@ -318,9 +334,22 @@ def _consume_acoustic_only_screaming(
         linguistic_contributions={},
     )
     result = classifier.classify(result)
+    logger.info(
+        "BEHAVIOUR_DEBUG dashboard_classifier_result behaviours=%s severity=%s confidence=%.3f acoustic_features=%s",
+        result.behaviours,
+        result.severity,
+        result.reliability,
+        result.acoustic_features.to_dict() if result.acoustic_features is not None else None,
+    )
     if "Screaming" not in result.behaviours:
         return
 
+    logger.info(
+        "BEHAVIOUR_DEBUG dashboard_final_decision label=%s severity=%s behaviours=%s",
+        _displayed_behaviour_label(result),
+        result.severity,
+        result.behaviours,
+    )
     logger.info(
         "BEHAVIOUR_TRACE acoustic_only_screaming raw_rms=%.3f raw_peak=%.3f raw_clipping=%.3f window_rms=%.3f window_peak=%.3f window_clipping=%.3f labels=%s severity=%s",
         loudness.rms if loudness else 0.0,
@@ -609,10 +638,13 @@ def _render_logging_form() -> None:
 def _displayed_behaviour_label(result: FusedResult) -> str:
     """Return the label shown in the current-behaviour card and log UI selection."""
     event_labels = [event.canonical_label for event in result.behaviour_events]
-    candidate_labels = event_labels or [
-        label for label in result.behaviours if label != "No audio agitation detected"
-    ] or result.behaviours
-    displayed = candidate_labels[0] if candidate_labels else "No audio agitation detected"
+    if "Screaming" in result.behaviours:
+        displayed = "Screaming"
+    else:
+        candidate_labels = event_labels or [
+            label for label in result.behaviours if label != "No audio agitation detected"
+        ] or result.behaviours
+        displayed = candidate_labels[0] if candidate_labels else "No audio agitation detected"
     logger.info(
         "BEHAVIOUR_TRACE ui_display transcript=%r behaviours=%s event_labels=%s severity=%s displayed_behavior=%r",
         result.utterance.full_text if result.utterance else "",

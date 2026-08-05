@@ -5,7 +5,8 @@ import time
 import numpy as np
 import pytest
 
-from acoustic_features import AcousticExtractor, _safe, _AudioRecord
+from acoustic_features import AcousticExtractor, AcousticWorker, _safe, _AudioRecord
+from event_models import AcousticFeatureWindow
 
 
 def _make_record(
@@ -74,6 +75,23 @@ class TestAcousticExtractor:
         w = self.extractor.extract(records, 0.0, 2.0)
         assert w.voiced_ratio == pytest.approx(0.0)
 
+    def test_high_energy_vocalization_keeps_pitch_when_vad_rejects_speech(self):
+        records = [
+            _make_record(freq=620.0, duration=0.1, is_speech=False)
+            for _ in range(20)
+        ]
+        records = [
+            _AudioRecord(
+                data=(record.data * 4.0).astype(np.float32),
+                timestamp=record.timestamp,
+                is_speech=False,
+            )
+            for record in records
+        ]
+        w = self.extractor.extract(records, 0.0, 2.0)
+        assert w.voiced_ratio == pytest.approx(0.0)
+        assert w.pitch_median > 400.0
+
     def test_pause_ratio_complement(self):
         records = [
             _make_record(is_speech=i % 2 == 0) for i in range(10)
@@ -97,3 +115,40 @@ class TestAcousticExtractor:
         ]:
             val = getattr(w, field_name)
             assert np.isfinite(val), f"{field_name}={val} is not finite"
+
+    def test_utterance_aggregation_preserves_transient_scream_evidence(self):
+        calm = AcousticFeatureWindow(
+            start_time=0.0,
+            end_time=2.0,
+            rms_mean=0.03,
+            rms_max=0.08,
+            pitch_median=140.0,
+            pitch_range=20.0,
+            pitch_variance=100.0,
+            zcr_mean=0.03,
+            spectral_centroid=1200.0,
+            spectral_rolloff=2600.0,
+            voiced_ratio=0.8,
+            pause_ratio=0.2,
+        )
+        burst = AcousticFeatureWindow(
+            start_time=2.0,
+            end_time=4.0,
+            rms_mean=0.16,
+            rms_max=0.92,
+            rms_slope=0.004,
+            pitch_median=520.0,
+            pitch_range=300.0,
+            pitch_variance=12000.0,
+            zcr_mean=0.13,
+            spectral_centroid=4200.0,
+            spectral_rolloff=7200.0,
+            voiced_ratio=0.3,
+            pause_ratio=0.7,
+            clipping_ratio=0.01,
+        )
+        aggregate = AcousticWorker._average_windows([calm, burst], 0.0, 4.0)
+        assert aggregate.rms_mean == pytest.approx(0.095)
+        assert aggregate.rms_max == pytest.approx(0.92)
+        assert aggregate.pitch_range == pytest.approx(300.0)
+        assert aggregate.spectral_centroid == pytest.approx(4200.0)

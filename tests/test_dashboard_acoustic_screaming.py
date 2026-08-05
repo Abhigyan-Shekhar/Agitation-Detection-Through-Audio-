@@ -18,6 +18,18 @@ def test_recent_loudness_snapshot_triggers_scream_score():
     assert _loudness_scream_score(loudness) >= 0.65
 
 
+def test_moderate_loudness_snapshot_with_strong_peak_triggers_scream_score():
+    loudness = LoudnessSnapshot(
+        timestamp=time.time(),
+        rms=0.16,
+        peak=0.70,
+        clipping_ratio=0.0,
+        frame_index=1,
+    )
+
+    assert _loudness_scream_score(loudness) >= 0.65
+
+
 def test_stale_loudness_snapshot_is_ignored():
     loudness = LoudnessSnapshot(
         timestamp=time.time() - 2.0,
