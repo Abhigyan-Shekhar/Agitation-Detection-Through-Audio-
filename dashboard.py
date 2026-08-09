@@ -864,7 +864,13 @@ with st.sidebar:
                 bm.reset_calibration()
         elif bm.is_calibrating:
             progress = bm.calibration_progress
-            st.progress(progress, text=f"Calibrating… {int(progress * 100)}%")
+            st.progress(
+                progress,
+                text=(
+                    f"Calibrating… {int(progress * 100)}% "
+                    f"({bm.calibration_window_count}/{bm.minimum_windows_for_personal} windows)"
+                ),
+            )
             if st.button("Stop calibration"):
                 ok = bm.stop_calibration()
                 st.session_state.calibrating = False
@@ -903,7 +909,15 @@ with st.sidebar:
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)
         if bm:
+            st.write("Baseline manager id:", id(bm))
+            st.write("Calibration active:", bm.is_calibrating)
+            st.write("Calibration windows:", bm.calibration_window_count)
+            st.write("Calibration min windows:", bm.minimum_windows_for_personal)
+            st.write("Calibration progress:", round(bm.calibration_progress * 100.0, 1))
             st.write("Rolling baseline windows:", len(bm._rolling))
+            if manager:
+                st.write("Manager baseline id:", id(manager._baseline_manager))
+                st.write("Manager uses session baseline:", manager._baseline_manager is bm)
 
 # ---- Error banner --------------------------------------------------------
 if st.session_state.error:

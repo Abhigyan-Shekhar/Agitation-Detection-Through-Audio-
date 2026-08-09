@@ -8,15 +8,13 @@ from __future__ import annotations
 
 import logging
 import queue
-import threading
-import time
 from typing import Any
 
 import config
 from acoustic_features import AcousticWorker
 from audio_pipeline import AudioPipeline
 from baseline_manager import BaselineManager
-from event_models import CommittedLine, Utterance
+from event_models import AcousticFeatureWindow, CommittedLine, Utterance
 from utterance_aggregator import UtteranceAggregator
 from transcriber import TranscriptionWorker
 
@@ -117,8 +115,8 @@ class DashboardManager:
         )
         self.acoustic_worker = AcousticWorker(
             acoustic_queue=self.pipeline.acoustic_queue,
+            on_window=self._handle_acoustic_window,
         )
-        self._patch_acoustic_worker_baseline_feed()
 
     def _start_workers(self) -> None:
         if self.utterance_aggregator is None or self.acoustic_worker is None or self.transcription_worker is None:
@@ -133,43 +131,20 @@ class DashboardManager:
         logger.info("Starting microphone")
         self.pipeline.start()
 
-    def _patch_acoustic_worker_baseline_feed(self) -> None:
-        """Preserve the existing dashboard baseline feed behavior."""
-        acoustic_worker = self.acoustic_worker
-        if acoustic_worker is None:
-            return
-
-        def _run_with_baseline_feed() -> None:
-            while not acoustic_worker._stop_event.is_set():
-                acoustic_worker._drain_queue()
-                now = time.time()
-                if now - acoustic_worker._last_extraction_time >= acoustic_worker._hop_sec:
-                    records = acoustic_worker._ring.latest_window(
-                        acoustic_worker._window_sec
-                    )
-                    if records:
-                        window_end = now
-                        window_start = window_end - acoustic_worker._window_sec
-                        extract_start = time.monotonic()
-                        feat = acoustic_worker._extractor.extract(
-                            records, window_start, window_end
-                        )
-                        logger.debug(
-                            "Acoustic feature extraction + baseline feed took %.2f ms",
-                            (time.monotonic() - extract_start) * 1000.0,
-                        )
-                        with acoustic_worker._lock:
-                            acoustic_worker._windows.append(feat)
-                        acoustic_worker._last_extraction_time = now
-                        acoustic_worker._windows_extracted += 1
-                        self._baseline_manager.feed(feat)
-                time.sleep(0.010)
-
-        acoustic_worker._thread = threading.Thread(
-            target=_run_with_baseline_feed,
-            name="acoustic-worker",
-            daemon=True,
-        )
+    def _handle_acoustic_window(self, feat: AcousticFeatureWindow) -> None:
+        """Feed extracted acoustic windows into the shared baseline manager."""
+        before = self._baseline_manager.calibration_window_count
+        was_calibrating = self._baseline_manager.is_calibrating
+        self._baseline_manager.feed(feat)
+        after = self._baseline_manager.calibration_window_count
+        if was_calibrating and after != before:
+            logger.info(
+                "Baseline calibration collected acoustic window %d/%d "
+                "(manager_id=%s)",
+                after,
+                self._baseline_manager.minimum_windows_for_personal,
+                id(self._baseline_manager),
+            )
 
     def _clear_runtime_queues(self) -> None:
         for q in (self._partial_queue, self._committed_queue, self._utterance_queue):
