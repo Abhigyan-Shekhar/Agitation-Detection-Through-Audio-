@@ -572,6 +572,106 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
     return filtered
 
 
+_BASELINE_DEBUG_FEATURES: tuple[str, ...] = (
+    "rms_mean",
+    "rms_max",
+    "rms_slope",
+    "pitch_median",
+    "pitch_range",
+    "pitch_variance",
+    "zcr_mean",
+    "spectral_centroid",
+    "voiced_ratio",
+    "pause_ratio",
+)
+
+
+def _render_acoustic_baseline_debug() -> None:
+    """Render live acoustic baseline diagnostics without changing scoring."""
+    st.subheader("Acoustic Baseline Debug")
+    manager = st.session_state.get("manager")
+    acoustic_worker = manager.acoustic_worker if manager is not None else None
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    fusion: ScoreFusion | None = st.session_state.score_fusion
+    latest = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    result: FusedResult | None = st.session_state.latest_result
+
+    if bm is None:
+        st.warning("Baseline manager is not initialised.")
+        return
+    if latest is None:
+        st.info("No acoustic feature window has been extracted yet.")
+        return
+
+    st.caption(
+        "Live diagnostics for the latest acoustic window. Values are read-only "
+        "and do not alter scoring, thresholds, or calibration."
+    )
+    status_cols = st.columns(4)
+    status_cols[0].metric("Personal baseline", "Active" if bm.has_personal_baseline else "Rolling fallback")
+    status_cols[1].metric("Calibration windows", bm.calibration_window_count)
+    status_cols[2].metric("Latest window age", f"{(time.time() - latest.end_time):.2f}s")
+    if acoustic_worker is not None:
+        status_cols[3].metric("Pending extractions", acoustic_worker.pending_extractions)
+
+    raw_rows = [
+        {"feature": feat, "raw": round(float(getattr(latest, feat, 0.0)), 6)}
+        for feat in _BASELINE_DEBUG_FEATURES
+    ]
+    st.markdown("**A. Raw acoustic features**")
+    st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
+
+    personal_stats = bm.personal_baseline_stats()
+    baseline_rows = []
+    for feat in _BASELINE_DEBUG_FEATURES:
+        mean, std = personal_stats.get(feat, (None, None))
+        baseline_rows.append({
+            "feature": feat,
+            "personal_mean": None if mean is None else round(float(mean), 6),
+            "personal_std": None if std is None else round(float(std), 6),
+        })
+    st.markdown("**B. Personal baseline**")
+    if personal_stats:
+        st.dataframe(pd.DataFrame(baseline_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No personal baseline is active yet; z-scores currently use the rolling fallback when enough rolling data exists.")
+
+    z_rows = [
+        {
+            "feature": feat,
+            "z_score": round(float(bm.z_score(feat, float(getattr(latest, feat, 0.0)))), 4),
+        }
+        for feat in _BASELINE_DEBUG_FEATURES
+    ]
+    st.markdown("**C. Z-scores from BaselineManager.z_score()**")
+    st.dataframe(pd.DataFrame(z_rows), hide_index=True, use_container_width=True)
+
+    debug_values = fusion.acoustic_debug_values(latest) if fusion is not None else {"score": 0.0, "z_scores": {}, "branch_values": {}}
+    branch_z = debug_values.get("z_scores", {})
+    branch_values = debug_values.get("branch_values", {})
+    st.markdown("**D. Acoustic branch values used by score_fusion.py**")
+    branch_rows = [
+        {"name": name, "value": value}
+        for name, value in {**branch_z, **branch_values}.items()
+    ]
+    st.dataframe(pd.DataFrame(branch_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**E. Final scores**")
+    score_cols = st.columns(5)
+    score_cols[0].metric("Latest acoustic branch", debug_values.get("score", 0.0))
+    if result is not None:
+        score_cols[1].metric("Result acoustic", result.acoustic_score)
+        score_cols[2].metric("Result linguistic", result.linguistic_score)
+        score_cols[3].metric("Fused agitation", result.smoothed_score)
+        score_cols[4].metric("Reliability", result.reliability)
+        st.caption(f"Severity: {result.severity}")
+    else:
+        score_cols[1].metric("Result acoustic", "N/A")
+        score_cols[2].metric("Result linguistic", "N/A")
+        score_cols[3].metric("Fused agitation", "N/A")
+        score_cols[4].metric("Reliability", "N/A")
+
+
 def _render_summary_cards(df: pd.DataFrame) -> None:
     today_df = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
     high_df = df[df["severity"].isin(["High", "Critical"])] if not df.empty else df
@@ -783,6 +883,8 @@ def _render() -> None:
             with st.expander("⏱️ Latency diagnostics", expanded=False):
                 latency = result.latency_trace.durations_ms()
                 st.json(latency if latency else {"status": "waiting for complete trace"})
+        with st.expander("Acoustic Baseline Debug", expanded=False):
+            _render_acoustic_baseline_debug()
 
         live_col, current_col = st.columns([1, 1])
         with live_col:
@@ -915,6 +1017,9 @@ with st.sidebar:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
             st.write("Last acoustic extraction (ms):", round(aw.last_extraction_ms, 2))
             st.write("Average acoustic extraction (ms):", round(aw.average_extraction_ms, 2))
+            st.write("Acoustic extractions scheduled:", aw.windows_scheduled)
+            st.write("Pending acoustic extractions:", aw.pending_extractions)
+            st.write("Skipped acoustic windows (backpressure):", aw.windows_skipped_backpressure)
             latest = aw.latest_window()
             if latest:
                 st.write("Latest acoustic window age (ms):", round((time.time() - latest.end_time) * 1000.0, 2))
