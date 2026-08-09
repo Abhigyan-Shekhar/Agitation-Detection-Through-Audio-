@@ -28,7 +28,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Deque
+from typing import Callable, Deque
 
 import librosa
 import numpy as np
@@ -290,6 +290,7 @@ class AcousticWorker:
         window_sec: float = config.ACOUSTIC_WINDOW_SEC,
         hop_sec: float = config.ACOUSTIC_HOP_SEC,
         ring_buffer_sec: float = config.AUDIO_RING_BUFFER_SEC,
+        on_window: Callable[[AcousticFeatureWindow], None] | None = None,
     ) -> None:
         self._queue = acoustic_queue
         self._window_sec = window_sec
@@ -298,6 +299,7 @@ class AcousticWorker:
         self._vad = SileroVAD()
         self._ring = AudioRingBuffer(max_seconds=ring_buffer_sec)
         self._extractor = AcousticExtractor()
+        self._on_window = on_window
 
         # Time-indexed window store (deque so old windows auto-expire)
         max_windows = int(ring_buffer_sec / hop_sec) + 2
@@ -380,12 +382,21 @@ class AcousticWorker:
                     feat = self._extractor.extract(records, window_start, window_end)
                     extract_ms = (time.monotonic() - extract_start) * 1000.0
                     logger.debug("Acoustic feature extraction window took %.2f ms", extract_ms)
-                    with self._lock:
-                        self._windows.append(feat)
-                    self._last_extraction_time = now
-                    self._windows_extracted += 1
+                    self._store_window(feat)
 
             time.sleep(0.010)   # ~10 ms yield
+
+    def _store_window(self, feat: AcousticFeatureWindow) -> None:
+        with self._lock:
+            self._windows.append(feat)
+        self._last_extraction_time = time.time()
+        self._windows_extracted += 1
+
+        if self._on_window is not None:
+            try:
+                self._on_window(feat)
+            except Exception:  # noqa: BLE001
+                logger.exception("Acoustic window callback failed")
 
     def _drain_queue(self) -> None:
         while True:
