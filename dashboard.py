@@ -121,6 +121,43 @@ def _pipeline_running() -> bool:
     return bool(manager and manager.is_running)
 
 
+@st.fragment(run_every=1.0)
+def _render_baseline_calibration_panel() -> None:
+    """Render auto-refreshing calibration controls and progress."""
+    st.subheader("📐 Baseline Calibration")
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    if bm is None:
+        st.warning("Baseline manager is not initialised yet.")
+        return
+
+    pipeline_running = _pipeline_running()
+    if bm.has_personal_baseline:
+        st.success(f"Personal baseline set ({bm._personal_n} windows)")
+        if st.button("Reset baseline"):
+            bm.reset_calibration()
+    elif bm.is_calibrating:
+        progress = bm.calibration_progress
+        st.progress(
+            progress,
+            text=(
+                f"Calibrating… {int(progress * 100)}% "
+                f"({bm.calibration_window_count}/{bm.minimum_windows_for_personal} windows)"
+            ),
+        )
+        if st.button("Stop calibration"):
+            ok = bm.stop_calibration()
+            st.session_state.calibrating = False
+            if ok:
+                st.success("Baseline saved!")
+            else:
+                st.warning("Not enough data — keep recording and try again")
+    else:
+        st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
+        if st.button("Start calibration", disabled=not pipeline_running):
+            bm.start_calibration()
+            st.session_state.calibrating = True
+
+
 def _start_pipeline() -> None:
     st.session_state.error = None
     st.session_state.partial_caption = ""
@@ -855,34 +892,8 @@ with st.sidebar:
     st.divider()
 
     # Baseline calibration
-    st.subheader("📐 Baseline Calibration")
     bm: BaselineManager | None = st.session_state.baseline_manager
-    if bm:
-        if bm.has_personal_baseline:
-            st.success(f"Personal baseline set ({bm._personal_n} windows)")
-            if st.button("Reset baseline"):
-                bm.reset_calibration()
-        elif bm.is_calibrating:
-            progress = bm.calibration_progress
-            st.progress(
-                progress,
-                text=(
-                    f"Calibrating… {int(progress * 100)}% "
-                    f"({bm.calibration_window_count}/{bm.minimum_windows_for_personal} windows)"
-                ),
-            )
-            if st.button("Stop calibration"):
-                ok = bm.stop_calibration()
-                st.session_state.calibrating = False
-                if ok:
-                    st.success("Baseline saved!")
-                else:
-                    st.warning("Not enough data — keep recording and try again")
-        else:
-            st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
-            if st.button("Start calibration", disabled=not pipeline_running):
-                bm.start_calibration()
-                st.session_state.calibrating = True
+    _render_baseline_calibration_panel()
 
     st.divider()
     st.session_state.dashboard_filters = _sidebar_filters(_records_dataframe())
@@ -902,6 +913,8 @@ with st.sidebar:
         aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
+            st.write("Last acoustic extraction (ms):", round(aw.last_extraction_ms, 2))
+            st.write("Average acoustic extraction (ms):", round(aw.average_extraction_ms, 2))
             latest = aw.latest_window()
             if latest:
                 st.write("Latest acoustic window age (ms):", round((time.time() - latest.end_time) * 1000.0, 2))

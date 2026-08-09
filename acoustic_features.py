@@ -310,6 +310,8 @@ class AcousticWorker:
         self._stop_event = threading.Event()
         self._last_extraction_time: float = 0.0
         self._windows_extracted: int = 0
+        self._last_extraction_ms: float = 0.0
+        self._total_extraction_ms: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -362,6 +364,16 @@ class AcousticWorker:
     def windows_extracted(self) -> int:
         return self._windows_extracted
 
+    @property
+    def last_extraction_ms(self) -> float:
+        return self._last_extraction_ms
+
+    @property
+    def average_extraction_ms(self) -> float:
+        if self._windows_extracted <= 0:
+            return 0.0
+        return self._total_extraction_ms / self._windows_extracted
+
     # ------------------------------------------------------------------
     # Internal loop
     # ------------------------------------------------------------------
@@ -382,15 +394,17 @@ class AcousticWorker:
                     feat = self._extractor.extract(records, window_start, window_end)
                     extract_ms = (time.monotonic() - extract_start) * 1000.0
                     logger.debug("Acoustic feature extraction window took %.2f ms", extract_ms)
-                    self._store_window(feat)
+                    self._store_window(feat, extract_ms)
 
             time.sleep(0.010)   # ~10 ms yield
 
-    def _store_window(self, feat: AcousticFeatureWindow) -> None:
+    def _store_window(self, feat: AcousticFeatureWindow, extract_ms: float) -> None:
         with self._lock:
             self._windows.append(feat)
         self._last_extraction_time = time.time()
         self._windows_extracted += 1
+        self._last_extraction_ms = extract_ms
+        self._total_extraction_ms += extract_ms
 
         if self._on_window is not None:
             try:
