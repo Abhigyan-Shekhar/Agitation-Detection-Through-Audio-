@@ -147,6 +147,10 @@ class BaselineManager:
             return len(self._calibration_samples)
 
     @property
+    def minimum_windows_for_personal(self) -> int:
+        return _MIN_WINDOWS_FOR_PERSONAL
+
+    @property
     def calibration_progress(self) -> float:
         """Returns 0.0 – 1.0 progress toward minimum required windows."""
         with self._lock:
@@ -162,6 +166,17 @@ class BaselineManager:
             self._rolling.append(window)
             if self._calibrating:
                 self._calibration_samples.append(window)
+                count = len(self._calibration_samples)
+            else:
+                count = 0
+        if count and (count == 1 or count % 10 == 0 or count >= _MIN_WINDOWS_FOR_PERSONAL):
+            logger.info(
+                "BaselineManager.feed collected calibration window %d/%d "
+                "(manager_id=%s)",
+                count,
+                _MIN_WINDOWS_FOR_PERSONAL,
+                id(self),
+            )
 
     # ------------------------------------------------------------------
     # Z-score API (called by score_fusion.py)
