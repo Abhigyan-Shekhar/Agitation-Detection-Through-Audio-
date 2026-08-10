@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Native WLK real-time speaker diarization. Current NeMo extra supports
+# Python 3.11-3.12 and is intended for a Linux/CUDA deployment profile.
+whisperlivekit[diarization-sortformer]>=0.2.23,<0.3; python_version >= "3.11" and python_version < "3.13" and sys_platform == "linux"

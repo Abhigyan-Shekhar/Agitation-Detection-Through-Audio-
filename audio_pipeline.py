@@ -5,7 +5,7 @@ Responsibilities
 * Open a sounddevice InputStream at 16 kHz mono float32.
 * On every callback, put a copy of the raw float32 frame on two queues:
     - ``acoustic_queue``  → acoustic feature worker
-    - ``transcription_queue`` → local faster-whisper transcriber
+    - ``transcription_queue`` → selected local/WLK transcription worker
 * Track frame timestamps so downstream workers can align features with
   transcript segments.
 * Expose start() / stop() for the dashboard to call.
@@ -123,6 +123,9 @@ class AudioPipeline:
         self.transcription_queue: queue.Queue[TimestampedFrame] = queue.Queue(
             maxsize=max_queue_size
         )
+        # Historical WLK branches used this name. It is an alias, not a second
+        # raw-audio buffer or capture stream.
+        self.wlk_queue = self.transcription_queue
 
         self._stream: sd.InputStream | None = None
         self._is_running: bool = False

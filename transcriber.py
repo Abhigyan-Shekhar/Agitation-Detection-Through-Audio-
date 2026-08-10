@@ -19,6 +19,7 @@ import numpy as np
 import config
 from audio_pipeline import TimestampedFrame
 from event_models import CommittedLine, LatencyTrace
+from queue_fanout import as_queue_list, publish_latest
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ class TranscriptionWorker:
         self,
         audio_queue: queue.Queue[TimestampedFrame],
         partial_queue: queue.Queue[str],
-        committed_queue: queue.Queue[CommittedLine],
+        committed_queue: queue.Queue[CommittedLine] | list[queue.Queue[CommittedLine]],
         transcriber: DirectWhisperTranscriber | None = None,
         window_seconds: float = config.TRANSCRIPTION_WINDOW_SECONDS,
         interval_seconds: float = config.TRANSCRIPTION_INTERVAL_SECONDS,
@@ -130,7 +131,7 @@ class TranscriptionWorker:
     ) -> None:
         self._audio_queue = audio_queue
         self._partial_queue = partial_queue
-        self._committed_queue = committed_queue
+        self._committed_queues = as_queue_list(committed_queue)
         self._transcriber = transcriber or DirectWhisperTranscriber(sample_rate=sample_rate)
         self._window_seconds = window_seconds
         self._interval_seconds = interval_seconds
@@ -231,7 +232,12 @@ class TranscriptionWorker:
                     committed.timestamp,
                     "None" if confidence is None else f"{confidence:.3f}",
                 )
-                self._put_latest(self._committed_queue, committed)
+                publish_latest(
+                    self._committed_queues,
+                    committed,
+                    logger=logger,
+                    label="committed transcript queue",
+                )
                 self._last_text = text
 
     @staticmethod

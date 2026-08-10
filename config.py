@@ -5,7 +5,16 @@ everywhere rather than scattering magic numbers across the codebase.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
+import platform
+import sys
+from urllib.parse import urlencode
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 # ---------------------------------------------------------------------------
 # Audio capture
@@ -17,15 +26,49 @@ DTYPE: str = "float32"
 AUDIO_INPUT_DEVICE: str | int | None = os.getenv("AUDIO_INPUT_DEVICE") or None
 
 # ---------------------------------------------------------------------------
-# Local transcription
+# Transcription / WhisperLiveKit
 # ---------------------------------------------------------------------------
-TRANSCRIPTION_ENGINE: str = os.getenv("TRANSCRIPTION_ENGINE", "faster-whisper")
+_WLK_PLATFORM_DEFAULT = (
+    sys.version_info < (3, 13)
+    and platform.system() != "Darwin"
+    and importlib.util.find_spec("nemo") is not None
+)
+ENABLE_SPEAKER_DIARIZATION: bool = _env_bool(
+    "ENABLE_SPEAKER_DIARIZATION", _WLK_PLATFORM_DEFAULT
+)
+DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "sortformer")
+# Current WLK Sortformer does not expose a maximum-speaker CLI option. Keep this
+# as an extension point without passing an unsupported argument to the server.
+MAX_SPEAKERS: int | None = (
+    int(value) if (value := os.getenv("MAX_SPEAKERS", "").strip()) else None
+)
+SPEAKER_ALIASES_JSON: str = os.getenv("SPEAKER_ALIASES_JSON", "")
+
+TRANSCRIPTION_ENGINE: str = os.getenv(
+    "TRANSCRIPTION_ENGINE",
+    "whisperlivekit" if ENABLE_SPEAKER_DIARIZATION else "faster-whisper",
+).strip().lower()
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE: str | None = os.getenv("WHISPER_LANGUAGE", "en") or None
 TRANSCRIPTION_WINDOW_SECONDS: float = float(os.getenv("TRANSCRIPTION_WINDOW_SECONDS", "5"))
 TRANSCRIPTION_INTERVAL_SECONDS: float = float(os.getenv("TRANSCRIPTION_INTERVAL_SECONDS", "1"))
 TRANSCRIPTION_STOP_TIMEOUT_SECONDS: float = float(os.getenv("TRANSCRIPTION_STOP_TIMEOUT_SECONDS", "30"))
 USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() == "true"
+
+WLK_HOST: str = os.getenv("WLK_HOST", "127.0.0.1")
+WLK_PORT: int = int(os.getenv("WLK_PORT", "8000"))
+WLK_PATH: str = os.getenv("WLK_PATH", "/asr")
+WLK_OUTPUT_MODE: str = os.getenv("WLK_OUTPUT_MODE", "diff")
+_WLK_QUERY = urlencode({"mode": WLK_OUTPUT_MODE}) if WLK_OUTPUT_MODE else ""
+WLK_URL: str = (
+    f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
+    f"{'&' if '?' in WLK_PATH else '?'}{_WLK_QUERY}"
+    if _WLK_QUERY
+    else f"ws://{WLK_HOST}:{WLK_PORT}{WLK_PATH}"
+)
+WLK_BACKEND: str = os.getenv("WLK_BACKEND", "auto")
+WLK_AUTO_LAUNCH: bool = _env_bool("WLK_AUTO_LAUNCH", True)
+WLK_STARTUP_TIMEOUT_SEC: float = float(os.getenv("WLK_STARTUP_TIMEOUT_SEC", "180"))
 
 # ---------------------------------------------------------------------------
 # Utterance aggregator
