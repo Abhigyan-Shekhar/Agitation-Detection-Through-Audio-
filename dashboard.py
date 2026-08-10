@@ -28,6 +28,7 @@ import sys
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -42,6 +43,14 @@ from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
 from behaviour_classifier import BehaviourClassifier
 from audio_behaviour_taxonomy import get_supported_behaviours
+from behaviour_history import (
+    DEFAULT_WINDOW_MINUTES,
+    append_record_once,
+    behaviour_breakdown,
+    get_most_common_behaviour,
+    get_recent_events,
+    normalise_event_timestamp,
+)
 from event_models import BehaviourEvent, FusedResult, Utterance
 
 logging.basicConfig(
@@ -76,6 +85,7 @@ def _init() -> None:
         "committed_lines": [],      # list[str]
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
+        "behaviour_event_keys": set(),
         "latest_result": None,      # FusedResult | None
         "error": None,
         # Calibration
@@ -280,7 +290,11 @@ def _consume() -> None:
 
             st.session_state.latest_result = result
             for event in result.behaviour_events:
-                st.session_state.behaviour_log.append(_event_to_record(event, result))
+                append_record_once(
+                    st.session_state.behaviour_log,
+                    _event_to_record(event, result),
+                    st.session_state.behaviour_event_keys,
+                )
             st.session_state.timeline.append({
                 "time": time.strftime("%H:%M:%S"),
                 "timestamp": datetime.now(),
@@ -329,14 +343,14 @@ def _severity_badge(severity: str | None) -> str:
 
 def _event_to_record(event: BehaviourEvent, result: FusedResult | None = None) -> dict[str, Any]:
     """Convert a BehaviourEvent into a dashboard-friendly record."""
-    timestamp = event.timestamp
-    if not isinstance(timestamp, datetime):
-        timestamp = datetime.now()
+    timestamp = normalise_event_timestamp(event.timestamp) or datetime.now()
     return {
+        "event_id": event.event_id,
         "timestamp": timestamp,
         "resident": event.person or "Unassigned resident",
         "behaviour": event.canonical_label or event.behaviour_type or "Unmapped audio behaviour",
         "severity": event.severity or (result.severity if result else "Low"),
+        "reliability": result.reliability if result else None,
         "location": event.location or "Observation area",
         "duration": event.duration,
         "trigger": event.trigger or "",
@@ -351,7 +365,7 @@ def _records_dataframe(records: list[dict[str, Any]] | None = None) -> pd.DataFr
     """Build the canonical events DataFrame used by dashboard tabs."""
     data = records if records is not None else st.session_state.behaviour_log
     columns = [
-        "timestamp", "resident", "behaviour", "severity", "location", "duration",
+        "event_id", "timestamp", "resident", "behaviour", "severity", "reliability", "location", "duration",
         "trigger", "intervention", "outcome", "notes", "source",
     ]
     if not data:
@@ -480,6 +494,55 @@ def _render_charts(df: pd.DataFrame) -> None:
         st.line_chart(hourly, x="hour", y="events")
 
 
+def _render_rolling_behaviour_history() -> None:
+    window_minutes = DEFAULT_WINDOW_MINUTES
+    st.subheader(f"Behaviours detected in last {window_minutes} minutes")
+
+    now = datetime.now()
+    recent_events = get_recent_events(
+        st.session_state.behaviour_log,
+        window_minutes=window_minutes,
+        now=now,
+    )
+    most_common_behaviour, most_common_count = get_most_common_behaviour(recent_events)
+    breakdown_rows = behaviour_breakdown(recent_events)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total events", len(recent_events))
+    c2.metric("Most repeated behaviour", most_common_behaviour or "None")
+    c3.metric("Occurrences", most_common_count)
+
+    if not recent_events:
+        _render_empty(f"No behaviours detected in the last {window_minutes} minutes.")
+        return
+
+    if most_common_behaviour:
+        st.markdown("**Most Repeated Behaviour**")
+        st.metric(most_common_behaviour.upper(), f"{most_common_count} occurrences")
+
+    st.markdown("**Behaviour breakdown**")
+    breakdown_df = pd.DataFrame(breakdown_rows)
+    st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**30-minute history graph**")
+    recent_df = pd.DataFrame(recent_events)
+    recent_df["timestamp"] = pd.to_datetime(recent_df["timestamp"], errors="coerce")
+    recent_df = recent_df.dropna(subset=["timestamp"])
+    if recent_df.empty:
+        _render_empty("No timestamped behaviour events are available for the graph.")
+        return
+
+    graph_df = (
+        recent_df
+        .assign(time_bucket=recent_df["timestamp"].dt.floor("5min"))
+        .groupby(["time_bucket", "behaviour"])
+        .size()
+        .reset_index(name="events")
+        .sort_values("time_bucket")
+    )
+    st.bar_chart(graph_df, x="time_bucket", y="events", color="behaviour")
+
+
 def _render_recent_events(df: pd.DataFrame) -> None:
     st.subheader("📋 Recent Behaviour Events")
     if df.empty:
@@ -535,11 +598,13 @@ def _render_logging_form() -> None:
                 extra_notes = f"{extra_notes}\nEmergency intervention: {emergency}".strip()
             if target:
                 extra_notes = f"{extra_notes}\nTarget of aggression: {target}".strip()
-            st.session_state.behaviour_log.append({
+            record = {
+                "event_id": f"manual-{uuid4().hex[:8]}",
                 "timestamp": timestamp,
                 "resident": resident or "Unassigned resident",
                 "behaviour": behaviour,
                 "severity": severity,
+                "reliability": None,
                 "location": location,
                 "duration": duration,
                 "trigger": trigger,
@@ -547,7 +612,12 @@ def _render_logging_form() -> None:
                 "outcome": outcome,
                 "notes": extra_notes,
                 "source": "Manual",
-            })
+            }
+            append_record_once(
+                st.session_state.behaviour_log,
+                record,
+                st.session_state.behaviour_event_keys,
+            )
             st.success("Behaviour event saved.")
 
 
@@ -632,6 +702,8 @@ def _render() -> None:
         _render_logging_form()
 
     with analytics_tab:
+        _render_rolling_behaviour_history()
+        st.divider()
         _render_summary_cards(filtered_df)
         _render_charts(filtered_df)
         if st.session_state.timeline:
