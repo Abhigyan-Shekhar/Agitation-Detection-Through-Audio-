@@ -164,15 +164,10 @@ class DashboardManager:
             committed_queue=self._committed_queue,
             utterance_queue=self._utterance_queue,
         )
-<<<<<<< HEAD
         self.acoustic_worker = AcousticWorker(
             acoustic_queue=self.pipeline.acoustic_queue,
             on_window=self._handle_acoustic_window,
         )
-=======
-        self.acoustic_worker = AcousticWorker(acoustic_queue=self.pipeline.acoustic_queue)
-        self._patch_acoustic_worker_baseline_feed()
->>>>>>> origin/codex/add-strange-human-noise-detection
 
     def _start_workers(self) -> None:
         if self.utterance_aggregator is None or self.acoustic_worker is None:
@@ -194,7 +189,6 @@ class DashboardManager:
             raise DashboardStartupError(f"{self._diagnostics()}\nAudio pipeline is not ready.")
         self.pipeline.start()
 
-<<<<<<< HEAD
     def _handle_acoustic_window(self, feat: AcousticFeatureWindow) -> None:
         """Feed extracted acoustic windows into the shared baseline manager."""
         before = self._baseline_manager.calibration_window_count
@@ -209,115 +203,6 @@ class DashboardManager:
                 self._baseline_manager.minimum_windows_for_personal,
                 id(self._baseline_manager),
             )
-=======
-    def _start_wlk(self) -> None:
-        if not config.WLK_AUTO_LAUNCH:
-            self._owns_wlk_proc = False
-            return
-        if (
-            config.ENABLE_SPEAKER_DIARIZATION
-            and config.DIARIZATION_BACKEND == "sortformer"
-            and (platform.system() == "Darwin" or sys.version_info >= (3, 13))
-        ):
-            raise DashboardStartupError(
-                f"{self._diagnostics()}\nThe WLK 0.2.x NeMo/Sortformer extra is supported "
-                "by this project on Linux with Python 3.11-3.12. Use the documented "
-                "single-speaker fallback here or connect to an external supported WLK server."
-            )
-        if importlib.util.find_spec("whisperlivekit") is None:
-            extra = "[diarization-sortformer]" if config.ENABLE_SPEAKER_DIARIZATION else ""
-            raise DashboardStartupError(
-                f"{self._diagnostics()}\nWhisperLiveKit is not installed in {sys.executable}. "
-                f"Install with: python -m pip install 'whisperlivekit{extra}>=0.2.23,<0.3'"
-            )
-        self._wlk_log_file = tempfile.NamedTemporaryFile(prefix="odu-wlk-", suffix=".log", delete=False)
-        self._wlk_log_path = self._wlk_log_file.name
-        env = os.environ.copy()
-        env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-        env["PYTHONUNBUFFERED"] = "1"
-        try:
-            self.wlk_proc = subprocess.Popen(
-                self.wlk_command,
-                stdout=self._wlk_log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise DashboardStartupError(f"{self._diagnostics()}\nCould not launch WLK: {exc}") from exc
-        self._owns_wlk_proc = True
-
-    def _wait_for_tcp_ready(self) -> None:
-        deadline = time.monotonic() + config.WLK_STARTUP_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            if self.wlk_proc is not None and self.wlk_proc.poll() is not None:
-                raise DashboardStartupError(self._exit_diagnostics())
-            try:
-                with socket.create_connection((config.WLK_HOST, config.WLK_PORT), timeout=_TCP_TIMEOUT_SEC):
-                    return
-            except OSError:
-                time.sleep(_TCP_POLL_SEC)
-        raise DashboardStartupError(
-            f"{self._diagnostics()}\nTimed out waiting {config.WLK_STARTUP_TIMEOUT_SEC:.0f}s for WLK."
-        )
-
-    def _stop_wlk(self) -> None:
-        proc = self.wlk_proc
-        if proc is not None and self._owns_wlk_proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=_TERMINATE_TIMEOUT_SEC)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=_TERMINATE_TIMEOUT_SEC)
-        self.wlk_proc = None
-        self._owns_wlk_proc = False
-        if self._wlk_log_file is not None:
-            self._wlk_log_file.close()
-            self._wlk_log_file = None
-
-    def _clear_runtime_queues(self) -> None:
-        for target in (
-            self._partial_queue,
-            self._committed_queue,
-            self._committed_display_queue,
-            self._utterance_queue,
-        ):
-            while True:
-                try:
-                    target.get_nowait()
-                except queue.Empty:
-                    break
-
-    def _patch_acoustic_worker_baseline_feed(self) -> None:
-        acoustic_worker = self.acoustic_worker
-        if acoustic_worker is None:
-            return
-
-        def _run_with_baseline_feed() -> None:
-            while not acoustic_worker._stop_event.is_set():
-                acoustic_worker._drain_queue()
-                now = time.time()
-                if now - acoustic_worker._last_extraction_time >= acoustic_worker._hop_sec:
-                    records = acoustic_worker._ring.latest_window(acoustic_worker._window_sec)
-                    if records:
-                        feat = acoustic_worker._extractor.extract(
-                            records,
-                            now - acoustic_worker._window_sec,
-                            now,
-                        )
-                        with acoustic_worker._lock:
-                            acoustic_worker._windows.append(feat)
-                        acoustic_worker._last_extraction_time = now
-                        acoustic_worker._windows_extracted += 1
-                        self._baseline_manager.feed(feat)
-                time.sleep(0.010)
-
-        acoustic_worker._thread = threading.Thread(
-            target=_run_with_baseline_feed,
-            name="acoustic-worker",
-            daemon=True,
-        )
->>>>>>> origin/codex/add-strange-human-noise-detection
 
     def _safe_stop(self, name: str, obj: Any) -> None:
         if obj is None:
