@@ -359,7 +359,18 @@ class LinguisticAnalyzer:
     def __init__(self, history_sec: float = config.TRANSCRIPT_HISTORY_SEC) -> None:
         self._history_sec = history_sec
         max_records = int(history_sec / 2) + 10  # generous upper bound
-        self._history: Deque[_TranscriptRecord] = deque(maxlen=max_records)
+        self._max_records = max_records
+        self._histories: dict[int | str | None, Deque[_TranscriptRecord]] = {}
+        # Retain the old attribute for callers/tests that inspect the
+        # non-diarized single-speaker history.
+        self._history = self._history_for(None)
+
+    def _history_for(self, speaker_id: int | str | None) -> Deque[_TranscriptRecord]:
+        history = self._histories.get(speaker_id)
+        if history is None:
+            history = deque(maxlen=self._max_records)
+            self._histories[speaker_id] = history
+        return history
 
     # ------------------------------------------------------------------
     # Public API
@@ -371,17 +382,23 @@ class LinguisticAnalyzer:
         Updates the rolling history after analysis.
         """
         text = utterance.full_text
-        logger.info("BEHAVIOUR_TRACE linguistic_input transcript=%r", text)
+        speaker_id = utterance.speaker_id
+        history = self._history_for(speaker_id)
+        logger.info(
+            "BEHAVIOUR_TRACE linguistic_input speaker=%s transcript=%r",
+            speaker_id,
+            text,
+        )
         if not text.strip():
             logger.info("BEHAVIOUR_TRACE linguistic_output empty_transcript=True")
             return LinguisticFeatures()
 
-        self._prune_history(utterance.end_time)
+        self._prune_history(utterance.end_time, history)
 
         evidence: dict = {}
 
         # A. Repetition
-        rep, q_rep, req_rep = self._repetition_scores(text)
+        rep, q_rep, req_rep = self._repetition_scores(text, history)
         evidence["repetition"] = {"rep": rep, "q_rep": q_rep, "req_rep": req_rep}
 
         # B. Sentiment
@@ -440,7 +457,7 @@ class LinguisticAnalyzer:
         }
 
         # Update history
-        self._history.append(_TranscriptRecord(text, utterance.end_time))
+        history.append(_TranscriptRecord(text, utterance.end_time))
 
         features = LinguisticFeatures(
             repetition_score=float(np.clip(rep, 0.0, 1.0)),
@@ -491,7 +508,11 @@ class LinguisticAnalyzer:
     # Sub-scorers
     # ------------------------------------------------------------------
 
-    def _repetition_scores(self, text: str) -> tuple[float, float, float]:
+    def _repetition_scores(
+        self,
+        text: str,
+        history: Deque[_TranscriptRecord] | None = None,
+    ) -> tuple[float, float, float]:
         """Return (repetition_score, question_repetition_score, request_repetition_score)."""
         intra_rep, intra_q_rep, intra_req_rep = self._intra_utterance_repetition_scores(text)
         current_words = _content_words(text)
@@ -502,7 +523,7 @@ class LinguisticAnalyzer:
         word_sims, phrase_sims, fuzzy_sims = [], [], []
         q_sims, req_sims = [], []
 
-        for rec in self._history:
+        for rec in self._history if history is None else history:
             hist_words = _content_words(rec.text)
             hist_3grams = _ngrams(hist_words, 3)
 
@@ -785,7 +806,12 @@ class LinguisticAnalyzer:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _prune_history(self, current_time: float) -> None:
+    def _prune_history(
+        self,
+        current_time: float,
+        history: Deque[_TranscriptRecord] | None = None,
+    ) -> None:
         cutoff = current_time - self._history_sec
-        while self._history and self._history[0].timestamp < cutoff:
-            self._history.popleft()
+        target = self._history if history is None else history
+        while target and target[0].timestamp < cutoff:
+            target.popleft()

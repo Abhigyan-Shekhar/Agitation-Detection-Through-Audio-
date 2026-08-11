@@ -1,11 +1,11 @@
-"""Audio + Linguistic Agitation Dashboard with local faster-whisper transcription.
+"""Audio + Linguistic Agitation Dashboard with speaker-aware WLK transcription.
 
 Architecture overview
 ---------------------
 Microphone (sounddevice)
     │
-    ├─► transcription_queue ──► TranscriptionWorker ──► partial_queue  ─► live caption
-    │                                               └──► committed_queue ─► UtteranceAggregator
+    ├─► transcription_queue ──► WLK/local transcriber ─► partial_queue
+    │                                     └────────────► committed queue fan-out
     │                                                                          │
     └─► acoustic_queue ──► AcousticWorker                                      ▼
                                (rolling ring buffer)                 completed utterance_queue
@@ -84,11 +84,14 @@ def _init() -> None:
         # Queues
         "partial_queue": queue.Queue(maxsize=5),
         "committed_queue": queue.Queue(maxsize=100),
+        "committed_display_queue": queue.Queue(maxsize=100),
         "utterance_queue": queue.Queue(maxsize=50),
         # Display state
         "partial_caption": "",
         "transcription_metadata": {},
         "committed_lines": [],      # list[str]
+        "speakers_seen": set(),
+        "latest_speaker_label": None,
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
         "behaviour_event_keys": set(),
@@ -126,6 +129,7 @@ def _get_manager() -> DashboardManager:
         manager = DashboardManager(
             partial_queue=st.session_state.partial_queue,
             committed_queue=st.session_state.committed_queue,
+            committed_display_queue=st.session_state.committed_display_queue,
             utterance_queue=st.session_state.utterance_queue,
             baseline_manager=st.session_state.baseline_manager,
         )
@@ -179,6 +183,9 @@ def _render_baseline_calibration_panel() -> None:
 def _start_pipeline() -> None:
     st.session_state.error = None
     st.session_state.partial_caption = ""
+    st.session_state.committed_lines = []
+    st.session_state.speakers_seen = set()
+    st.session_state.latest_speaker_label = None
     _get_manager().start()
 
 
@@ -204,8 +211,20 @@ def _consume() -> None:
     except queue.Empty:
         pass
 
-    # Do not drain committed_queue here: the UtteranceAggregator owns it.
-    # Committed transcript display is updated from completed utterances below.
+    # Display gets an independent fan-out queue; analysis exclusively owns the
+    # committed queue above, so Streamlit can never steal an analyser message.
+    try:
+        while True:
+            line = st.session_state.committed_display_queue.get_nowait()
+            prefix = f"{line.speaker_label}: " if line.speaker_label else ""
+            st.session_state.committed_lines.append(f"{prefix}{line.text}")
+            if line.speaker_id is not None:
+                st.session_state.speakers_seen.add(line.speaker_id)
+                st.session_state.latest_speaker_label = line.speaker_label
+    except queue.Empty:
+        pass
+    if len(st.session_state.committed_lines) > 50:
+        st.session_state.committed_lines = st.session_state.committed_lines[-50:]
 
     # Completed utterances → full analysis pipeline
     manager = st.session_state.get("manager")
@@ -264,9 +283,7 @@ def _consume() -> None:
                 result.latency_trace.dashboard_render_ts = time.monotonic()
                 logger.info("Dashboard latency diagnostics: %s", result.latency_trace.durations_ms())
             st.session_state.latest_result = result
-            st.session_state.committed_lines.extend(line.text for line in utterance.lines)
-            if len(st.session_state.committed_lines) > 50:
-                st.session_state.committed_lines = st.session_state.committed_lines[-50:]
+            st.session_state.latest_speaker_label = utterance.speaker_label
             for event in result.behaviour_events:
                 append_record_once(
                     st.session_state.behaviour_log,
@@ -280,6 +297,7 @@ def _consume() -> None:
                 "linguistic_score": result.linguistic_score,
                 "smoothed_score": result.smoothed_score,
                 "severity": result.severity,
+                "speaker": result.speaker_label,
             })
 
             # Optional Gemini ablation
@@ -910,6 +928,8 @@ def _render_behaviour_events(result: FusedResult) -> None:
                 details: list[str] = []
                 if event.internal_code:
                     details.append(f"Internal code: {event.internal_code}")
+                if event.speaker_label:
+                    details.append(f"Speaker: {event.speaker_label}")
                 if event.cmai_category:
                     details.append(f"CMAI: {event.cmai_category}")
                 if event.mapping_status:
@@ -957,6 +977,17 @@ def _render() -> None:
         status_cols[0].success("Microphone active" if _pipeline_running() else "Monitoring stopped")
         status_cols[1].caption("Local decision support only — not a clinical diagnosis.")
         status_cols[2].progress(1.0 if _pipeline_running() else 0.0, text="Audio pipeline status")
+        manager = st.session_state.get("manager")
+        diarization_active = bool(
+            manager and manager.uses_wlk and config.ENABLE_SPEAKER_DIARIZATION
+        )
+        speaker_cols = st.columns(3)
+        speaker_cols[0].metric("Diarization", "Enabled" if diarization_active else "Disabled")
+        speaker_cols[1].metric("Speakers this session", len(st.session_state.speakers_seen))
+        speaker_cols[2].metric(
+            "Latest analysed speaker",
+            st.session_state.latest_speaker_label or "Unattributed",
+        )
         if result is not None and result.latency_trace is not None:
             with st.expander("⏱️ Latency diagnostics", expanded=False):
                 latency = result.latency_trace.durations_ms()
@@ -969,7 +1000,6 @@ def _render() -> None:
             st.subheader("🎙️ Current Recording")
             partial = st.session_state.partial_caption or "_Waiting for speech…_"
             st.markdown(f"> {partial}")
-            manager = st.session_state.get("manager")
             worker = manager.transcription_worker if manager is not None else None
             tx = worker.latest_result if worker is not None else None
             if tx is not None:
@@ -990,6 +1020,7 @@ def _render() -> None:
                 st.metric("Behaviour", behaviour_label)
                 st.metric("Current Severity", _severity_badge(result.severity))
                 st.metric("Current Confidence", f"{result.reliability:.0%}")
+                st.caption(f"Originating speaker: {result.speaker_label or 'Unattributed'}")
                 with st.expander("Detected behaviour details", expanded=True):
                     _render_behaviour_events(result)
 
@@ -1086,6 +1117,8 @@ with st.sidebar:
     with st.expander("🔧 Debug"):
         st.write("Pipeline running:", pipeline_running)
         st.write("Transcription engine:", config.TRANSCRIPTION_ENGINE)
+        st.write("Speaker diarization:", config.ENABLE_SPEAKER_DIARIZATION)
+        st.write("Diarization backend:", config.DIARIZATION_BACKEND)
         st.write("Whisper model:", config.WHISPER_MODEL)
         st.write("Transcription window (s):", config.TRANSCRIPTION_WINDOW_SECONDS)
         st.write("Transcription interval (s):", config.TRANSCRIPTION_INTERVAL_SECONDS)
@@ -1106,6 +1139,9 @@ with st.sidebar:
         ua = manager.utterance_aggregator if manager else None
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)
+        wlk_client = manager.wlk_client if manager else None
+        if wlk_client:
+            st.write("WLK client stats:", wlk_client.stats)
         if bm:
             st.write("Baseline manager id:", id(bm))
             st.write("Calibration active:", bm.is_calibrating)

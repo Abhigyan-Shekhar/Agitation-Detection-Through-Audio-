@@ -4,8 +4,10 @@ torch==2.3.1
 torchaudio==2.3.1
 scipy==1.13.1
 librosa==0.10.2
-# ASR — local direct transcription
+# ASR — direct single-speaker fallback and WLK streaming client/server
 faster-whisper>=1.0.0
+whisperlivekit>=0.2.23,<0.3; python_version >= "3.11" and python_version < "3.14"
+websockets>=12.0
 # Linguistic analysis
 vaderSentiment>=3.3.2
 rapidfuzz>=3.9.0
@@ -15,3 +17,5 @@ google-genai>=1.0.0
 streamlit>=1.38.0
 pandas
 python-dotenv>=1.0.0
+# Test runner
+pytest>=8.0

@@ -17,8 +17,8 @@ Design notes
 ------------
 * Runs in a dedicated background thread (``start()`` / ``stop()``).
 * Does not call any ML model — purely time-based heuristics.
-* Duplicate committed lines (same text emitted twice by transcriber) are
-  de-duplicated via a simple last-line equality check.
+* Duplicate committed lines are de-duplicated without collapsing identical
+  words spoken by different speakers.
 """
 from __future__ import annotations
 
@@ -72,7 +72,10 @@ class UtteranceAggregator:
         self._lines: list[CommittedLine] = []
         self._utterance_start: float | None = None
         self._last_line_time: float | None = None
-        self._last_line_text: str = ""   # for de-duplication
+        self._last_line_key: tuple[object, ...] | None = None
+        self._current_speaker_id: int | str | None = None
+        self._current_speaker_label: str | None = None
+        self._last_line_received_at: float | None = None
 
         self._emitted_count: int = 0
 
@@ -122,9 +125,9 @@ class UtteranceAggregator:
             self._drain_committed_queue()
 
             # Check finalisation conditions
-            if self._lines and self._last_line_time is not None:
+            if self._lines and self._last_line_received_at is not None:
                 now = time.time()
-                elapsed_since_last = now - self._last_line_time
+                elapsed_since_last = now - self._last_line_received_at
                 utterance_age = now - (self._utterance_start or now)
 
                 # Condition 1: silence timeout
@@ -168,18 +171,38 @@ class UtteranceAggregator:
             except queue.Empty:
                 return
 
-            # De-duplicate: The transcriber sometimes re-emits the same line
-            if line.text.strip() == self._last_line_text:
+            clean_text = line.text.strip()
+            line_key = (line.speaker_id, line.start_time, line.end_time, clean_text)
+            if line_key == self._last_line_key:
                 logger.debug("Duplicate committed line ignored: %r", line.text)
                 continue
 
-            self._last_line_text = line.text.strip()
+            if (
+                self._lines
+                and self._current_speaker_id is not None
+                and line.speaker_id is not None
+                and line.speaker_id != self._current_speaker_id
+            ):
+                logger.info(
+                    "SPEAKER_CHANGE from=%s to=%s",
+                    self._current_speaker_id,
+                    line.speaker_id,
+                )
+                self._emit()
+
+            self._last_line_key = line_key
 
             if not self._lines:
-                self._utterance_start = line.timestamp
+                self._utterance_start = line.start_time or line.timestamp
+                self._current_speaker_id = line.speaker_id
+                self._current_speaker_label = line.speaker_label
+            elif self._current_speaker_id is None and line.speaker_id is not None:
+                self._current_speaker_id = line.speaker_id
+                self._current_speaker_label = line.speaker_label
 
             self._lines.append(line)
-            self._last_line_time = line.timestamp
+            self._last_line_time = line.end_time or line.timestamp
+            self._last_line_received_at = time.time()
             logger.info(
                 "BEHAVIOUR_TRACE aggregator_received transcript=%r line_count=%d timestamp=%.3f",
                 line.text,
@@ -197,19 +220,25 @@ class UtteranceAggregator:
         utterance = Utterance(
             lines=list(self._lines),
             start_time=self._utterance_start or self._lines[0].timestamp,
-            end_time=self._lines[-1].timestamp,
+            end_time=self._lines[-1].end_time or self._lines[-1].timestamp,
             latency_trace=trace,
+            speaker_id=self._current_speaker_id,
+            speaker_label=self._current_speaker_label,
         )
         self._lines.clear()
         self._utterance_start = None
         self._last_line_time = None
-        self._last_line_text = ""
+        self._last_line_key = None
+        self._current_speaker_id = None
+        self._current_speaker_label = None
+        self._last_line_received_at = None
 
         try:
             self._utterance_queue.put_nowait(utterance)
             self._emitted_count += 1
             logger.info(
-                "Utterance emitted — text=%r duration=%.2fs latency=%s",
+                "Utterance emitted — speaker=%s text=%r duration=%.2fs latency=%s",
+                utterance.speaker_id,
                 utterance.full_text[:60],
                 utterance.duration(),
                 trace.durations_ms() if trace else {},
