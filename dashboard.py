@@ -950,8 +950,10 @@ def _render() -> None:
         worker = manager.transcription_worker if manager is not None else None
         if worker is None:
             st.caption(f"Speaker diarization: {'enabled' if config.ENABLE_SPEAKER_DIARIZATION else 'disabled'}")
+        elif worker.diarization_error:
+            st.error(f"Speaker diarization unavailable — {worker.diarization_error}")
         else:
-            state = "active" if worker.diarization_active else "disabled/unavailable"
+            state = "enabled" if worker.diarization_active else "disabled"
             st.caption(f"Speaker diarization: {state} • Speakers observed: {worker.speakers_seen}")
         if result is not None and result.latency_trace is not None:
             with st.expander("⏱️ Latency diagnostics", expanded=False):

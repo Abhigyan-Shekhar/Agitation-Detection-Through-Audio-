@@ -126,6 +126,32 @@ def test_disabled_diarization_preserves_unlabelled_single_speaker_mode():
     )
     assert worker._identify_speaker(np.ones(1000, dtype=np.float32)) == (None, None)
     assert worker.diarization_active is False
+    assert worker.diarization_error is None
+
+
+def test_diarization_failure_is_exposed_for_dashboard_diagnostics():
+    class BrokenDiarizer:
+        speakers_seen = 0
+
+        def reset(self):
+            pass
+
+        def identify(self, audio, sample_rate):
+            raise RuntimeError("speaker model unavailable")
+
+    worker = TranscriptionWorker(
+        audio_queue=queue.Queue(),
+        partial_queue=queue.Queue(),
+        committed_queue=queue.Queue(),
+        transcriber=DirectWhisperTranscriber(model_size="small", model=TwoSegmentModel()),
+        diarizer=BrokenDiarizer(),
+        enable_diarization=True,
+        sample_rate=1000,
+    )
+
+    assert worker._identify_speaker(np.ones(1000, dtype=np.float32)) == (None, None)
+    assert worker.diarization_active is False
+    assert worker.diarization_error == "RuntimeError: speaker model unavailable"
 
 
 def test_speaker_identity_reaches_fused_result_and_behaviour_event():

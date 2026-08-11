@@ -1,2 +1,5 @@
 # Optional local speaker embeddings. Install after requirements.txt.
 speechbrain>=1.0,<1.1
+# SpeechBrain 1.0.3 still passes use_auth_token to hf_hub_download;
+# huggingface_hub 1.x removed that argument.
+huggingface_hub>=0.20,<1.0

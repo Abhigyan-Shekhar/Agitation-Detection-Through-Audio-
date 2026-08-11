@@ -143,6 +143,7 @@ class TranscriptionWorker:
             raise ValueError(f"Unsupported DIARIZATION_BACKEND={config.DIARIZATION_BACKEND!r}")
         self._diarizer = diarizer or (OnlineSpeakerDiarizer() if enable_diarization else None)
         self._diarization_failed = False
+        self._diarization_error: str | None = None
         self._frames: deque[TimestampedFrame] = deque()
         self._max_samples = max(1, int(window_seconds * sample_rate))
         self._sample_count = 0
@@ -160,6 +161,7 @@ class TranscriptionWorker:
         self._emitted_segments.clear()
         self._last_text = ""
         self._diarization_failed = False
+        self._diarization_error = None
         if self._diarizer is not None:
             self._diarizer.reset()
         self._thread = threading.Thread(target=self._run, name="transcription-worker", daemon=True)
@@ -286,8 +288,9 @@ class TranscriptionWorker:
             return None, None
         try:
             return self._diarizer.identify(audio, self._sample_rate)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             self._diarization_failed = True
+            self._diarization_error = f"{type(exc).__name__}: {exc}"
             logger.exception(
                 "Speaker diarization disabled for this session after initialization/inference failure"
             )
@@ -300,6 +303,10 @@ class TranscriptionWorker:
     @property
     def diarization_active(self) -> bool:
         return self._diarizer is not None and not self._diarization_failed
+
+    @property
+    def diarization_error(self) -> str | None:
+        return self._diarization_error
 
     @staticmethod
     def _put_latest(target: queue.Queue[Any], item: Any) -> None:
