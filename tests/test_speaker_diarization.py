@@ -35,6 +35,38 @@ def test_online_clustering_keeps_stable_session_speaker_ids():
     assert diarizer.speakers_seen == 2
 
 
+def test_normal_single_speaker_variation_does_not_fragment_into_new_ids():
+    # Each sample is only moderately similar to the initial centroid, which
+    # previously crossed the overly strict 0.72 threshold and created a new ID.
+    backend = SequenceEmbeddingBackend(
+        [[1.0, 0.0, 0.0], [0.65, 0.76, 0.0], [0.62, 0.72, 0.31], [0.70, 0.68, 0.22]]
+    )
+    diarizer = OnlineSpeakerDiarizer(
+        backend=backend, min_segment_seconds=0, similarity_threshold=0.55
+    )
+    audio = np.ones(100, dtype=np.float32)
+
+    ids = [diarizer.identify(audio, 16_000)[0] for _ in range(4)]
+
+    assert ids == [1, 1, 1, 1]
+    assert diarizer.speakers_seen == 1
+
+
+def test_prototype_bank_recognizes_a_prior_voice_mode_after_centroid_drift():
+    backend = SequenceEmbeddingBackend(
+        [[1.0, 0.0], [0.6, 0.8], [0.0, 1.0], [1.0, 0.0]]
+    )
+    diarizer = OnlineSpeakerDiarizer(
+        backend=backend, min_segment_seconds=0, similarity_threshold=0.55
+    )
+    audio = np.ones(100, dtype=np.float32)
+
+    ids = [diarizer.identify(audio, 16_000)[0] for _ in range(4)]
+
+    assert ids == [1, 1, 1, 1]
+    assert diarizer.speakers_seen == 1
+
+
 def test_short_audio_is_not_given_a_fabricated_speaker():
     diarizer = OnlineSpeakerDiarizer(
         backend=SequenceEmbeddingBackend([[1, 0]]), min_segment_seconds=1.0

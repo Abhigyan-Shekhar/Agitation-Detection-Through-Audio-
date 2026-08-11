@@ -32,8 +32,8 @@ USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() =
 ENABLE_SPEAKER_DIARIZATION: bool = os.getenv("ENABLE_SPEAKER_DIARIZATION", "true").lower() == "true"
 DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "speechbrain-ecapa")
 DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
-DIARIZATION_SIMILARITY_THRESHOLD: float = float(os.getenv("DIARIZATION_SIMILARITY_THRESHOLD", "0.72"))
-DIARIZATION_MIN_SEGMENT_SECONDS: float = float(os.getenv("DIARIZATION_MIN_SEGMENT_SECONDS", "0.75"))
+DIARIZATION_SIMILARITY_THRESHOLD: float = float(os.getenv("DIARIZATION_SIMILARITY_THRESHOLD", "0.55"))
+DIARIZATION_MIN_SEGMENT_SECONDS: float = float(os.getenv("DIARIZATION_MIN_SEGMENT_SECONDS", "1.0"))
 DIARIZATION_MAX_SPEAKERS: int = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "6"))
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ open a microphone, use WhisperLiveKit, or send audio to a cloud service.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from typing import Protocol
 
@@ -55,6 +55,10 @@ class SpeechBrainECAPABackend:
 class _SpeakerCentroid:
     vector: np.ndarray
     observations: int = 1
+    # A centroid alone can blur different speaking styles from one person.
+    # Retaining a small prototype bank makes short/noisy turns match any
+    # previously observed mode without allowing memory to grow unbounded.
+    prototypes: list[np.ndarray] = field(default_factory=list)
 
 
 class OnlineSpeakerDiarizer:
@@ -93,16 +97,25 @@ class OnlineSpeakerDiarizer:
         speaker_id: int
         if not self._speakers:
             speaker_id = 1
-            self._speakers[speaker_id] = _SpeakerCentroid(vector)
+            self._speakers[speaker_id] = _SpeakerCentroid(vector, prototypes=[vector])
         else:
             similarities = {
-                sid: float(np.dot(vector, centroid.vector))
+                sid: max(
+                    float(np.dot(vector, centroid.vector)),
+                    *(float(np.dot(vector, prototype)) for prototype in centroid.prototypes),
+                )
                 for sid, centroid in self._speakers.items()
             }
             speaker_id, best = max(similarities.items(), key=lambda item: item[1])
+            logger.info(
+                "DIARIZATION_MATCH speaker=%s similarity=%.3f threshold=%.3f",
+                speaker_id,
+                best,
+                self._threshold,
+            )
             if best < self._threshold and len(self._speakers) < self._max_speakers:
                 speaker_id = max(self._speakers) + 1
-                self._speakers[speaker_id] = _SpeakerCentroid(vector)
+                self._speakers[speaker_id] = _SpeakerCentroid(vector, prototypes=[vector])
                 logger.info("DIARIZATION speakers_seen=%d", len(self._speakers))
             else:
                 centroid = self._speakers[speaker_id]
@@ -110,6 +123,9 @@ class OnlineSpeakerDiarizer:
                     centroid.vector * centroid.observations + vector
                 )
                 centroid.observations += 1
+                centroid.prototypes.append(vector)
+                if len(centroid.prototypes) > 12:
+                    centroid.prototypes.pop(0)
         return speaker_id, f"Speaker {speaker_id}"
 
     @staticmethod
