@@ -28,6 +28,14 @@ import pandas as pd
 import streamlit as st
 
 import config
+from behaviour_history import (
+    DEFAULT_WINDOW_MINUTES,
+    append_unique_event,
+    build_behaviour_timeline,
+    count_behaviours,
+    get_most_common_behaviour,
+    get_recent_events,
+)
 from dashboard_manager import DashboardManager
 from baseline_manager import BaselineManager
 from linguistic_features import LinguisticAnalyzer
@@ -250,7 +258,7 @@ def _consume() -> None:
             if len(st.session_state.committed_lines) > 50:
                 st.session_state.committed_lines = st.session_state.committed_lines[-50:]
             for event in result.behaviour_events:
-                st.session_state.behaviour_log.append(_event_to_record(event, result))
+                append_unique_event(st.session_state.behaviour_log, _event_to_record(event, result))
             st.session_state.timeline.append({
                 "time": time.strftime("%H:%M:%S"),
                 "timestamp": datetime.now(),
@@ -373,7 +381,7 @@ def _consume_acoustic_only_screaming(
     st.session_state.last_acoustic_scream_ts = now
     st.session_state.latest_result = result
     for event in result.behaviour_events:
-        st.session_state.behaviour_log.append(_event_to_record(event, result))
+        append_unique_event(st.session_state.behaviour_log, _event_to_record(event, result))
     st.session_state.timeline.append({
         "time": time.strftime("%H:%M:%S"),
         "timestamp": datetime.now(),
@@ -434,7 +442,7 @@ def _consume_acoustic_only_strange_noise(
     st.session_state.last_acoustic_strange_noise_ts = now
     st.session_state.latest_result = result
     for event in result.behaviour_events:
-        st.session_state.behaviour_log.append(_event_to_record(event, result))
+        append_unique_event(st.session_state.behaviour_log, _event_to_record(event, result))
     st.session_state.timeline.append({
         "time": time.strftime("%H:%M:%S"),
         "timestamp": datetime.now(),
@@ -733,6 +741,61 @@ def _render_charts(df: pd.DataFrame) -> None:
         st.line_chart(hourly, x="hour", y="events")
 
 
+def _render_rolling_behaviour_history() -> None:
+    """Render rolling 30-minute behaviour-history analytics.
+
+    This reads the existing dashboard behaviour log populated by the real-time
+    classifier and manual logging. It is a history/frequency view only.
+    """
+    st.subheader("Behaviours detected in last 30 minutes")
+    recent_events = get_recent_events(
+        st.session_state.behaviour_log,
+        window_minutes=DEFAULT_WINDOW_MINUTES,
+    )
+    most_common = get_most_common_behaviour(recent_events)
+    total_events = len(recent_events)
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Total events", total_events)
+    if most_common is None:
+        metric_cols[1].metric("Most repeated behaviour", "None")
+        metric_cols[2].metric("Occurrences", 0)
+    else:
+        behaviour, occurrences = most_common
+        metric_cols[1].metric("Most repeated behaviour", behaviour.upper())
+        metric_cols[2].metric("Occurrences", occurrences)
+
+    if not recent_events:
+        _render_empty("No behaviours detected in the last 30 minutes.")
+        return
+
+    st.markdown("**Behaviour breakdown**")
+    counts = count_behaviours(recent_events)
+    breakdown = pd.DataFrame(
+        [{"behaviour": behaviour, "events": events} for behaviour, events in counts.most_common()]
+    )
+    st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
+    st.markdown("**30-minute history graph**")
+    timeline = pd.DataFrame(
+        build_behaviour_timeline(
+            recent_events,
+            window_minutes=DEFAULT_WINDOW_MINUTES,
+        )
+    )
+    if timeline.empty:
+        _render_empty("No timeline data available for the last 30 minutes.")
+        return
+    chart_data = timeline.pivot_table(
+        index="time",
+        columns="behaviour",
+        values="events",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    st.bar_chart(chart_data)
+
+
 def _render_recent_events(df: pd.DataFrame) -> None:
     st.subheader("📋 Recent Behaviour Events")
     if df.empty:
@@ -925,6 +988,9 @@ def _render() -> None:
 
     with analytics_tab:
         _render_summary_cards(filtered_df)
+        st.divider()
+        _render_rolling_behaviour_history()
+        st.divider()
         _render_charts(filtered_df)
         if st.session_state.timeline:
             st.subheader("📈 Detection Score Timeline")
