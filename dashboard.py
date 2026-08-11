@@ -1125,6 +1125,9 @@ with st.sidebar:
         st.write("Use GPU if available:", config.USE_GPU_IF_AVAILABLE)
         st.write("Gemini comparison:", config.ENABLE_GEMINI_COMPARISON)
         manager = st.session_state.get("manager")
+        pipeline = manager.pipeline if manager else None
+        if pipeline:
+            st.write("Audio pipeline stats:", pipeline.stats)
         aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)

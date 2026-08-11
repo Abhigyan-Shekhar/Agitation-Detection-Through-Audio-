@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import config
+import dashboard_manager
 from baseline_manager import BaselineManager
 from audio_pipeline import TimestampedFrame
 from behaviour_classifier import BehaviourClassifier
@@ -156,6 +157,10 @@ def test_wlk_stop_flushes_pcm_before_end_of_audio_signal() -> None:
     asyncio.run(client._send_loop(websocket))
     assert websocket.sent[-1] == b""
     assert len(websocket.sent[0]) == 4
+    assert client.stats["frames_consumed"] == 1
+    assert client.stats["bytes_sent"] == 4
+    assert client.stats["chunks_sent"] == 1
+    assert client.stats["last_frame_index"] == 0
 
 
 def test_wlk_stop_still_receives_final_committed_lines() -> None:
@@ -315,3 +320,76 @@ def test_unsupported_local_sortformer_fails_with_actionable_error(
     monkeypatch.setattr("dashboard_manager.platform.system", lambda: "Darwin")
     with pytest.raises(DashboardStartupError, match="Linux with Python 3.11-3.12"):
         manager._start_wlk()
+
+
+def test_wlk_auto_launch_starts_and_stops_owned_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = DashboardManager(queue.Queue(), queue.Queue(), queue.Queue(), BaselineManager())
+
+    class FakeProc:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            self.pid = 4321
+            self.returncode = None
+            self.terminated = False
+            self.killed = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode or 0
+
+    fake_proc = FakeProc()
+    monkeypatch.setattr(config, "TRANSCRIPTION_ENGINE", "whisperlivekit")
+    monkeypatch.setattr(config, "WLK_AUTO_LAUNCH", True)
+    monkeypatch.setattr(config, "ENABLE_SPEAKER_DIARIZATION", False)
+    monkeypatch.setattr(manager, "_is_tcp_open", lambda: False)
+    monkeypatch.setattr(dashboard_manager.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
+    monkeypatch.setattr(dashboard_manager, "_OWNED_WLK_PROC", None)
+
+    manager._start_wlk()
+
+    assert manager.wlk_proc is fake_proc
+    assert manager.server_running
+    assert manager._owns_wlk_proc is True
+
+    manager._stop_wlk()
+
+    assert fake_proc.terminated is True
+    assert fake_proc.killed is False
+    assert manager.wlk_proc is None
+    assert dashboard_manager._OWNED_WLK_PROC is None
+
+
+def test_wlk_auto_launch_does_not_create_second_process_when_port_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = DashboardManager(queue.Queue(), queue.Queue(), queue.Queue(), BaselineManager())
+    popen_called = False
+
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("Popen should not be called")
+
+    monkeypatch.setattr(config, "TRANSCRIPTION_ENGINE", "whisperlivekit")
+    monkeypatch.setattr(config, "WLK_AUTO_LAUNCH", True)
+    monkeypatch.setattr(config, "ENABLE_SPEAKER_DIARIZATION", False)
+    monkeypatch.setattr(manager, "_is_tcp_open", lambda: True)
+    monkeypatch.setattr(dashboard_manager.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(dashboard_manager, "_OWNED_WLK_PROC", None)
+
+    manager._start_wlk()
+
+    assert popen_called is False
+    assert manager.wlk_proc is None
+    assert manager._owns_wlk_proc is False

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import http.client
 from typing import Any
 
 import config
@@ -19,9 +20,9 @@ from acoustic_features import AcousticWorker
 from audio_pipeline import AudioPipeline
 from baseline_manager import BaselineManager
 from event_models import AcousticFeatureWindow, CommittedLine, Utterance
-from utterance_aggregator import UtteranceAggregator
 from transcriber import TranscriptionWorker
 from utterance_aggregator import UtteranceAggregator
+from whisperlivekit_client import WhisperLiveKitClient
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ _TCP_TIMEOUT_SEC = 0.5
 _WS_TIMEOUT_SEC = 10.0
 _TERMINATE_TIMEOUT_SEC = 5.0
 _LOG_TAIL_BYTES = 8192
+_OWNED_WLK_PROC: subprocess.Popen[bytes] | None = None
+_OWNED_WLK_LOCK = threading.Lock()
 
 
 class DashboardStartupError(RuntimeError):
@@ -108,7 +111,7 @@ class DashboardManager:
             self._clear_runtime_queues()
             if self.uses_wlk:
                 self._start_wlk()
-                self._wait_for_tcp_ready()
+                self._wait_for_wlk_ready()
             self._create_pipeline_components()
             self._start_workers()
             self._start_microphone()
@@ -211,6 +214,150 @@ class DashboardManager:
             obj.stop()
         except Exception:  # noqa: BLE001
             logger.exception("Error stopping %s", name)
+
+    def _clear_runtime_queues(self) -> None:
+        for q in (
+            self._partial_queue,
+            self._committed_queue,
+            self._committed_display_queue,
+            self._utterance_queue,
+        ):
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _start_wlk(self) -> None:
+        """Ensure a single WhisperLiveKit server is available for this manager."""
+        self._validate_wlk_runtime()
+        if not self.uses_wlk:
+            return
+        if self.server_running:
+            return
+
+        global _OWNED_WLK_PROC
+        with _OWNED_WLK_LOCK:
+            if _OWNED_WLK_PROC is not None and _OWNED_WLK_PROC.poll() is None:
+                self.wlk_proc = _OWNED_WLK_PROC
+                self._owns_wlk_proc = True
+                logger.info("Reusing dashboard-owned WLK process pid=%s", self.wlk_proc.pid)
+                return
+
+            if self._is_tcp_open():
+                self.wlk_proc = None
+                self._owns_wlk_proc = False
+                logger.info("Using existing WLK server at %s:%d", config.WLK_HOST, config.WLK_PORT)
+                return
+
+            if not config.WLK_AUTO_LAUNCH:
+                self.wlk_proc = None
+                self._owns_wlk_proc = False
+                logger.info("WLK auto-launch disabled; expecting external server at %s", config.WLK_URL)
+                return
+
+            self._open_wlk_log()
+            logger.info("Starting WhisperLiveKit: %s", subprocess.list2cmdline(self.wlk_command))
+            self.wlk_proc = subprocess.Popen(
+                self.wlk_command,
+                stdout=self._wlk_log_file,
+                stderr=subprocess.STDOUT,
+            )
+            self._owns_wlk_proc = True
+            _OWNED_WLK_PROC = self.wlk_proc
+
+    def _validate_wlk_runtime(self) -> None:
+        if not config.ENABLE_SPEAKER_DIARIZATION:
+            return
+        if config.DIARIZATION_BACKEND != "sortformer":
+            return
+        if platform.system() == "Darwin" or sys.version_info >= (3, 13):
+            raise DashboardStartupError(
+                "WhisperLiveKit Sortformer diarization requires Linux with Python 3.11-3.12. "
+                "Set ENABLE_SPEAKER_DIARIZATION=false to use WLK transcription without local Sortformer."
+            )
+        if importlib.util.find_spec("nemo") is None:
+            raise DashboardStartupError(
+                "WhisperLiveKit Sortformer diarization requires NeMo. "
+                "Install requirements-diarization.txt or set ENABLE_SPEAKER_DIARIZATION=false."
+            )
+
+    def _open_wlk_log(self) -> None:
+        if self._wlk_log_file is not None:
+            return
+        log = tempfile.NamedTemporaryFile(prefix="wlk-", suffix=".log", delete=False)
+        self._wlk_log_file = log
+        self._wlk_log_path = log.name
+
+    def _wait_for_wlk_ready(self) -> None:
+        deadline = time.monotonic() + config.WLK_STARTUP_TIMEOUT_SEC
+        last_error = ""
+        while time.monotonic() < deadline:
+            if self.wlk_proc is not None and self.wlk_proc.poll() is not None:
+                raise DashboardStartupError(self._exit_diagnostics())
+            if self._health_ready():
+                logger.info("WhisperLiveKit health check ready at http://%s:%d/health", config.WLK_HOST, config.WLK_PORT)
+                return
+            if self._is_tcp_open():
+                last_error = "TCP port is open but /health is not ready yet"
+            else:
+                last_error = "TCP port is not open yet"
+            time.sleep(_TCP_POLL_SEC)
+        raise DashboardStartupError(
+            f"{self._diagnostics()}\nWLK readiness timed out after {config.WLK_STARTUP_TIMEOUT_SEC:.1f}s: {last_error}\n"
+            f"WLK log tail:\n{self._read_wlk_log_tail()}"
+        )
+
+    def _health_ready(self) -> bool:
+        try:
+            conn = http.client.HTTPConnection(config.WLK_HOST, config.WLK_PORT, timeout=_TCP_TIMEOUT_SEC)
+            conn.request("GET", "/health")
+            response = conn.getresponse()
+            response.read()
+            return 200 <= response.status < 300
+        except OSError:
+            return False
+        finally:
+            try:
+                conn.close()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+
+    def _is_tcp_open(self) -> bool:
+        try:
+            with socket.create_connection((config.WLK_HOST, config.WLK_PORT), timeout=_TCP_TIMEOUT_SEC):
+                return True
+        except OSError:
+            return False
+
+    def _stop_wlk(self) -> None:
+        global _OWNED_WLK_PROC
+        proc = self.wlk_proc
+        owns_proc = self._owns_wlk_proc
+        self.wlk_proc = None
+        self._owns_wlk_proc = False
+
+        if proc is not None and owns_proc:
+            if proc.poll() is None:
+                logger.info("Stopping dashboard-owned WLK process pid=%s", proc.pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=_TERMINATE_TIMEOUT_SEC)
+                except subprocess.TimeoutExpired:
+                    logger.warning("WLK process did not terminate; killing pid=%s", proc.pid)
+                    proc.kill()
+                    proc.wait(timeout=_TERMINATE_TIMEOUT_SEC)
+            with _OWNED_WLK_LOCK:
+                if _OWNED_WLK_PROC is proc:
+                    _OWNED_WLK_PROC = None
+
+        if self._wlk_log_file is not None:
+            try:
+                self._wlk_log_file.close()
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not close WLK log file", exc_info=True)
+            finally:
+                self._wlk_log_file = None
 
     def _diagnostics(self) -> str:
         if not self.uses_wlk:

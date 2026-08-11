@@ -46,7 +46,7 @@ SPEAKER_ALIASES_JSON: str = os.getenv("SPEAKER_ALIASES_JSON", "")
 
 TRANSCRIPTION_ENGINE: str = os.getenv(
     "TRANSCRIPTION_ENGINE",
-    "whisperlivekit" if ENABLE_SPEAKER_DIARIZATION else "faster-whisper",
+    "whisperlivekit",
 ).strip().lower()
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE: str | None = os.getenv("WHISPER_LANGUAGE", "en") or None

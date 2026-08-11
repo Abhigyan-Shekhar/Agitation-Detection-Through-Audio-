@@ -52,9 +52,10 @@ python -m pip install -r requirements-diarization.txt
 
 Current WhisperLiveKit releases require Python below 3.14. Sortformer/NeMo is
 not treated as a supported Apple Silicon runtime by this project; on macOS or
-Python 3.14 the application defaults to the existing faster-whisper path. This
-is an explicit fallback, not simulated diarization. A WLK initialization or
-missing-extra failure is shown with the launch command and server log tail.
+Python 3.14, keep diarization disabled or select the existing faster-whisper
+path explicitly. This is an explicit fallback, not simulated diarization. A WLK
+initialization or missing-extra failure is shown with the launch command and
+server log tail.
 
 ## Run
 
@@ -64,6 +65,12 @@ On a supported diarization machine, the exact application command is:
 ENABLE_SPEAKER_DIARIZATION=true \
 TRANSCRIPTION_ENGINE=whisperlivekit \
 DIARIZATION_BACKEND=sortformer \
+python -m streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501
+```
+
+For WLK transcription without diarization, the default branch workflow is:
+
+```bash
 python -m streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501
 ```
 

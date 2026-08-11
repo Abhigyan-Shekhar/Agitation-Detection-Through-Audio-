@@ -133,6 +133,9 @@ class AudioPipeline:
 
         # Monotonic frame counter for diagnostics
         self._frame_index: int = 0
+        self._frames_captured: int = 0
+        self._acoustic_frames_enqueued: int = 0
+        self._transcription_frames_enqueued: int = 0
         self._last_callback_stats: dict[str, float | int | str | bool] = {}
         self._latest_loudness: LoudnessSnapshot | None = None
         self._input_device: str | int | None = None
@@ -153,6 +156,20 @@ class AudioPipeline:
     def latest_loudness(self) -> LoudnessSnapshot | None:
         return self._latest_loudness
 
+    @property
+    def stats(self) -> dict[str, object]:
+        return {
+            "running": self._is_running,
+            "frames_captured": self._frames_captured,
+            "acoustic_frames_enqueued": self._acoustic_frames_enqueued,
+            "transcription_frames_enqueued": self._transcription_frames_enqueued,
+            "acoustic_queue_depth": self.acoustic_queue.qsize(),
+            "transcription_queue_depth": self.transcription_queue.qsize(),
+            "dropped_frames": self._dropped_frames,
+            "last_frame_index": self._frame_index,
+            "last_callback": self._last_callback_stats,
+        }
+
     def start(self) -> None:
         """Open the microphone stream and begin fanning frames to queues."""
         if self._is_running:
@@ -166,6 +183,9 @@ class AudioPipeline:
 
         self._dropped_frames = 0
         self._frame_index = 0
+        self._frames_captured = 0
+        self._acoustic_frames_enqueued = 0
+        self._transcription_frames_enqueued = 0
         self._flush_queues()
         self._is_running = True
 
@@ -228,6 +248,7 @@ class AudioPipeline:
         ts = time.time()
         capture_monotonic = time.monotonic()
         self._frame_index += 1
+        self._frames_captured += 1
         frame = TimestampedFrame(
             data=audio,
             timestamp=ts,
@@ -240,9 +261,13 @@ class AudioPipeline:
         self._latest_loudness = self._loudness_snapshot(audio, ts, self._frame_index)
 
         # Fan out to both queues — drop if full rather than block the callback
-        for q in (self.acoustic_queue, self.transcription_queue):
+        for label, q in (("acoustic", self.acoustic_queue), ("transcription", self.transcription_queue)):
             try:
                 q.put_nowait(frame)
+                if label == "acoustic":
+                    self._acoustic_frames_enqueued += 1
+                else:
+                    self._transcription_frames_enqueued += 1
                 self._log_audio_stage("queue_insertion", self._frame_index, audio)
             except queue.Full:
                 self._dropped_frames += 1

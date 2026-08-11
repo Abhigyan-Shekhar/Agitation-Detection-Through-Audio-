@@ -66,9 +66,13 @@ class WhisperLiveKitClient:
         self._last_error: BaseException | None = None
 
         self._bytes_sent = 0
+        self._frames_consumed = 0
+        self._chunks_sent = 0
         self._messages_received = 0
         self._partial_count = 0
         self._committed_count = 0
+        self._last_frame_index = 0
+        self._last_send_monotonic = 0.0
         self._last_message_type = ""
         self._last_message_text = ""
         self._last_partial_text = ""
@@ -129,7 +133,17 @@ class WhisperLiveKitClient:
     @property
     def stats(self) -> dict[str, Any]:
         return {
+            "connected": self._connected_event.is_set(),
+            "queue_depth": self._wlk_queue.qsize(),
+            "frames_consumed": self._frames_consumed,
+            "last_frame_index": self._last_frame_index,
             "bytes_sent": self._bytes_sent,
+            "chunks_sent": self._chunks_sent,
+            "last_send_age_sec": (
+                round(time.monotonic() - self._last_send_monotonic, 3)
+                if self._last_send_monotonic
+                else None
+            ),
             "messages_received": self._messages_received,
             "partial_count": self._partial_count,
             "committed_count": self._committed_count,
@@ -209,6 +223,8 @@ class WhisperLiveKitClient:
                     frame = self._wlk_queue.get_nowait()
                     if self._stream_start_wallclock is None:
                         self._stream_start_wallclock = frame.timestamp
+                    self._frames_consumed += 1
+                    self._last_frame_index = frame.frame_index
                     self._last_sent_trace = LatencyTrace(
                         microphone_ts=frame.capture_monotonic or None,
                         queue_ts=frame.queued_monotonic or None,
@@ -222,6 +238,8 @@ class WhisperLiveKitClient:
                 del pcm_buffer[:_SEND_CHUNK_BYTES]
                 await ws.send(chunk)
                 self._bytes_sent += len(chunk)
+                self._chunks_sent += 1
+                self._last_send_monotonic = time.monotonic()
             await asyncio.sleep(0.010)
 
         # Microphone has stopped. Drain its bounded queue, flush every pending
@@ -232,6 +250,8 @@ class WhisperLiveKitClient:
                 frame = self._wlk_queue.get_nowait()
                 if self._stream_start_wallclock is None:
                     self._stream_start_wallclock = frame.timestamp
+                self._frames_consumed += 1
+                self._last_frame_index = frame.frame_index
                 pcm_buffer.extend(float32_to_pcm16(frame.data))
         except queue.Empty:
             pass
@@ -239,6 +259,8 @@ class WhisperLiveKitClient:
             if pcm_buffer:
                 await ws.send(bytes(pcm_buffer))
                 self._bytes_sent += len(pcm_buffer)
+                self._chunks_sent += 1
+                self._last_send_monotonic = time.monotonic()
             await ws.send(b"")
             deadline = time.monotonic() + 5.0
             while not self._ready_to_stop_event.is_set() and time.monotonic() < deadline:

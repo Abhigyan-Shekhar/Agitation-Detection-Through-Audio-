@@ -27,6 +27,10 @@ def test_audio_callback_enqueues_frame_without_debug_capture_hook():
     assert pipeline.latest_loudness.rms > 0.0
     assert pipeline.latest_loudness.peak == pytest.approx(0.04)
     assert pipeline.latest_loudness.frame_index == 1
+    assert pipeline.stats["frames_captured"] == 1
+    assert pipeline.stats["acoustic_frames_enqueued"] == 1
+    assert pipeline.stats["transcription_frames_enqueued"] == 1
+    assert pipeline.stats["transcription_queue_depth"] == 0
 
     try:
         pipeline.acoustic_queue.get_nowait()
