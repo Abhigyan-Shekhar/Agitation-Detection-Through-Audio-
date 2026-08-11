@@ -23,7 +23,7 @@ Configuration:
 ```bash
 ENABLE_SPEAKER_DIARIZATION=true
 DIARIZATION_BACKEND=speechbrain-ecapa
-DIARIZATION_SIMILARITY_THRESHOLD=0.55
+DIARIZATION_SIMILARITY_THRESHOLD=0.22
 DIARIZATION_MIN_SEGMENT_SECONDS=1.0
 DIARIZATION_MAX_SPEAKERS=6
 ```
@@ -36,3 +36,7 @@ session continues without speaker labels and logs a clear error.
 session. They represent voice clusters, not names or biometric identities.
 Overlapping speakers and very short turns can remain unattributed because the
 ASR segments do not provide source separation.
+
+The default similarity threshold is intentionally close to SpeechBrain's
+native ECAPA speaker-verification threshold. Raise it only if different people
+are being merged; lower it if one person is still split into multiple IDs.

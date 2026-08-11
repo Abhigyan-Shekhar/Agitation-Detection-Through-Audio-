@@ -36,13 +36,18 @@ def test_online_clustering_keeps_stable_session_speaker_ids():
 
 
 def test_normal_single_speaker_variation_does_not_fragment_into_new_ids():
-    # Each sample is only moderately similar to the initial centroid, which
-    # previously crossed the overly strict 0.72 threshold and created a new ID.
+    # One-second ECAPA chunks from SpeechBrain's reference audio can score
+    # around 0.25, so these modest similarities must remain one speaker.
     backend = SequenceEmbeddingBackend(
-        [[1.0, 0.0, 0.0], [0.65, 0.76, 0.0], [0.62, 0.72, 0.31], [0.70, 0.68, 0.22]]
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.30, 0.954, 0.0, 0.0],
+            [0.25, 0.0, 0.968, 0.0],
+            [0.28, 0.0, 0.0, 0.96],
+        ]
     )
     diarizer = OnlineSpeakerDiarizer(
-        backend=backend, min_segment_seconds=0, similarity_threshold=0.55
+        backend=backend, min_segment_seconds=0, similarity_threshold=0.22
     )
     audio = np.ones(100, dtype=np.float32)
 
