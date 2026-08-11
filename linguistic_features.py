@@ -359,7 +359,16 @@ class LinguisticAnalyzer:
     def __init__(self, history_sec: float = config.TRANSCRIPT_HISTORY_SEC) -> None:
         self._history_sec = history_sec
         max_records = int(history_sec / 2) + 10  # generous upper bound
-        self._history: Deque[_TranscriptRecord] = deque(maxlen=max_records)
+        self._max_records = max_records
+        self._histories: dict[int | str | None, Deque[_TranscriptRecord]] = {}
+        self._history = self._history_for(None)
+
+    def _history_for(self, speaker_id: int | str | None) -> Deque[_TranscriptRecord]:
+        history = self._histories.get(speaker_id)
+        if history is None:
+            history = deque(maxlen=self._max_records)
+            self._histories[speaker_id] = history
+        return history
 
     # ------------------------------------------------------------------
     # Public API
@@ -371,17 +380,18 @@ class LinguisticAnalyzer:
         Updates the rolling history after analysis.
         """
         text = utterance.full_text
-        logger.info("BEHAVIOUR_TRACE linguistic_input transcript=%r", text)
+        history = self._history_for(utterance.speaker_id)
+        logger.info("BEHAVIOUR_TRACE linguistic_input speaker=%s transcript=%r", utterance.speaker_id, text)
         if not text.strip():
             logger.info("BEHAVIOUR_TRACE linguistic_output empty_transcript=True")
             return LinguisticFeatures()
 
-        self._prune_history(utterance.end_time)
+        self._prune_history(utterance.end_time, history)
 
         evidence: dict = {}
 
         # A. Repetition
-        rep, q_rep, req_rep = self._repetition_scores(text)
+        rep, q_rep, req_rep = self._repetition_scores(text, history)
         evidence["repetition"] = {"rep": rep, "q_rep": q_rep, "req_rep": req_rep}
 
         # B. Sentiment
@@ -414,7 +424,7 @@ class LinguisticAnalyzer:
 
         # I. Complaining
         complaint_score, complaint_keywords, complaint_patterns, complaint_confidence = (
-            self._complaint_details(text, neg_sentiment)
+            self._complaint_details(text, neg_sentiment, history)
         )
         evidence["complaint"] = {
             "complaint_score": complaint_score,
@@ -440,7 +450,7 @@ class LinguisticAnalyzer:
         }
 
         # Update history
-        self._history.append(_TranscriptRecord(text, utterance.end_time))
+        history.append(_TranscriptRecord(text, utterance.end_time))
 
         features = LinguisticFeatures(
             repetition_score=float(np.clip(rep, 0.0, 1.0)),
@@ -491,7 +501,9 @@ class LinguisticAnalyzer:
     # Sub-scorers
     # ------------------------------------------------------------------
 
-    def _repetition_scores(self, text: str) -> tuple[float, float, float]:
+    def _repetition_scores(
+        self, text: str, history: Deque[_TranscriptRecord] | None = None
+    ) -> tuple[float, float, float]:
         """Return (repetition_score, question_repetition_score, request_repetition_score)."""
         intra_rep, intra_q_rep, intra_req_rep = self._intra_utterance_repetition_scores(text)
         current_words = _content_words(text)
@@ -502,7 +514,7 @@ class LinguisticAnalyzer:
         word_sims, phrase_sims, fuzzy_sims = [], [], []
         q_sims, req_sims = [], []
 
-        for rec in self._history:
+        for rec in (self._history if history is None else history):
             hist_words = _content_words(rec.text)
             hist_3grams = _ngrams(hist_words, 3)
 
@@ -656,7 +668,12 @@ class LinguisticAnalyzer:
         return min(1.0, sum(weight for pattern, weight in SEXUAL_ADVANCE_PATTERNS if pattern.search(text)))
 
 
-    def _complaint_details(self, text: str, negative_sentiment: float) -> tuple[float, list[str], list[str], float]:
+    def _complaint_details(
+        self,
+        text: str,
+        negative_sentiment: float,
+        history: Deque[_TranscriptRecord] | None = None,
+    ) -> tuple[float, list[str], list[str], float]:
         """Score explicit complaint semantics without treating plain sadness as complaining."""
         matched: list[tuple[str, float]] = [
             (name, weight) for name, pattern, weight in COMPLAINT_PATTERNS if pattern.search(text)
@@ -666,7 +683,9 @@ class LinguisticAnalyzer:
             return 0.0, keywords, [], 0.0
 
         base = max(weight for _, weight in matched)
-        repeated_recent = any(rec.is_complaint for rec in self._history)
+        repeated_recent = any(
+            rec.is_complaint for rec in (self._history if history is None else history)
+        )
         if repeated_recent:
             base += 0.15
         if negative_sentiment >= 0.20:
@@ -785,7 +804,10 @@ class LinguisticAnalyzer:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _prune_history(self, current_time: float) -> None:
+    def _prune_history(
+        self, current_time: float, history: Deque[_TranscriptRecord] | None = None
+    ) -> None:
+        target = self._history if history is None else history
         cutoff = current_time - self._history_sec
-        while self._history and self._history[0].timestamp < cutoff:
-            self._history.popleft()
+        while target and target[0].timestamp < cutoff:
+            target.popleft()

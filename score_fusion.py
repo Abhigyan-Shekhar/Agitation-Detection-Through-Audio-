@@ -59,6 +59,7 @@ class ScoreFusion:
     def __init__(self, baseline_manager: BaselineManager) -> None:
         self._bm = baseline_manager
         self._prev_smoothed: float = 0.0
+        self._speaker_smoothed: dict[int | str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -86,13 +87,18 @@ class ScoreFusion:
         raw_final = _clamp(raw_final)
 
         # ---- Asymmetric EMA smoothing --------------------------------
-        if raw_final > self._prev_smoothed:
+        speaker_id = utterance.speaker_id
+        previous = self._prev_smoothed if speaker_id is None else self._speaker_smoothed.get(speaker_id, 0.0)
+        if raw_final > previous:
             alpha = config.EMA_ALPHA_UP
         else:
             alpha = config.EMA_ALPHA_DOWN
-        smoothed = alpha * raw_final + (1 - alpha) * self._prev_smoothed
+        smoothed = alpha * raw_final + (1 - alpha) * previous
         smoothed = _clamp(smoothed)
-        self._prev_smoothed = smoothed
+        if speaker_id is None:
+            self._prev_smoothed = smoothed
+        else:
+            self._speaker_smoothed[speaker_id] = smoothed
 
         # ---- Reliability --------------------------------------------
         reliability = self._reliability(acoustic, linguistic, acoustic_score, linguistic_score)
@@ -128,6 +134,8 @@ class ScoreFusion:
             smoothed_score=round(smoothed, 4),
             severity=severity,
             reliability=round(reliability, 4),
+            speaker_id=utterance.speaker_id,
+            speaker_label=utterance.speaker_label,
             behaviours=[],   # filled in by BehaviourClassifier
             acoustic_contributions=acoustic_contributions,
             linguistic_contributions=linguistic_contributions,
@@ -140,6 +148,7 @@ class ScoreFusion:
     def reset(self) -> None:
         """Reset EMA state (e.g. when microphone restarts)."""
         self._prev_smoothed = 0.0
+        self._speaker_smoothed.clear()
 
     # ------------------------------------------------------------------
     # Acoustic branch

@@ -246,7 +246,9 @@ def _consume() -> None:
                 result.latency_trace.dashboard_render_ts = time.monotonic()
                 logger.info("Dashboard latency diagnostics: %s", result.latency_trace.durations_ms())
             st.session_state.latest_result = result
-            st.session_state.committed_lines.extend(line.text for line in utterance.lines)
+            for line in utterance.lines:
+                prefix = f"{line.speaker_label}: " if line.speaker_label else ""
+                st.session_state.committed_lines.append(f"{prefix}{line.text}")
             if len(st.session_state.committed_lines) > 50:
                 st.session_state.committed_lines = st.session_state.committed_lines[-50:]
             for event in result.behaviour_events:
@@ -834,6 +836,8 @@ def _render_behaviour_events(result: FusedResult) -> None:
                     details.append(f"Internal code: {event.internal_code}")
                 if event.cmai_category:
                     details.append(f"CMAI: {event.cmai_category}")
+                if event.speaker_label or event.person:
+                    details.append(f"Speaker: {event.speaker_label or event.person}")
                 if event.mapping_status:
                     details.append(f"Mapping status: {event.mapping_status}")
                 if event.timestamp is not None:
@@ -879,6 +883,13 @@ def _render() -> None:
         status_cols[0].success("Microphone active" if _pipeline_running() else "Monitoring stopped")
         status_cols[1].caption("Local decision support only — not a clinical diagnosis.")
         status_cols[2].progress(1.0 if _pipeline_running() else 0.0, text="Audio pipeline status")
+        manager = st.session_state.get("manager")
+        worker = manager.transcription_worker if manager is not None else None
+        if worker is None:
+            st.caption(f"Speaker diarization: {'enabled' if config.ENABLE_SPEAKER_DIARIZATION else 'disabled'}")
+        else:
+            state = "active" if worker.diarization_active else "disabled/unavailable"
+            st.caption(f"Speaker diarization: {state} • Speakers observed: {worker.speakers_seen}")
         if result is not None and result.latency_trace is not None:
             with st.expander("⏱️ Latency diagnostics", expanded=False):
                 latency = result.latency_trace.durations_ms()
@@ -909,6 +920,8 @@ def _render() -> None:
                 st.info("Waiting for a completed utterance…")
             else:
                 behaviour_label = _displayed_behaviour_label(result)
+                if result.speaker_label:
+                    st.caption(f"Latest speaker: {result.speaker_label}")
                 st.metric("Behaviour", behaviour_label)
                 st.metric("Current Severity", _severity_badge(result.severity))
                 st.metric("Current Confidence", f"{result.reliability:.0%}")

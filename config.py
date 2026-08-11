@@ -27,6 +27,15 @@ TRANSCRIPTION_INTERVAL_SECONDS: float = float(os.getenv("TRANSCRIPTION_INTERVAL_
 TRANSCRIPTION_STOP_TIMEOUT_SECONDS: float = float(os.getenv("TRANSCRIPTION_STOP_TIMEOUT_SECONDS", "30"))
 USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() == "true"
 
+# Local speaker diarization. The ECAPA model is loaded lazily on the
+# transcription worker, never in the sounddevice callback or Streamlit loop.
+ENABLE_SPEAKER_DIARIZATION: bool = os.getenv("ENABLE_SPEAKER_DIARIZATION", "true").lower() == "true"
+DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "speechbrain-ecapa")
+DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+DIARIZATION_SIMILARITY_THRESHOLD: float = float(os.getenv("DIARIZATION_SIMILARITY_THRESHOLD", "0.72"))
+DIARIZATION_MIN_SEGMENT_SECONDS: float = float(os.getenv("DIARIZATION_MIN_SEGMENT_SECONDS", "0.75"))
+DIARIZATION_MAX_SPEAKERS: int = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "6"))
+
 # ---------------------------------------------------------------------------
 # Utterance aggregator
 # ---------------------------------------------------------------------------

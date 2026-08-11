@@ -408,6 +408,9 @@ class BehaviourClassifier:
                 continue
             event = build_behaviour_event(
                 raw_behaviour=behaviour.label,
+                person=result.speaker_label,
+                speaker_id=result.speaker_id,
+                speaker_label=result.speaker_label,
                 timestamp=getattr(result.utterance, "end_time", None),
                 notes=behaviour.evidence,
             )

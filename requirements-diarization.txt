@@ -1,0 +1,2 @@
+# Optional local speaker embeddings. Install after requirements.txt.
+speechbrain>=1.0,<1.1

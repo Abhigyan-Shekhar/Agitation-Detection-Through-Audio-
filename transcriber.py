@@ -19,6 +19,7 @@ import numpy as np
 import config
 from audio_pipeline import TimestampedFrame
 from event_models import CommittedLine, LatencyTrace
+from speaker_diarization import OnlineSpeakerDiarizer
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,8 @@ class TranscriptionWorker:
         window_seconds: float = config.TRANSCRIPTION_WINDOW_SECONDS,
         interval_seconds: float = config.TRANSCRIPTION_INTERVAL_SECONDS,
         sample_rate: int = config.SAMPLE_RATE,
+        diarizer: OnlineSpeakerDiarizer | None = None,
+        enable_diarization: bool = config.ENABLE_SPEAKER_DIARIZATION,
     ) -> None:
         self._audio_queue = audio_queue
         self._partial_queue = partial_queue
@@ -135,11 +138,17 @@ class TranscriptionWorker:
         self._window_seconds = window_seconds
         self._interval_seconds = interval_seconds
         self._sample_rate = sample_rate
+        self._diarization_enabled = enable_diarization
+        if enable_diarization and config.DIARIZATION_BACKEND != "speechbrain-ecapa":
+            raise ValueError(f"Unsupported DIARIZATION_BACKEND={config.DIARIZATION_BACKEND!r}")
+        self._diarizer = diarizer or (OnlineSpeakerDiarizer() if enable_diarization else None)
+        self._diarization_failed = False
         self._frames: deque[TimestampedFrame] = deque()
         self._max_samples = max(1, int(window_seconds * sample_rate))
         self._sample_count = 0
         self._last_transcribe = 0.0
         self._last_text = ""
+        self._emitted_segments: deque[tuple[str, float, float]] = deque(maxlen=200)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self.latest_result: TranscriptionResult | None = None
@@ -148,6 +157,11 @@ class TranscriptionWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._emitted_segments.clear()
+        self._last_text = ""
+        self._diarization_failed = False
+        if self._diarizer is not None:
+            self._diarizer.reset()
         self._thread = threading.Thread(target=self._run, name="transcription-worker", daemon=True)
         self._thread.start()
         logger.info("Transcription worker started.")
@@ -218,21 +232,74 @@ class TranscriptionWorker:
         logger.info("Inference time: %.2f ms", inference_ms)
         if text:
             self._put_latest(self._partial_queue, text)
-            if text != self._last_text:
+            emitted = False
+            for segment in segments:
+                clean_text = segment.text.strip()
+                if not clean_text:
+                    continue
+                relative_start = max(0.0, float(segment.start or 0.0))
+                relative_end = max(relative_start, float(segment.end or buffer_duration))
+                start_ts = min(audio_start_ts + relative_start, audio_end_ts)
+                end_ts = min(audio_start_ts + relative_end, audio_end_ts)
+                key = (clean_text, round(start_ts, 1), round(end_ts, 1))
+                if key in self._emitted_segments:
+                    continue
+                start_sample = min(audio.size, max(0, int(relative_start * self._sample_rate)))
+                end_sample = min(audio.size, max(start_sample, int(relative_end * self._sample_rate)))
+                speaker_id, speaker_label = self._identify_speaker(audio[start_sample:end_sample])
                 trace = LatencyTrace(
                     microphone_ts=self._frames[0].capture_monotonic or None,
                     queue_ts=self._frames[0].queued_monotonic or None,
                     transcript_ts=time.monotonic(),
                 )
-                committed = CommittedLine(text=text, timestamp=result.timestamp, latency_trace=trace)
+                committed = CommittedLine(
+                    text=clean_text,
+                    timestamp=end_ts,
+                    latency_trace=trace,
+                    speaker_id=speaker_id,
+                    speaker_label=speaker_label,
+                    start_time=start_ts,
+                    end_time=end_ts,
+                )
                 logger.info(
-                    "BEHAVIOUR_TRACE transcriber_committed transcript=%r timestamp=%.3f confidence=%s",
-                    committed.text,
-                    committed.timestamp,
-                    "None" if confidence is None else f"{confidence:.3f}",
+                    "SPEAKER speaker=%s text=%r start=%.3f end=%.3f",
+                    speaker_id,
+                    clean_text,
+                    start_ts,
+                    end_ts,
                 )
                 self._put_latest(self._committed_queue, committed)
+                self._emitted_segments.append(key)
+                emitted = True
+
+            # Some injected/alternative transcribers may return text without
+            # segment timing. Preserve the pre-diarization behaviour for them.
+            if not segments and text != self._last_text:
+                committed = CommittedLine(text=text, timestamp=result.timestamp)
+                self._put_latest(self._committed_queue, committed)
+                emitted = True
+            if emitted:
                 self._last_text = text
+
+    def _identify_speaker(self, audio: np.ndarray) -> tuple[int | None, str | None]:
+        if self._diarizer is None or self._diarization_failed:
+            return None, None
+        try:
+            return self._diarizer.identify(audio, self._sample_rate)
+        except Exception:  # noqa: BLE001
+            self._diarization_failed = True
+            logger.exception(
+                "Speaker diarization disabled for this session after initialization/inference failure"
+            )
+            return None, None
+
+    @property
+    def speakers_seen(self) -> int:
+        return self._diarizer.speakers_seen if self._diarizer is not None else 0
+
+    @property
+    def diarization_active(self) -> bool:
+        return self._diarizer is not None and not self._diarization_failed
 
     @staticmethod
     def _put_latest(target: queue.Queue[Any], item: Any) -> None:

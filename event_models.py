@@ -63,6 +63,8 @@ class BehaviourEvent:
     canonical_label: str = "Unmapped audio behaviour"
     cmai_category: str | None = None
     person: str | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
     timestamp: Any = None
     location: str | None = None
     severity: str | None = None
@@ -129,6 +131,10 @@ class CommittedLine:
     text: str
     timestamp: float    # Unix timestamp when line was committed
     latency_trace: LatencyTrace | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
+    start_time: float | None = None
+    end_time: float | None = None
 
 
 @dataclass
@@ -139,6 +145,8 @@ class Utterance:
     start_time: float   # Unix timestamp of first word
     end_time: float     # Unix timestamp of last committed line
     latency_trace: LatencyTrace | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
 
     @property
     def full_text(self) -> str:
@@ -209,3 +217,7 @@ class FusedResult:
 
     # End-to-end latency diagnostics for the utterance lifecycle
     latency_trace: LatencyTrace | None = None
+
+    # Session-local diarization attribution (not biometric identity).
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
