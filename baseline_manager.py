@@ -147,6 +147,27 @@ class BaselineManager:
             return len(self._calibration_samples)
 
     @property
+    def minimum_windows_for_personal(self) -> int:
+        return _MIN_WINDOWS_FOR_PERSONAL
+
+    @property
+    def feature_names(self) -> tuple[str, ...]:
+        return _FEATURE_NAMES
+
+    def personal_baseline_stats(self) -> dict[str, tuple[float, float]]:
+        """Return a thread-safe copy of personal baseline mean/std values."""
+        with self._lock:
+            if self._personal_mean is None or self._personal_std is None:
+                return {}
+            return {
+                feat: (
+                    self._personal_mean.get(feat, 0.0),
+                    self._personal_std.get(feat, 0.0),
+                )
+                for feat in _FEATURE_NAMES
+            }
+
+    @property
     def calibration_progress(self) -> float:
         """Returns 0.0 – 1.0 progress toward minimum required windows."""
         with self._lock:
@@ -162,6 +183,17 @@ class BaselineManager:
             self._rolling.append(window)
             if self._calibrating:
                 self._calibration_samples.append(window)
+                count = len(self._calibration_samples)
+            else:
+                count = 0
+        if count and (count == 1 or count % 10 == 0 or count >= _MIN_WINDOWS_FOR_PERSONAL):
+            logger.info(
+                "BaselineManager.feed collected calibration window %d/%d "
+                "(manager_id=%s)",
+                count,
+                _MIN_WINDOWS_FOR_PERSONAL,
+                id(self),
+            )
 
     # ------------------------------------------------------------------
     # Z-score API (called by score_fusion.py)

@@ -23,12 +23,13 @@ Design notes
 from __future__ import annotations
 
 import collections
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Deque
+from typing import Callable, Deque
 
 import librosa
 import numpy as np
@@ -39,6 +40,7 @@ except ImportError:
     torch = None  # type: ignore[assignment]
 
 import config
+from acoustic_vocalization_detector import detect_acoustic_vocalization
 from audio_pipeline import TimestampedFrame
 from event_models import AcousticFeatureWindow
 
@@ -207,6 +209,8 @@ class AcousticExtractor:
         except Exception:  # noqa: BLE001
             hnr = 0.0
 
+        vocalization = detect_acoustic_vocalization(audio, self._sr)
+
         # --- Voice activity mask ---
         voiced_records = [r for r in records if r.is_speech]
         voiced_ratio = _safe(len(voiced_records) / max(len(records), 1))
@@ -250,6 +254,9 @@ class AcousticExtractor:
             spectral_centroid=spectral_centroid,
             spectral_rolloff=spectral_rolloff,
             harmonic_to_noise_ratio=hnr,
+            non_speech_vocalization_score=vocalization.score,
+            non_speech_vocalization_label=vocalization.label,
+            non_speech_vocalization_evidence=vocalization.evidence or None,
             voiced_ratio=voiced_ratio,
             pause_ratio=pause_ratio,
             clipping_ratio=clipping_ratio,
@@ -284,6 +291,8 @@ class AcousticWorker:
         window_sec: float = config.ACOUSTIC_WINDOW_SEC,
         hop_sec: float = config.ACOUSTIC_HOP_SEC,
         ring_buffer_sec: float = config.AUDIO_RING_BUFFER_SEC,
+        on_window: Callable[[AcousticFeatureWindow], None] | None = None,
+        extraction_workers: int = 2,
     ) -> None:
         self._queue = acoustic_queue
         self._window_sec = window_sec
@@ -292,6 +301,12 @@ class AcousticWorker:
         self._vad = SileroVAD()
         self._ring = AudioRingBuffer(max_seconds=ring_buffer_sec)
         self._extractor = AcousticExtractor()
+        self._on_window = on_window
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, extraction_workers),
+            thread_name_prefix="acoustic-extract",
+        )
+        self._max_pending_extractions = max(1, extraction_workers) * 2
 
         # Time-indexed window store (deque so old windows auto-expire)
         max_windows = int(ring_buffer_sec / hop_sec) + 2
@@ -302,6 +317,11 @@ class AcousticWorker:
         self._stop_event = threading.Event()
         self._last_extraction_time: float = 0.0
         self._windows_extracted: int = 0
+        self._last_extraction_ms: float = 0.0
+        self._total_extraction_ms: float = 0.0
+        self._pending_extractions: int = 0
+        self._windows_scheduled: int = 0
+        self._windows_skipped_backpressure: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -321,6 +341,7 @@ class AcousticWorker:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=3.0)
+        self._executor.shutdown(wait=True, cancel_futures=False)
         logger.info(
             "AcousticWorker stopped — windows extracted: %d", self._windows_extracted
         )
@@ -354,6 +375,29 @@ class AcousticWorker:
     def windows_extracted(self) -> int:
         return self._windows_extracted
 
+    @property
+    def last_extraction_ms(self) -> float:
+        return self._last_extraction_ms
+
+    @property
+    def average_extraction_ms(self) -> float:
+        if self._windows_extracted <= 0:
+            return 0.0
+        return self._total_extraction_ms / self._windows_extracted
+
+    @property
+    def pending_extractions(self) -> int:
+        with self._lock:
+            return self._pending_extractions
+
+    @property
+    def windows_scheduled(self) -> int:
+        return self._windows_scheduled
+
+    @property
+    def windows_skipped_backpressure(self) -> int:
+        return self._windows_skipped_backpressure
+
     # ------------------------------------------------------------------
     # Internal loop
     # ------------------------------------------------------------------
@@ -370,16 +414,65 @@ class AcousticWorker:
                 if records:
                     window_end = now
                     window_start = window_end - self._window_sec
-                    extract_start = time.monotonic()
-                    feat = self._extractor.extract(records, window_start, window_end)
-                    extract_ms = (time.monotonic() - extract_start) * 1000.0
-                    logger.debug("Acoustic feature extraction window took %.2f ms", extract_ms)
-                    with self._lock:
-                        self._windows.append(feat)
-                    self._last_extraction_time = now
-                    self._windows_extracted += 1
+                    self._schedule_extraction(records, window_start, window_end, now)
 
             time.sleep(0.010)   # ~10 ms yield
+
+    def _schedule_extraction(
+        self,
+        records: list[_AudioRecord],
+        window_start: float,
+        window_end: float,
+        scheduled_at: float,
+    ) -> None:
+        with self._lock:
+            if self._pending_extractions >= self._max_pending_extractions:
+                self._windows_skipped_backpressure += 1
+                self._last_extraction_time = scheduled_at
+                logger.warning(
+                    "Skipping acoustic extraction window because %d extractions are pending",
+                    self._pending_extractions,
+                )
+                return
+            self._pending_extractions += 1
+            self._windows_scheduled += 1
+            self._last_extraction_time = scheduled_at
+
+        future = self._executor.submit(
+            self._extract_and_store, records, window_start, window_end
+        )
+        future.add_done_callback(self._on_extraction_done)
+
+    def _extract_and_store(
+        self, records: list[_AudioRecord], window_start: float, window_end: float
+    ) -> None:
+        extract_start = time.monotonic()
+        feat = self._extractor.extract(records, window_start, window_end)
+        extract_ms = (time.monotonic() - extract_start) * 1000.0
+        logger.debug("Acoustic feature extraction window took %.2f ms", extract_ms)
+        self._store_window(feat, extract_ms)
+
+    def _on_extraction_done(self, future: Future[None]) -> None:
+        try:
+            future.result()
+        except Exception:  # noqa: BLE001
+            logger.exception("Acoustic feature extraction failed")
+        finally:
+            with self._lock:
+                self._pending_extractions = max(0, self._pending_extractions - 1)
+
+    def _store_window(self, feat: AcousticFeatureWindow, extract_ms: float) -> None:
+        with self._lock:
+            self._windows.append(feat)
+        self._windows_extracted += 1
+        self._last_extraction_ms = extract_ms
+        self._total_extraction_ms += extract_ms
+
+        if self._on_window is not None:
+            try:
+                self._on_window(feat)
+            except Exception:  # noqa: BLE001
+                logger.exception("Acoustic window callback failed")
 
     def _drain_queue(self) -> None:
         while True:
@@ -401,6 +494,13 @@ class AcousticWorker:
         end_time: float,
     ) -> AcousticFeatureWindow:
         """Compute element-wise mean across a list of feature windows."""
-        fields = [f for f in AcousticFeatureWindow.__dataclass_fields__ if f not in ("start_time", "end_time")]
+        text_fields = {"non_speech_vocalization_label", "non_speech_vocalization_evidence"}
+        fields = [
+            f for f in AcousticFeatureWindow.__dataclass_fields__
+            if f not in ("start_time", "end_time") and f not in text_fields
+        ]
         averaged = {f: float(np.mean([getattr(w, f) for w in windows])) for f in fields}
+        strongest = max(windows, key=lambda w: w.non_speech_vocalization_score)
+        averaged["non_speech_vocalization_label"] = strongest.non_speech_vocalization_label
+        averaged["non_speech_vocalization_evidence"] = strongest.non_speech_vocalization_evidence
         return AcousticFeatureWindow(start_time=start_time, end_time=end_time, **averaged)

@@ -33,7 +33,7 @@ Each behaviour has:
 | Making verbal sexual advances | AUDIO_VERBAL_SEXUAL_ADVANCES | verbal sexual advances, sexual comments, sexual propositions, sexually inappropriate comments | Verbally agitated: verbal sexual advances | No |
 | Cursing / verbal aggression | AUDIO_CURSING | curse, cursing, swear, swearing, insult, insulting, verbal aggression | Verbally agitated: verbal aggression | No |
 | Repetitive sentences or questions | AUDIO_REPETITIVE | repetitive, repeat, repeated, again, again and again, same question | Verbally non-aggressive: repetitive questioning | No |
-| Making strange noises | AUDIO_STRANGE_NOISE | strange noise, weird noise, weird laughter, crying, groan, grunt, moan | Verbally non-aggressive: strange noises | No |
+| Making strange noises | AUDIO_STRANGE_NOISE | strange noise, weird noise, weird laughter, crying, groan, grunt, moan, sigh, pant, yawn, throat clearing, cough, sneeze, sniff, teeth chattering, teeth grinding, tongue clicking, nose blowing, lip popping, lip smacking | Verbally non-aggressive: strange noises | No |
 | Complaining | AUDIO_COMPLAINING | complain, complaining, gripe, grumbling | Verbally non-aggressive: complaining | No |
 | Negativism | AUDIO_NEGATIVISM | negative, negativity, no, refuse, refusal, resistant | Verbally non-aggressive: negativism/refusal | No |
 | Constant requests for attention or help | AUDIO_CONSTANT_REQUEST | constant requests, attention, help, help me, please help | Verbally non-aggressive: repeated requests for attention/help | No |
@@ -153,6 +153,51 @@ The detector does not classify general negative sentiment, sadness, depression, 
 - “I'm depressed.”
 - “The CMAI includes Negativism.”
 
-## 7. Notes for dashboard and downstream consumers
+## 7. Strange-noise detector (dataset-label heuristic)
+
+Strange noises are detected through two deterministic paths. The linguistic path uses a label vocabulary derived from public human non-speech vocalization datasets. The acoustic path detects sustained moan/groan-like raw audio from microphone windows when ASR does not emit a transcript annotation. This is still a heuristic, not a trained dataset model.
+
+### Source label taxonomies
+
+The detector uses labels from:
+
+- OpenSLR SLR99 / Deeply Nonverbal Vocalization Dataset: teeth chattering, teeth grinding, tongue clicking, nose blowing, coughing, yawning, throat clearing, sighing, lip popping, lip smacking, panting, crying, laughing, sneezing, moaning, screaming.
+- VocalSound: laughter, sighs, coughs, throat clearing, sneezes, sniffs.
+- Nonspeech7k: breathing, coughing, crying, laughing, screaming, sneezing, yawning.
+- EmoGator: laughter, cries, sighs, moans, groans.
+
+Screaming is present in some source datasets, but the pipeline keeps it mapped to the stronger `AUDIO_SCREAMING` behaviour instead of `AUDIO_STRANGE_NOISE`.
+
+### Scoring and mapping
+
+The linguistic analyzer emits `strange_noise_score` when the utterance contains a dataset-derived non-speech human vocalization label. The acoustic extractor emits `non_speech_vocalization_score`, `non_speech_vocalization_label`, and supporting acoustic evidence for sustained moan/groan-like audio. The classifier emits `Making strange noises` when either score exceeds the configurable `BEHAVIOUR_STRANGE_NOISE_THRESHOLD`.
+
+The evidence includes:
+
+- matched dataset labels
+- source datasets for those labels
+- acoustic label and acoustic evidence when raw audio triggered the event
+- classifier confidence
+
+Documentation-like text is intentionally ignored unless the cue is in an annotation form such as “[moaning]”.
+
+The acoustic path currently targets sustained pitched vocalizations such as moaning and groaning. Other labels such as cough, sneeze, throat clearing, lip smacking, and teeth chattering are mapped when an upstream transcript or audio-caption layer emits those labels.
+
+### Examples that trigger
+
+- “[moaning]”
+- “Patient is groaning and sighing.”
+- “[throat clearing]”
+- “teeth chattering”
+- “lip smacking”
+- “non-speech human vocalization”
+
+### Examples intentionally excluded
+
+- “The OpenSLR dataset includes coughing and laughing labels.”
+- “The CMAI category is making strange noises.”
+- “The dataset contains throat clearing as a class.”
+
+## 8. Notes for dashboard and downstream consumers
 
 Downstream components should prefer the structured behaviour events over free-form labels. This keeps the behaviour taxonomy explicit, auditable, and consistent across the dashboard and tests.

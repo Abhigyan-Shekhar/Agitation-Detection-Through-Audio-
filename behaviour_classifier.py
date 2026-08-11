@@ -261,6 +261,51 @@ def _check_negativism(
     return None
 
 
+def _check_strange_noise(
+    result: FusedResult,
+    linguistic: LinguisticFeatures | None,
+) -> BehaviourLabel | None:
+    if linguistic is None:
+        return None
+    if linguistic.strange_noise_score >= config.BEHAVIOUR_STRANGE_NOISE_THRESHOLD:
+        details = linguistic.evidence.get("strange_noise", {}) if linguistic.evidence else {}
+        labels = details.get("matched_labels", [])
+        datasets = details.get("source_datasets", [])
+        evidence = f"Dataset-derived strange-noise score={linguistic.strange_noise_score:.2f}"
+        if labels:
+            evidence += f", labels={labels}"
+        if datasets:
+            evidence += f", sources={datasets}"
+        return BehaviourLabel(
+            label=_canonical_label("Making strange noises"),
+            evidence=evidence,
+            confidence=round(min(1.0, linguistic.strange_noise_score), 3),
+        )
+    return None
+
+
+def _check_acoustic_strange_noise(
+    result: FusedResult,
+    acoustic: AcousticFeatureWindow | None,
+) -> BehaviourLabel | None:
+    if acoustic is None:
+        return None
+    if acoustic.non_speech_vocalization_score >= config.BEHAVIOUR_STRANGE_NOISE_THRESHOLD:
+        label = acoustic.non_speech_vocalization_label or "non-speech human vocalization"
+        evidence = (
+            f"Raw-audio strange-noise score={acoustic.non_speech_vocalization_score:.2f}, "
+            f"label={label}"
+        )
+        if acoustic.non_speech_vocalization_evidence:
+            evidence += f", {acoustic.non_speech_vocalization_evidence}"
+        return BehaviourLabel(
+            label=_canonical_label("Making strange noises"),
+            evidence=evidence,
+            confidence=round(min(1.0, acoustic.non_speech_vocalization_score), 3),
+        )
+    return None
+
+
 def _check_distressed_verbalization(
     result: FusedResult,
     linguistic: LinguisticFeatures | None,
@@ -300,6 +345,8 @@ class BehaviourClassifier:
         _check_repeated_questioning,
         _check_complaining,
         _check_negativism,
+        _check_strange_noise,
+        _check_acoustic_strange_noise,
         _check_distressed_verbalization,
     ]
 
@@ -319,7 +366,7 @@ class BehaviourClassifier:
         )
         if linguistic is not None:
             logger.info(
-                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f sexual_advance=%.3f complaint_score=%.3f",
+                "BEHAVIOUR_TRACE classifier_linguistic_features repetition=%.3f question_repetition=%.3f negative=%.3f urgency=%.3f threat=%.3f profanity=%.3f imperative=%.3f yelling=%.3f sexual_advance=%.3f complaint_score=%.3f negativism=%.3f strange_noise=%.3f",
                 linguistic.repetition_score,
                 linguistic.question_repetition_score,
                 linguistic.negative_sentiment,
@@ -330,11 +377,13 @@ class BehaviourClassifier:
                 linguistic.yelling_score,
                 linguistic.sexual_advance_score,
                 linguistic.complaint_score,
+                linguistic.negativism_score,
+                linguistic.strange_noise_score,
             )
         detected: list[BehaviourLabel] = []
 
         for rule in self._RULES:
-            label = rule(result, acoustic if rule == _check_screaming else linguistic)
+            label = rule(result, acoustic if rule in (_check_screaming, _check_acoustic_strange_noise) else linguistic)
             if label is not None:
                 existing = next((item for item in detected if item.label == label.label), None)
                 if existing is None:

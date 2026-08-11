@@ -102,6 +102,9 @@ class AcousticFeatureWindow:
     spectral_centroid: float = 0.0
     spectral_rolloff: float = 0.0
     harmonic_to_noise_ratio: float = 0.0
+    non_speech_vocalization_score: float = 0.0
+    non_speech_vocalization_label: str | None = None
+    non_speech_vocalization_evidence: str | None = None
 
     # Voice activity (Silero mask — not a gate)
     voiced_ratio: float = 0.0       # proportion of frames flagged as speech
@@ -164,6 +167,7 @@ class LinguisticFeatures:
     sexual_advance_score: float = 0.0
     complaint_score: float = 0.0
     negativism_score: float = 0.0
+    strange_noise_score: float = 0.0
 
     # Raw evidence strings (for explainability panel)
     evidence: dict[str, Any] = field(default_factory=dict)

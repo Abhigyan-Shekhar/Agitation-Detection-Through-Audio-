@@ -66,13 +66,14 @@ ACOUSTIC_WEIGHTS: dict[str, float] = {
 
 # Linguistic branch weights (must sum to 1.0)
 LINGUISTIC_WEIGHTS: dict[str, float] = {
-    "repetition_score":          0.28,
+    "repetition_score":          0.24,
     "question_repetition_score": 0.18,
     "negative_sentiment":        0.15,
     "urgency_score":             0.15,
     "threat_score":              0.15,
     "profanity_score":           0.05,
     "sexual_advance_score":      0.04,
+    "strange_noise_score":       0.04,
 }
 
 # Final fusion
@@ -95,6 +96,14 @@ BEHAVIOUR_URGENCY_THRESHOLD: float = 0.60
 BEHAVIOUR_URGENCY_ACOUSTIC: float = 0.50
 BEHAVIOUR_COMPLAINT_THRESHOLD: float = 0.55
 BEHAVIOUR_NEGATIVISM_THRESHOLD: float = 0.55
+BEHAVIOUR_STRANGE_NOISE_THRESHOLD: float = 0.60
+ACOUSTIC_VOCALIZATION_MIN_RMS: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MIN_RMS", "0.025"))
+ACOUSTIC_VOCALIZATION_MIN_PEAK: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MIN_PEAK", "0.06"))
+ACOUSTIC_VOCALIZATION_MIN_PITCH_COVERAGE: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MIN_PITCH_COVERAGE", "0.35"))
+ACOUSTIC_VOCALIZATION_MAX_PITCH_RANGE: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MAX_PITCH_RANGE", "120"))
+ACOUSTIC_VOCALIZATION_MAX_ZCR: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MAX_ZCR", "0.12"))
+ACOUSTIC_VOCALIZATION_MAX_CENTROID: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MAX_CENTROID", "1800"))
+ACOUSTIC_VOCALIZATION_GROAN_MAX_HZ: float = float(os.getenv("ACOUSTIC_VOCALIZATION_GROAN_MAX_HZ", "170"))
 
 # Severity thresholds
 SEVERITY_LOW_MAX: float = 0.35

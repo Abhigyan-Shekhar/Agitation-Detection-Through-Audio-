@@ -145,12 +145,30 @@ class ScoreFusion:
     # Acoustic branch
     # ------------------------------------------------------------------
 
+    def acoustic_debug_values(
+        self, acoustic: AcousticFeatureWindow | None
+    ) -> dict[str, object]:
+        """Return acoustic branch diagnostics without changing fusion state."""
+        if acoustic is None:
+            return {"score": 0.0, "z_scores": {}, "branch_values": {}}
+        score, contributions, z_scores = self._acoustic_components(acoustic)
+        return {
+            "score": round(score, 4),
+            "z_scores": z_scores,
+            "branch_values": contributions,
+        }
+
     def _acoustic_score(
         self, acoustic: AcousticFeatureWindow | None
     ) -> tuple[float, dict[str, float]]:
         if acoustic is None:
             return 0.0, {}
+        score, contributions, _ = self._acoustic_components(acoustic)
+        return score, contributions
 
+    def _acoustic_components(
+        self, acoustic: AcousticFeatureWindow
+    ) -> tuple[float, dict[str, float], dict[str, float]]:
         bm = self._bm
 
         # Z-score each feature (clamped to ±Z_CLIP by BaselineManager)
@@ -166,6 +184,15 @@ class ScoreFusion:
         # Pause irregularity: high pause_ratio relative to baseline can be
         # agitation (broken speech, gasping) or calm silence — use cautiously
         pause_irr_z = bm.z_score("pause_ratio", acoustic.pause_ratio)
+
+        z_scores = {
+            "energy_z": round(energy_z, 4),
+            "energy_burst_z": round(energy_max_z, 4),
+            "pitch_range_z": round(pitch_range_z, 4),
+            "pitch_variance_z": round(pitch_var_z, 4),
+            "speech_rate_z": round(speech_rate_z, 4),
+            "pause_irregularity_z": round(pause_irr_z, 4),
+        }
 
         weights = config.ACOUSTIC_WEIGHTS
         weighted_sum = (
@@ -188,7 +215,7 @@ class ScoreFusion:
             "pause_irregularity": round(weights["pause_irregularity_z"] * pause_irr_z, 4),
         }
 
-        return score, contributions
+        return score, contributions, z_scores
 
     # ------------------------------------------------------------------
     # Linguistic branch
@@ -206,6 +233,7 @@ class ScoreFusion:
             + w["threat_score"] * linguistic.threat_score
             + w["profanity_score"] * linguistic.profanity_score
             + w["sexual_advance_score"] * linguistic.sexual_advance_score
+            + w["strange_noise_score"] * linguistic.strange_noise_score
         )
         score = _clamp(raw)
 
@@ -217,6 +245,7 @@ class ScoreFusion:
             "threat_language": round(w["threat_score"] * linguistic.threat_score, 4),
             "profanity": round(w["profanity_score"] * linguistic.profanity_score, 4),
             "sexual_advance": round(w["sexual_advance_score"] * linguistic.sexual_advance_score, 4),
+            "strange_noise": round(w["strange_noise_score"] * linguistic.strange_noise_score, 4),
         }
         return score, contributions
 

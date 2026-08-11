@@ -139,6 +139,43 @@ def _pipeline_running() -> bool:
     return bool(manager and manager.is_running)
 
 
+@st.fragment(run_every=1.0)
+def _render_baseline_calibration_panel() -> None:
+    """Render auto-refreshing calibration controls and progress."""
+    st.subheader("📐 Baseline Calibration")
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    if bm is None:
+        st.warning("Baseline manager is not initialised yet.")
+        return
+
+    pipeline_running = _pipeline_running()
+    if bm.has_personal_baseline:
+        st.success(f"Personal baseline set ({bm._personal_n} windows)")
+        if st.button("Reset baseline"):
+            bm.reset_calibration()
+    elif bm.is_calibrating:
+        progress = bm.calibration_progress
+        st.progress(
+            progress,
+            text=(
+                f"Calibrating… {int(progress * 100)}% "
+                f"({bm.calibration_window_count}/{bm.minimum_windows_for_personal} windows)"
+            ),
+        )
+        if st.button("Stop calibration"):
+            ok = bm.stop_calibration()
+            st.session_state.calibrating = False
+            if ok:
+                st.success("Baseline saved!")
+            else:
+                st.warning("Not enough data — keep recording and try again")
+    else:
+        st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
+        if st.button("Start calibration", disabled=not pipeline_running):
+            bm.start_calibration()
+            st.session_state.calibrating = True
+
+
 def _start_pipeline() -> None:
     st.session_state.error = None
     st.session_state.partial_caption = ""
@@ -262,6 +299,7 @@ def _consume() -> None:
 
     pipeline = manager.pipeline if manager is not None else None
     _consume_acoustic_only_screaming(acoustic_worker, classifier, pipeline.latest_loudness if pipeline else None)
+    _consume_acoustic_only_strange_noise(acoustic_worker, classifier)
 
 
 def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
@@ -355,6 +393,67 @@ def _consume_acoustic_only_screaming(
         result.severity,
     )
     st.session_state.last_acoustic_scream_ts = now
+    st.session_state.latest_result = result
+    for event in result.behaviour_events:
+        st.session_state.behaviour_log.append(_event_to_record(event, result))
+    st.session_state.timeline.append({
+        "time": time.strftime("%H:%M:%S"),
+        "timestamp": datetime.now(),
+        "acoustic_score": result.acoustic_score,
+        "linguistic_score": result.linguistic_score,
+        "smoothed_score": result.smoothed_score,
+        "severity": result.severity,
+    })
+
+
+def _consume_acoustic_only_strange_noise(
+    acoustic_worker: Any,
+    classifier: BehaviourClassifier,
+) -> None:
+    acoustic = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    if acoustic is None:
+        return
+
+    score = acoustic.non_speech_vocalization_score
+    if score < config.BEHAVIOUR_STRANGE_NOISE_THRESHOLD:
+        return
+
+    now = time.time()
+    last_ts = float(st.session_state.get("last_acoustic_strange_noise_ts", 0.0) or 0.0)
+    if now - last_ts < 2.0:
+        return
+
+    severity = "Moderate" if score >= 0.80 else "Mild"
+    result = FusedResult(
+        acoustic_score=round(score, 4),
+        linguistic_score=0.0,
+        raw_final_score=round(score, 4),
+        smoothed_score=round(score, 4),
+        severity=severity,
+        reliability=0.85,
+        utterance=None,
+        acoustic_features=acoustic,
+        linguistic_features=LinguisticFeatures(),
+        acoustic_contributions={
+            "non_speech_vocalization": round(score, 4),
+            "rms": round(acoustic.rms_mean, 4),
+            "peak": round(acoustic.rms_max, 4),
+        },
+        linguistic_contributions={},
+    )
+    result = classifier.classify(result)
+    if "Making strange noises" not in result.behaviours:
+        return
+
+    logger.info(
+        "BEHAVIOUR_TRACE acoustic_only_strange_noise score=%.3f label=%s evidence=%s labels=%s severity=%s",
+        score,
+        acoustic.non_speech_vocalization_label,
+        acoustic.non_speech_vocalization_evidence,
+        result.behaviours,
+        result.severity,
+    )
+    st.session_state.last_acoustic_strange_noise_ts = now
     st.session_state.latest_result = result
     for event in result.behaviour_events:
         st.session_state.behaviour_log.append(_event_to_record(event, result))
@@ -493,6 +592,106 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
         ).str.lower()
         filtered = filtered[haystack.str.contains(search, regex=False)]
     return filtered
+
+
+_BASELINE_DEBUG_FEATURES: tuple[str, ...] = (
+    "rms_mean",
+    "rms_max",
+    "rms_slope",
+    "pitch_median",
+    "pitch_range",
+    "pitch_variance",
+    "zcr_mean",
+    "spectral_centroid",
+    "voiced_ratio",
+    "pause_ratio",
+)
+
+
+def _render_acoustic_baseline_debug() -> None:
+    """Render live acoustic baseline diagnostics without changing scoring."""
+    st.subheader("Acoustic Baseline Debug")
+    manager = st.session_state.get("manager")
+    acoustic_worker = manager.acoustic_worker if manager is not None else None
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    fusion: ScoreFusion | None = st.session_state.score_fusion
+    latest = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    result: FusedResult | None = st.session_state.latest_result
+
+    if bm is None:
+        st.warning("Baseline manager is not initialised.")
+        return
+    if latest is None:
+        st.info("No acoustic feature window has been extracted yet.")
+        return
+
+    st.caption(
+        "Live diagnostics for the latest acoustic window. Values are read-only "
+        "and do not alter scoring, thresholds, or calibration."
+    )
+    status_cols = st.columns(4)
+    status_cols[0].metric("Personal baseline", "Active" if bm.has_personal_baseline else "Rolling fallback")
+    status_cols[1].metric("Calibration windows", bm.calibration_window_count)
+    status_cols[2].metric("Latest window age", f"{(time.time() - latest.end_time):.2f}s")
+    if acoustic_worker is not None:
+        status_cols[3].metric("Pending extractions", acoustic_worker.pending_extractions)
+
+    raw_rows = [
+        {"feature": feat, "raw": round(float(getattr(latest, feat, 0.0)), 6)}
+        for feat in _BASELINE_DEBUG_FEATURES
+    ]
+    st.markdown("**A. Raw acoustic features**")
+    st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
+
+    personal_stats = bm.personal_baseline_stats()
+    baseline_rows = []
+    for feat in _BASELINE_DEBUG_FEATURES:
+        mean, std = personal_stats.get(feat, (None, None))
+        baseline_rows.append({
+            "feature": feat,
+            "personal_mean": None if mean is None else round(float(mean), 6),
+            "personal_std": None if std is None else round(float(std), 6),
+        })
+    st.markdown("**B. Personal baseline**")
+    if personal_stats:
+        st.dataframe(pd.DataFrame(baseline_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No personal baseline is active yet; z-scores currently use the rolling fallback when enough rolling data exists.")
+
+    z_rows = [
+        {
+            "feature": feat,
+            "z_score": round(float(bm.z_score(feat, float(getattr(latest, feat, 0.0)))), 4),
+        }
+        for feat in _BASELINE_DEBUG_FEATURES
+    ]
+    st.markdown("**C. Z-scores from BaselineManager.z_score()**")
+    st.dataframe(pd.DataFrame(z_rows), hide_index=True, use_container_width=True)
+
+    debug_values = fusion.acoustic_debug_values(latest) if fusion is not None else {"score": 0.0, "z_scores": {}, "branch_values": {}}
+    branch_z = debug_values.get("z_scores", {})
+    branch_values = debug_values.get("branch_values", {})
+    st.markdown("**D. Acoustic branch values used by score_fusion.py**")
+    branch_rows = [
+        {"name": name, "value": value}
+        for name, value in {**branch_z, **branch_values}.items()
+    ]
+    st.dataframe(pd.DataFrame(branch_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**E. Final scores**")
+    score_cols = st.columns(5)
+    score_cols[0].metric("Latest acoustic branch", debug_values.get("score", 0.0))
+    if result is not None:
+        score_cols[1].metric("Result acoustic", result.acoustic_score)
+        score_cols[2].metric("Result linguistic", result.linguistic_score)
+        score_cols[3].metric("Fused agitation", result.smoothed_score)
+        score_cols[4].metric("Reliability", result.reliability)
+        st.caption(f"Severity: {result.severity}")
+    else:
+        score_cols[1].metric("Result acoustic", "N/A")
+        score_cols[2].metric("Result linguistic", "N/A")
+        score_cols[3].metric("Fused agitation", "N/A")
+        score_cols[4].metric("Reliability", "N/A")
 
 
 def _render_summary_cards(df: pd.DataFrame) -> None:
@@ -762,6 +961,8 @@ def _render() -> None:
             with st.expander("⏱️ Latency diagnostics", expanded=False):
                 latency = result.latency_trace.durations_ms()
                 st.json(latency if latency else {"status": "waiting for complete trace"})
+        with st.expander("Acoustic Baseline Debug", expanded=False):
+            _render_acoustic_baseline_debug()
 
         live_col, current_col = st.columns([1, 1])
         with live_col:
@@ -873,28 +1074,8 @@ with st.sidebar:
     st.divider()
 
     # Baseline calibration
-    st.subheader("📐 Baseline Calibration")
     bm: BaselineManager | None = st.session_state.baseline_manager
-    if bm:
-        if bm.has_personal_baseline:
-            st.success(f"Personal baseline set ({bm._personal_n} windows)")
-            if st.button("Reset baseline"):
-                bm.reset_calibration()
-        elif bm.is_calibrating:
-            progress = bm.calibration_progress
-            st.progress(progress, text=f"Calibrating… {int(progress * 100)}%")
-            if st.button("Stop calibration"):
-                ok = bm.stop_calibration()
-                st.session_state.calibrating = False
-                if ok:
-                    st.success("Baseline saved!")
-                else:
-                    st.warning("Not enough data — keep recording and try again")
-        else:
-            st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
-            if st.button("Start calibration", disabled=not pipeline_running):
-                bm.start_calibration()
-                st.session_state.calibrating = True
+    _render_baseline_calibration_panel()
 
     st.divider()
     st.session_state.dashboard_filters = _sidebar_filters(_records_dataframe())
@@ -914,6 +1095,11 @@ with st.sidebar:
         aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
+            st.write("Last acoustic extraction (ms):", round(aw.last_extraction_ms, 2))
+            st.write("Average acoustic extraction (ms):", round(aw.average_extraction_ms, 2))
+            st.write("Acoustic extractions scheduled:", aw.windows_scheduled)
+            st.write("Pending acoustic extractions:", aw.pending_extractions)
+            st.write("Skipped acoustic windows (backpressure):", aw.windows_skipped_backpressure)
             latest = aw.latest_window()
             if latest:
                 st.write("Latest acoustic window age (ms):", round((time.time() - latest.end_time) * 1000.0, 2))
@@ -921,7 +1107,15 @@ with st.sidebar:
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)
         if bm:
+            st.write("Baseline manager id:", id(bm))
+            st.write("Calibration active:", bm.is_calibrating)
+            st.write("Calibration windows:", bm.calibration_window_count)
+            st.write("Calibration min windows:", bm.minimum_windows_for_personal)
+            st.write("Calibration progress:", round(bm.calibration_progress * 100.0, 1))
             st.write("Rolling baseline windows:", len(bm._rolling))
+            if manager:
+                st.write("Manager baseline id:", id(manager._baseline_manager))
+                st.write("Manager uses session baseline:", manager._baseline_manager is bm)
 
 # ---- Error banner --------------------------------------------------------
 if st.session_state.error:

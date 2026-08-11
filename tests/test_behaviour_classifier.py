@@ -414,3 +414,47 @@ class TestBehaviourClassifier:
         assert "Negativism" in classified.behaviours
         assert "No audio agitation detected" not in classified.behaviours
         assert classified.behaviour_events[0].canonical_label == "Negativism"
+
+    def test_strange_noise_triggers_cmai_strange_noise_event(self):
+        linguistic = LinguisticFeatures(
+            strange_noise_score=0.85,
+            evidence={
+                "strange_noise": {
+                    "strange_noise_score": 0.85,
+                    "matched_labels": ["moaning"],
+                    "source_datasets": ["OpenSLR SLR99 / Deeply Nonverbal Vocalization Dataset"],
+                }
+            },
+        )
+        result = _make_result(
+            linguistic=linguistic,
+            smoothed_score=0.20,
+            utterance_text="[moaning]",
+        )
+        classified = self.clf.classify(result)
+        assert "Making strange noises" in classified.behaviours
+        assert "No audio agitation detected" not in classified.behaviours
+        assert classified.behaviour_events[0].canonical_label == "Making strange noises"
+        assert classified.behaviour_events[0].cmai_category == "Verbally non-aggressive: strange noises"
+
+    def test_raw_acoustic_moaning_triggers_cmai_strange_noise_event(self):
+        acoustic = AcousticFeatureWindow(
+            start_time=time.time() - 2,
+            end_time=time.time(),
+            rms_mean=0.08,
+            rms_max=0.18,
+            non_speech_vocalization_score=0.82,
+            non_speech_vocalization_label="moaning",
+            non_speech_vocalization_evidence="acoustic moaning heuristic",
+        )
+        result = _make_result(
+            acoustic_score=0.10,
+            smoothed_score=0.20,
+            acoustic=acoustic,
+            linguistic=LinguisticFeatures(),
+            utterance_text="",
+        )
+        classified = self.clf.classify(result)
+        assert "Making strange noises" in classified.behaviours
+        assert "No audio agitation detected" not in classified.behaviours
+        assert classified.behaviour_events[0].canonical_label == "Making strange noises"

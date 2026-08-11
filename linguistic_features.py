@@ -14,6 +14,7 @@ H. yelling_score          — transcript yelling/shouting cues
 I. sexual_advance_score   — sexualized verbal propositions/comments
 J. complaint_score         — dissatisfaction/discomfort complaint semantics
 K. negativism_score       — clinically-oriented refusal/resistance/non-compliance/defiance heuristic
+L. strange_noise_score    — dataset-label cues for non-speech human vocalizations
 
 Design notes
 ------------
@@ -51,6 +52,7 @@ except ImportError:
 
 import config
 from event_models import LinguisticFeatures, Utterance
+from strange_noise_labels import STRANGE_NOISE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +179,19 @@ SEXUAL_ADVANCE_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
 
 SEXUAL_ADVANCE_CLINICAL_CONTEXT_RE = re.compile(
     r"\b(?:verbal sexual advances?|sexual advances?|sexual comments?|sexually inappropriate remarks?)\b",
+    re.I,
+)
+
+STRANGE_NOISE_CONTEXT_RE = re.compile(
+    r"\b(?:strange|weird|odd|unusual|non[-\s]?speech|nonverbal|non[-\s]?verbal|human|vocal|voice|audio)\s+"
+    r"(?:noise|noises|sound|sounds|vocali[sz]ation|vocali[sz]ations|burst|bursts)\b",
+    re.I,
+)
+
+STRANGE_NOISE_ANNOTATION_RE = re.compile(r"\[(?P<label>[^\]]+)\]|\((?P<paren>[^)]+)\)", re.I)
+
+STRANGE_NOISE_DOCUMENTATION_RE = re.compile(
+    r"\b(?:dataset|datasets|corpus|label|labels|class|classes|taxonomy|CMAI|includes?|contains?|classified as)\b",
     re.I,
 )
 
@@ -416,6 +431,14 @@ class LinguisticAnalyzer:
             "matched_phrases": negativism_phrases,
         }
 
+        # K. Strange human noises
+        strange_noise_score, strange_noise_labels, strange_noise_datasets = self._strange_noise_details(text)
+        evidence["strange_noise"] = {
+            "strange_noise_score": strange_noise_score,
+            "matched_labels": strange_noise_labels,
+            "source_datasets": strange_noise_datasets,
+        }
+
         # Update history
         self._history.append(_TranscriptRecord(text, utterance.end_time))
 
@@ -431,6 +454,7 @@ class LinguisticAnalyzer:
             sexual_advance_score=float(np.clip(sexual_advance, 0.0, 1.0)),
             complaint_score=float(np.clip(complaint_score, 0.0, 1.0)),
             negativism_score=float(np.clip(negativism_score, 0.0, 1.0)),
+            strange_noise_score=float(np.clip(strange_noise_score, 0.0, 1.0)),
             evidence=evidence,
         )
         logger.info(
@@ -454,6 +478,12 @@ class LinguisticAnalyzer:
             features.negativism_score,
             negativism_categories,
             negativism_phrases,
+        )
+        logger.info(
+            "BEHAVIOUR_TRACE linguistic_output strange_noise=%.3f labels=%s datasets=%s",
+            features.strange_noise_score,
+            strange_noise_labels,
+            strange_noise_datasets,
         )
         return features
 
@@ -682,6 +712,60 @@ class LinguisticAnalyzer:
 
         score = min(1.0, aggregate_score)
         return score, categories, sorted(set(matched_phrases))
+
+    def _strange_noise_details(self, text: str) -> tuple[float, list[str], list[str]]:
+        """Score non-speech human vocalization labels from public dataset taxonomies."""
+        normalized = _normalize(text)
+        if not normalized:
+            return 0.0, [], []
+
+        matched: list[tuple[str, float, tuple[str, ...]]] = []
+        for label in STRANGE_NOISE_LABELS:
+            if not label.map_to_strange_noise:
+                continue
+            if any(self._contains_label_variant(normalized, variant) for variant in label.variants):
+                matched.append((label.canonical, label.confidence, label.datasets))
+
+        context_match = STRANGE_NOISE_CONTEXT_RE.search(text) is not None
+        annotation_match = any(
+            bool(part and self._annotation_contains_strange_noise_label(part))
+            for match in STRANGE_NOISE_ANNOTATION_RE.finditer(text)
+            for part in (match.group("label"), match.group("paren"))
+        )
+
+        if not matched and context_match:
+            matched.append(("non-speech human vocalization", 0.65, ("Dataset label taxonomy",)))
+
+        if not matched:
+            return 0.0, [], []
+
+        if STRANGE_NOISE_DOCUMENTATION_RE.search(text) and not annotation_match:
+            return 0.0, [], []
+
+        labels = sorted({label for label, _, _ in matched})
+        datasets = sorted({dataset for _, _, label_datasets in matched for dataset in label_datasets})
+        base = max(confidence for _, confidence, _ in matched)
+        if annotation_match:
+            base += 0.10
+        if len(labels) > 1:
+            base += min(0.15, 0.05 * (len(labels) - 1))
+
+        return min(1.0, base), labels, datasets
+
+    @staticmethod
+    def _contains_label_variant(normalized_text: str, variant: str) -> bool:
+        normalized_variant = _normalize(variant)
+        if not normalized_variant:
+            return False
+        return re.search(rf"(?<!\w){re.escape(normalized_variant)}(?!\w)", normalized_text) is not None
+
+    def _annotation_contains_strange_noise_label(self, annotation: str) -> bool:
+        normalized = _normalize(annotation)
+        return any(
+            label.map_to_strange_noise
+            and any(self._contains_label_variant(normalized, variant) for variant in label.variants)
+            for label in STRANGE_NOISE_LABELS
+        )
 
     def _imperative_score(self, text: str) -> float:
         """Simple heuristic: imperatives tend to start with a base verb."""
