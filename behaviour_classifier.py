@@ -14,6 +14,7 @@ score. The system observes acoustic and linguistic cues only.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import config
@@ -333,7 +334,12 @@ def _check_distressed_verbalization(
 
 
 class BehaviourClassifier:
-    """Apply multi-label behaviour rules to a ``FusedResult``."""
+    """Apply multi-label behaviour rules to a ``FusedResult``.
+
+    Screaming labels use hysteresis and temporal persistence: entering the
+    screaming state requires multiple consecutive high-evidence windows, while
+    leaving it uses a lower recovery threshold to avoid rapid oscillation.
+    """
 
     _RULES = [
         _check_screaming,
@@ -349,6 +355,65 @@ class BehaviourClassifier:
         _check_acoustic_strange_noise,
         _check_distressed_verbalization,
     ]
+
+    def __init__(self) -> None:
+        self._scream_positive_windows = 0
+        self._scream_recovery_windows = 0
+        self._scream_active = False
+        self._scream_first_positive_ts: float | None = None
+
+    def _scream_gate(self, label: BehaviourLabel | None, result: FusedResult) -> BehaviourLabel | None:
+        if label is None:
+            self._scream_positive_windows = 0
+            self._scream_first_positive_ts = None
+            if result.acoustic_score <= config.SCREAM_OFF_SCORE_THRESHOLD:
+                self._scream_recovery_windows += 1
+                if self._scream_recovery_windows >= config.SCREAM_RECOVERY_CONSECUTIVE_WINDOWS:
+                    self._scream_active = False
+            return None
+
+        now = getattr(result.acoustic_features, "end_time", None) or time.time()
+        if result.acoustic_score >= config.SCREAM_ON_SCORE_THRESHOLD:
+            self._scream_positive_windows += 1
+            self._scream_recovery_windows = 0
+            if self._scream_first_positive_ts is None:
+                self._scream_first_positive_ts = now
+        elif self._scream_active and result.acoustic_score >= config.SCREAM_OFF_SCORE_THRESHOLD:
+            return label
+        else:
+            self._scream_positive_windows = 0
+            self._scream_first_positive_ts = None
+            self._scream_recovery_windows += 1
+            return None
+
+        duration = 0.0 if self._scream_first_positive_ts is None else max(0.0, now - self._scream_first_positive_ts)
+        enough_windows = self._scream_positive_windows >= config.SCREAM_MIN_CONSECUTIVE_WINDOWS
+        enough_duration = duration >= config.SCREAM_MIN_DURATION_SEC
+        if self._scream_active or (enough_windows and enough_duration):
+            self._scream_active = True
+            label.evidence += (
+                f", scream_gate=active positives={self._scream_positive_windows} "
+                f"duration={duration:.2f}s on={config.SCREAM_ON_SCORE_THRESHOLD:.2f} "
+                f"off={config.SCREAM_OFF_SCORE_THRESHOLD:.2f}"
+            )
+            return label
+
+        logger.info(
+            "Screaming candidate suppressed by persistence gate: positives=%d duration=%.2fs score=%.3f",
+            self._scream_positive_windows, duration, result.acoustic_score,
+        )
+        return None
+
+    @property
+    def scream_debug_state(self) -> dict[str, object]:
+        return {
+            "active": self._scream_active,
+            "consecutive_positive_windows": self._scream_positive_windows,
+            "recovery_windows": self._scream_recovery_windows,
+            "on_threshold": config.SCREAM_ON_SCORE_THRESHOLD,
+            "off_threshold": config.SCREAM_OFF_SCORE_THRESHOLD,
+            "min_consecutive_windows": config.SCREAM_MIN_CONSECUTIVE_WINDOWS,
+        }
 
     def classify(self, result: FusedResult) -> FusedResult:
         """Evaluate all rules and return an updated ``FusedResult``."""
@@ -384,6 +449,8 @@ class BehaviourClassifier:
 
         for rule in self._RULES:
             label = rule(result, acoustic if rule in (_check_screaming, _check_acoustic_strange_noise) else linguistic)
+            if rule is _check_screaming:
+                label = self._scream_gate(label, result)
             if label is not None:
                 existing = next((item for item in detected if item.label == label.label), None)
                 if existing is None:

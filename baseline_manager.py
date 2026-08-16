@@ -68,6 +68,9 @@ class BaselineManager:
         # Personal baseline (set during explicit calibration)
         self._personal_mean: dict[str, float] | None = None
         self._personal_std: dict[str, float] | None = None
+        self._personal_median: dict[str, float] | None = None
+        self._personal_p10: dict[str, float] | None = None
+        self._personal_p90: dict[str, float] | None = None
         self._personal_n: int = 0
 
         # Calibration mode
@@ -110,10 +113,13 @@ class BaselineManager:
             )
             return False
 
-        mean, std = self._compute_stats(samples)
+        mean, std, median, p10, p90 = self._compute_stats(samples)
         with self._lock:
             self._personal_mean = mean
             self._personal_std = std
+            self._personal_median = median
+            self._personal_p10 = p10
+            self._personal_p90 = p90
             self._personal_n = len(samples)
 
         logger.info(
@@ -127,6 +133,9 @@ class BaselineManager:
         with self._lock:
             self._personal_mean = None
             self._personal_std = None
+            self._personal_median = None
+            self._personal_p10 = None
+            self._personal_p90 = None
             self._personal_n = 0
             self._calibration_samples.clear()
         logger.info("Personal baseline reset")
@@ -164,6 +173,23 @@ class BaselineManager:
                     self._personal_mean.get(feat, 0.0),
                     self._personal_std.get(feat, 0.0),
                 )
+                for feat in _FEATURE_NAMES
+            }
+
+
+    def personal_baseline_summary(self) -> dict[str, dict[str, float]]:
+        """Return robust personal baseline distribution statistics for debugging."""
+        with self._lock:
+            if not all((self._personal_mean, self._personal_std, self._personal_median, self._personal_p10, self._personal_p90)):
+                return {}
+            return {
+                feat: {
+                    "mean": self._personal_mean.get(feat, 0.0),
+                    "std": self._personal_std.get(feat, 0.0),
+                    "median": self._personal_median.get(feat, 0.0),
+                    "p10": self._personal_p10.get(feat, 0.0),
+                    "p90": self._personal_p90.get(feat, 0.0),
+                }
                 for feat in _FEATURE_NAMES
             }
 
@@ -205,10 +231,10 @@ class BaselineManager:
         Clips to ±``config.Z_CLIP`` before returning.
         Falls back to 0.0 if standard deviation is zero or data is unavailable.
         """
-        mean, std = self._active_baseline(feature_name)
-        if mean is None or std is None or std < 1e-9:
+        center, std = self._active_baseline(feature_name)
+        if center is None or std is None or std < 1e-9:
             return 0.0
-        z = (value - mean) / std
+        z = (value - center) / std
         return float(np.clip(z, -config.Z_CLIP, config.Z_CLIP))
 
     def missing_baseline_penalty(self) -> float:
@@ -222,8 +248,9 @@ class BaselineManager:
     def _active_baseline(self, feature_name: str) -> tuple[float | None, float | None]:
         with self._lock:
             if self._personal_mean and feature_name in self._personal_mean:
+                center = (self._personal_median or self._personal_mean).get(feature_name, self._personal_mean[feature_name])
                 return (
-                    self._personal_mean[feature_name],
+                    center,
                     self._personal_std.get(feature_name),  # type: ignore[union-attr]
                 )
             # Rolling fallback
@@ -236,14 +263,17 @@ class BaselineManager:
         values = [v for v in values if v is not None and math.isfinite(v)]
         if len(values) < 3:
             return None, None
-        return float(np.mean(values)), float(np.std(values))
+        return float(np.median(values)), self._robust_std(feature_name, values)
 
     @staticmethod
     def _compute_stats(
         samples: list[AcousticFeatureWindow],
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
         mean: dict[str, float] = {}
         std: dict[str, float] = {}
+        median: dict[str, float] = {}
+        p10: dict[str, float] = {}
+        p90: dict[str, float] = {}
         for feat in _FEATURE_NAMES:
             values = [
                 getattr(s, feat)
@@ -253,8 +283,40 @@ class BaselineManager:
             ]
             if values:
                 mean[feat] = float(np.mean(values))
-                std[feat] = float(np.std(values)) if len(values) > 1 else 1.0
+                median[feat] = float(np.median(values))
+                p10[feat] = float(np.percentile(values, 10))
+                p90[feat] = float(np.percentile(values, 90))
+                std[feat] = BaselineManager._robust_std(feat, values)
             else:
                 mean[feat] = 0.0
+                median[feat] = 0.0
+                p10[feat] = 0.0
+                p90[feat] = 0.0
                 std[feat] = 1.0
-        return mean, std
+        return mean, std, median, p10, p90
+
+    @staticmethod
+    def _robust_std(feature_name: str, values: list[float]) -> float:
+        """Estimate spread from percentiles and enforce feature-specific tolerance floors.
+
+        Calm calibration can be very consistent; using its tiny raw standard
+        deviation makes ordinary speech variation look like an extreme event.
+        This keeps the personal baseline, but treats it as a normal range rather
+        than a single narrow boundary.
+        """
+        arr = np.asarray(values, dtype=float)
+        raw_std = float(np.std(arr)) if arr.size > 1 else 0.0
+        iqr_std = float((np.percentile(arr, 75) - np.percentile(arr, 25)) / 1.349) if arr.size > 1 else 0.0
+        p80_std = float((np.percentile(arr, 90) - np.percentile(arr, 10)) / 2.563) if arr.size > 1 else 0.0
+        center = abs(float(np.median(arr))) if arr.size else 0.0
+        rel_floor = center * config.BASELINE_STD_REL_FLOOR
+        absolute_floors = {
+            "rms_mean": config.BASELINE_RMS_STD_FLOOR,
+            "rms_max": config.BASELINE_PEAK_STD_FLOOR,
+            "pitch_median": config.BASELINE_PITCH_STD_FLOOR,
+            "pitch_range": config.BASELINE_PITCH_STD_FLOOR,
+            "pitch_variance": config.BASELINE_PITCH_STD_FLOOR ** 2,
+            "zcr_mean": config.BASELINE_ZCR_STD_FLOOR,
+            "spectral_centroid": config.BASELINE_CENTROID_STD_FLOOR,
+        }
+        return max(raw_std, iqr_std, p80_std, rel_floor, absolute_floors.get(feature_name, 1e-3))

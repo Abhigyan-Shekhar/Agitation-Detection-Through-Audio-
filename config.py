@@ -57,6 +57,14 @@ VAD_THRESHOLD: float = 0.5           # Silero speech-probability cut-off
 # ---------------------------------------------------------------------------
 BASELINE_COLLECT_MIN: float = 2.0    # minimum calm recording needed (minutes)
 BASELINE_ROLLING_MIN: float = 5.0    # rolling fallback window (minutes)
+# Robust baseline normalization: use median/percentile spread plus minimum
+# tolerances so calm calibration does not create hair-trigger z-scores.
+BASELINE_STD_REL_FLOOR: float = float(os.getenv("BASELINE_STD_REL_FLOOR", "0.35"))
+BASELINE_RMS_STD_FLOOR: float = float(os.getenv("BASELINE_RMS_STD_FLOOR", "0.015"))
+BASELINE_PEAK_STD_FLOOR: float = float(os.getenv("BASELINE_PEAK_STD_FLOOR", "0.04"))
+BASELINE_PITCH_STD_FLOOR: float = float(os.getenv("BASELINE_PITCH_STD_FLOOR", "35"))
+BASELINE_ZCR_STD_FLOOR: float = float(os.getenv("BASELINE_ZCR_STD_FLOOR", "0.015"))
+BASELINE_CENTROID_STD_FLOOR: float = float(os.getenv("BASELINE_CENTROID_STD_FLOOR", "250"))
 
 # ---------------------------------------------------------------------------
 # Score fusion
@@ -95,8 +103,13 @@ LINGUISTIC_FUSION_WEIGHT: float = 0.40
 BEHAVIOUR_REPETITION_THRESHOLD: float = 0.65
 BEHAVIOUR_Q_REP_THRESHOLD: float = 0.70
 BEHAVIOUR_REQUEST_REP_THRESHOLD: float = 0.65
-BEHAVIOUR_ENERGY_Z_SHOUT: float = 2.0
-BEHAVIOUR_ENERGY_BURST_SHOUT: float = 0.70
+BEHAVIOUR_ENERGY_Z_SHOUT: float = float(os.getenv("BEHAVIOUR_ENERGY_Z_SHOUT", "2.5"))
+BEHAVIOUR_ENERGY_BURST_SHOUT: float = float(os.getenv("BEHAVIOUR_ENERGY_BURST_SHOUT", "1.8"))
+SCREAM_ON_SCORE_THRESHOLD: float = float(os.getenv("SCREAM_ON_SCORE_THRESHOLD", "0.72"))
+SCREAM_OFF_SCORE_THRESHOLD: float = float(os.getenv("SCREAM_OFF_SCORE_THRESHOLD", "0.45"))
+SCREAM_MIN_CONSECUTIVE_WINDOWS: int = int(os.getenv("SCREAM_MIN_CONSECUTIVE_WINDOWS", "3"))
+SCREAM_RECOVERY_CONSECUTIVE_WINDOWS: int = int(os.getenv("SCREAM_RECOVERY_CONSECUTIVE_WINDOWS", "2"))
+SCREAM_MIN_DURATION_SEC: float = float(os.getenv("SCREAM_MIN_DURATION_SEC", "1.5"))
 BEHAVIOUR_ABSOLUTE_RMS_SHOUT: float = float(os.getenv("BEHAVIOUR_ABSOLUTE_RMS_SHOUT", "0.18"))
 BEHAVIOUR_ABSOLUTE_PEAK_SHOUT: float = float(os.getenv("BEHAVIOUR_ABSOLUTE_PEAK_SHOUT", "0.65"))
 BEHAVIOUR_CLIPPING_SHOUT: float = float(os.getenv("BEHAVIOUR_CLIPPING_SHOUT", "0.02"))
