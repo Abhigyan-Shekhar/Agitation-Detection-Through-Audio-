@@ -632,13 +632,19 @@ def _render_acoustic_baseline_debug() -> None:
     st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
 
     personal_stats = bm.personal_baseline_stats()
+    personal_summary = bm.personal_baseline_summary()
     baseline_rows = []
     for feat in _BASELINE_DEBUG_FEATURES:
         mean, std = personal_stats.get(feat, (None, None))
+        summary = personal_summary.get(feat, {})
         baseline_rows.append({
             "feature": feat,
             "personal_mean": None if mean is None else round(float(mean), 6),
-            "personal_std": None if std is None else round(float(std), 6),
+            "personal_median": None if not summary else round(float(summary.get("median", 0.0)), 6),
+            "personal_p10": None if not summary else round(float(summary.get("p10", 0.0)), 6),
+            "personal_p90": None if not summary else round(float(summary.get("p90", 0.0)), 6),
+            "personal_std_or_tolerance": None if std is None else round(float(std), 6),
+            "current_deviation": None if not summary else round(float(getattr(latest, feat, 0.0)) - float(summary.get("median", 0.0)), 6),
         })
     st.markdown("**B. Personal baseline**")
     if personal_stats:
@@ -680,6 +686,11 @@ def _render_acoustic_baseline_debug() -> None:
         score_cols[2].metric("Result linguistic", "N/A")
         score_cols[3].metric("Fused agitation", "N/A")
         score_cols[4].metric("Reliability", "N/A")
+
+    classifier = st.session_state.get("classifier")
+    if classifier is not None and hasattr(classifier, "scream_debug_state"):
+        st.markdown("**F. Scream gate (hysteresis / persistence)**")
+        st.json(classifier.scream_debug_state)
 
 
 def _render_summary_cards(df: pd.DataFrame) -> None:
