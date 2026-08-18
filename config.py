@@ -73,6 +73,13 @@ Z_CLIP: float = 3.0                  # clamp Z-scores to ±3 before fusion
 EMA_ALPHA_UP: float = 0.55           # fast escalation
 EMA_ALPHA_DOWN: float = 0.20         # slow de-escalation
 
+# Acoustic sigmoid bias (see score_fusion.py module docstring).
+# Subtract this from the weighted Z-sum before passing through sigmoid so that
+# all-zero Z-scores (no personal baseline) map to ~0.047 instead of 0.5.
+# Increase to suppress the acoustic branch further; decrease toward 0 to
+# revert to the pre-bias behaviour (set to 0 to disable).
+ACOUSTIC_SIGMOID_BIAS: float = float(os.getenv("ACOUSTIC_SIGMOID_BIAS", "3.0"))
+
 # Acoustic branch weights (must sum to 1.0)
 ACOUSTIC_WEIGHTS: dict[str, float] = {
     "energy_z":           0.30,
@@ -153,3 +160,12 @@ ANALYSIS_MODE: str = os.getenv("ANALYSIS_MODE", "rule_based")
 ENABLE_GEMINI_COMPARISON: bool = (
     os.getenv("ENABLE_GEMINI_COMPARISON", "false").lower() == "true"
 )
+
+# ---------------------------------------------------------------------------
+# Debug / diagnostic logging
+# ---------------------------------------------------------------------------
+# When true, the score_fusion and behaviour_classifier loggers are set to
+# DEBUG so that every intermediate value (baseline stats, z-scores, acoustic
+# score, scream gate flags, final label) is emitted to the log.
+# Enable via env var: DEBUG_TRACE_LOGGING=true
+DEBUG_TRACE_LOGGING: bool = os.getenv("DEBUG_TRACE_LOGGING", "false").lower() == "true"

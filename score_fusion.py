@@ -5,7 +5,10 @@ Responsibilities
 * Accept aggregated ``AcousticFeatureWindow`` and ``LinguisticFeatures``
   for a completed utterance.
 * Z-score each acoustic feature via ``BaselineManager``.
-* Compute the acoustic branch score via a sigmoid weighted sum.
+* Compute the acoustic branch score via a *biased* sigmoid weighted sum
+  (bias = ``ACOUSTIC_SIGMOID_BIAS``) so that all-zero z-scores produce
+  a near-zero acoustic score instead of 0.5.  This stops neutral speech
+  from inflating the fused score when no personal baseline has been set.
 * Compute the linguistic branch score as a linear weighted sum.
 * Fuse into a raw final score (60% acoustic, 40% linguistic).
 * Apply asymmetric EMA smoothing (fast escalation, slow de-escalation).
@@ -18,6 +21,17 @@ Design
 * The ``ScoreFusion`` instance is long-lived (held in Streamlit session
   state) so it retains EMA state between utterances.
 * Thread-safety: called from the Streamlit fragment thread only.
+
+Debug logging
+-------------
+* Set the ``score_fusion`` logger to DEBUG to see a full trace of every
+  intermediate value: baseline median/spread (via BaselineManager stats),
+  per-feature z-scores, weighted contributions, acoustic score, linguistic
+  score, raw fused score, smoothed score, and severity label.
+  Example::
+
+      import logging
+      logging.getLogger("score_fusion").setLevel(logging.DEBUG)
 """
 from __future__ import annotations
 
@@ -37,6 +51,28 @@ from event_models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Honour the DEBUG_TRACE_LOGGING flag at import time so operators can flip it
+# via env var without touching the code.
+if config.DEBUG_TRACE_LOGGING:
+    logging.getLogger("score_fusion").setLevel(logging.DEBUG)
+    logging.getLogger("behaviour_classifier").setLevel(logging.DEBUG)
+    logger.info(
+        "DEBUG_TRACE_LOGGING=true — full intermediate traces enabled for "
+        "score_fusion and behaviour_classifier"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Acoustic sigmoid bias
+# ---------------------------------------------------------------------------
+# Without a personal baseline the rolling fallback may be sparse or
+# self-referential, causing z_score() to return 0.0 for all features.
+# sigmoid(0) = 0.5, and with a 60 % acoustic fusion weight that already
+# pushes raw_final to 0.30 — dangerously close to the Mild boundary.
+# Shifting the sigmoid input by –ACOUSTIC_SIGMOID_BIAS centres neutral
+# speech well inside the Low severity band.
+_ACOUSTIC_SIGMOID_BIAS: float = config.ACOUSTIC_SIGMOID_BIAS  # sigmoid(-3) ≈ 0.047
 
 
 def _sigmoid(x: float) -> float:
@@ -126,6 +162,24 @@ class ScoreFusion:
             reliability,
             acoustic is not None,
         )
+        # Comprehensive intermediate trace at DEBUG level — includes everything
+        # needed to diagnose false positives and missed screaming detections.
+        logger.debug(
+            "SCORE_TRACE transcript=%r  "
+            "acoustic_score=%.4f linguistic_score=%.4f  "
+            "raw_final=%.4f smoothed=%.4f  "
+            "severity=%s  ema_prev=%.4f ema_alpha=%s  "
+            "reliability=%.4f  "
+            "acoustic_contributions=%s  linguistic_contributions=%s",
+            utterance.full_text,
+            acoustic_score, linguistic_score,
+            raw_final, smoothed,
+            severity,
+            previous, ("UP" if raw_final > previous else "DOWN"),
+            reliability,
+            {k: f"{v:.4f}" for k, v in self._acoustic_score(acoustic)[1].items()} if acoustic else {},
+            {k: f"{v:.4f}" for k, v in self._linguistic_score(linguistic)[1].items()},
+        )
 
         return FusedResult(
             acoustic_score=round(acoustic_score, 4),
@@ -213,7 +267,12 @@ class ScoreFusion:
             + weights["pause_irregularity_z"] * pause_irr_z
         )
 
-        score = _clamp(_sigmoid(weighted_sum))
+        # Subtract the sigmoid bias so neutral z-scores (all zero, i.e. no
+        # personal baseline yet) yield ~0.047 instead of 0.5.  This prevents
+        # ordinary speech from pushing the fused score into Mild territory
+        # simply because the rolling baseline hasn't converged yet.
+        biased_sum = weighted_sum - _ACOUSTIC_SIGMOID_BIAS
+        score = _clamp(_sigmoid(biased_sum))
 
         contributions = {
             "energy_above_baseline": round(weights["energy_z"] * energy_z, 4),
@@ -223,6 +282,29 @@ class ScoreFusion:
             "speech_rate": round(weights["speech_rate_z"] * speech_rate_z, 4),
             "pause_irregularity": round(weights["pause_irregularity_z"] * pause_irr_z, 4),
         }
+
+        # ---- Full intermediate trace (DEBUG) --------------------------------
+        # Retrieve baseline stats for the two most diagnostic features so
+        # the operator can see median/spread alongside z-scores in one log line.
+        bm_stats = bm.personal_baseline_stats()
+        energy_baseline = bm_stats.get("rms_mean", (None, None))
+        burst_baseline = bm_stats.get("rms_max", (None, None))
+        logger.debug(
+            "ACOUSTIC_TRACE  "
+            "baseline_rms_mean=(%.4f±%.4f) baseline_rms_max=(%.4f±%.4f) "
+            "has_personal=%s  "
+            "z: energy=%.3f energy_max=%.3f pitch_range=%.3f pitch_var=%.3f "
+            "speech_rate=%.3f pause_irr=%.3f  "
+            "weighted_sum=%.4f biased_sum=%.4f  acoustic_score=%.4f",
+            energy_baseline[0] if energy_baseline[0] is not None else float("nan"),
+            energy_baseline[1] if energy_baseline[1] is not None else float("nan"),
+            burst_baseline[0] if burst_baseline[0] is not None else float("nan"),
+            burst_baseline[1] if burst_baseline[1] is not None else float("nan"),
+            bm.has_personal_baseline,
+            energy_z, energy_max_z, pitch_range_z, pitch_var_z,
+            speech_rate_z, pause_irr_z,
+            weighted_sum, biased_sum, score,
+        )
 
         return score, contributions, z_scores
 

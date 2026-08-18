@@ -48,7 +48,16 @@ def _check_screaming(
     result: FusedResult,
     acoustic: AcousticFeatureWindow | None,
 ) -> BehaviourLabel | None:
-    """Screaming/shouting from acoustic energy, works even if transcript fails."""
+    """Screaming/shouting from acoustic energy, works even if transcript fails.
+
+    Two detection paths:
+    1. Z-score path — requires the fused acoustic score or relative-energy
+       contributions to cross the configured thresholds.
+    2. Absolute path — triggers directly on raw RMS/peak/clipping values that
+       are physically impossible for normal conversational speech, bypassing
+       z-score gating entirely.  This ensures sustained screaming is detected
+       even when the rolling baseline has not converged.
+    """
     if acoustic is None:
         return None
 
@@ -67,6 +76,19 @@ def _check_screaming(
     )
     voiced_present = acoustic.voiced_ratio >= 0.30 or absolute_energy_high or clipping_high
     high_acoustic_agitation = result.acoustic_score >= config.BEHAVIOUR_VERBAL_AGGR_ACOUSTIC
+
+    # ---- Debug gate trace -----------------------------------------------
+    logger.debug(
+        "SCREAM_GATE  rms_mean=%.4f rms_max=%.4f clipping=%.4f voiced=%.3f  "
+        "energy_contrib=%.4f(need≥%.4f) burst_contrib=%.4f(need≥%.4f)  "
+        "energy_high=%s burst_high=%s absolute_energy_high=%s clipping_high=%s "
+        "voiced_present=%s high_acoustic_agitation=%s(need≥%.2f)",
+        acoustic.rms_mean, acoustic.rms_max, acoustic.clipping_ratio, acoustic.voiced_ratio,
+        energy_contrib, config.ACOUSTIC_WEIGHTS["energy_z"] * config.BEHAVIOUR_ENERGY_Z_SHOUT / config.Z_CLIP,
+        burst_contrib, config.ACOUSTIC_WEIGHTS["energy_burst_z"] * config.BEHAVIOUR_ENERGY_BURST_SHOUT,
+        energy_high, burst_high, absolute_energy_high, clipping_high,
+        voiced_present, high_acoustic_agitation, config.BEHAVIOUR_VERBAL_AGGR_ACOUSTIC,
+    )
 
     if voiced_present and ((energy_high and burst_high) or high_acoustic_agitation or absolute_energy_high or clipping_high):
         absolute_conf = max(
