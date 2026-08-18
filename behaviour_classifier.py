@@ -395,12 +395,13 @@ class BehaviourClassifier:
             return None
 
         now = getattr(result.acoustic_features, "end_time", None) or time.time()
-        if result.acoustic_score >= config.SCREAM_ON_SCORE_THRESHOLD:
+        gate_score = label.confidence
+        if gate_score >= config.SCREAM_ON_SCORE_THRESHOLD:
             self._scream_positive_windows += 1
             self._scream_recovery_windows = 0
             if self._scream_first_positive_ts is None:
                 self._scream_first_positive_ts = now
-        elif self._scream_active and result.acoustic_score >= config.SCREAM_OFF_SCORE_THRESHOLD:
+        elif self._scream_active and gate_score >= config.SCREAM_OFF_SCORE_THRESHOLD:
             return label
         else:
             self._scream_positive_windows = 0

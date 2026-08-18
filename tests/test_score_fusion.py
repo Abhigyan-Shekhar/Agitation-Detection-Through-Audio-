@@ -16,8 +16,8 @@ from event_models import (
 from score_fusion import ScoreFusion, _sigmoid, _clamp
 
 
-def _make_utterance(text: str = "test") -> Utterance:
-    ts = time.time()
+def _make_utterance(text: str = "test", timestamp: float | None = None) -> Utterance:
+    ts = timestamp or time.time()
     return Utterance(
         lines=[CommittedLine(text=text, timestamp=ts)],
         start_time=ts - 2.0,
@@ -279,12 +279,20 @@ class TestScreamingAlwaysDetectedAboveAbsoluteThreshold:
         self.clf = BehaviourClassifier()
 
     def _classify_acoustic(self, **acoustic_kwargs):
-        acoustic = _make_acoustic(**acoustic_kwargs)
-        result = self.fusion.fuse(
-            _make_utterance("aaaaah"), acoustic, _make_linguistic()
-        )
-        result.acoustic_features = acoustic
-        return self.clf.classify(result).behaviours
+        import time
+        labels = []
+        for i in range(3):
+            acoustic = _make_acoustic(**acoustic_kwargs)
+            # stagger timestamps so duration gate passes (need >= 1.5s, 3 steps of 1s = 2s)
+            ts = time.time() + i * 1.0
+            acoustic.start_time = ts - 2.0
+            acoustic.end_time = ts
+            result = self.fusion.fuse(
+                _make_utterance("aaaaah", timestamp=ts), acoustic, _make_linguistic()
+            )
+            result.acoustic_features = acoustic
+            labels = self.clf.classify(result).behaviours
+        return labels
 
     def test_very_loud_sustained_scream_detected(self):
         """rms_mean well above threshold + rms_max above peak threshold."""
@@ -321,27 +329,33 @@ class TestScreamingAlwaysDetectedAboveAbsoluteThreshold:
         acoustic = _make_acoustic(
             rms_mean=0.30, rms_max=0.75, voiced_ratio=0.60, clipping_ratio=0.0,
         )
-        import time
-        from event_models import CommittedLine, FusedResult, Utterance
         ts = time.time()
-        result = FusedResult(
-            acoustic_score=0.20,   # deliberately low (e.g. baseline not converged)
-            linguistic_score=0.0,
-            raw_final_score=0.12,
-            smoothed_score=0.10,
-            severity="Low",
-            reliability=0.9,
-            utterance=Utterance(
-                lines=[CommittedLine(text="aah", timestamp=ts)],
-                start_time=ts - 2, end_time=ts,
-            ),
-            acoustic_features=acoustic,
-            linguistic_features=_make_linguistic(),
-            acoustic_contributions={"energy_above_baseline": 0.05, "energy_burst": 0.02},
-            linguistic_contributions={},
-        )
+        acoustic.start_time = ts - 2.0
+        acoustic.end_time = ts
+        
+        labels = []
         clf = BehaviourClassifier()
-        labels = clf.classify(result).behaviours
+        for i in range(3):
+            step_ts = ts + i * 1.0
+            acoustic.end_time = step_ts
+            result = FusedResult(
+                acoustic_score=0.20,
+                linguistic_score=0.0,
+                raw_final_score=0.12,
+                smoothed_score=0.10,
+                severity="Low",
+                reliability=0.9,
+                utterance=Utterance(
+                    lines=[CommittedLine(text="aah", timestamp=step_ts)],
+                    start_time=step_ts - 2, end_time=step_ts,
+                ),
+                acoustic_features=acoustic,
+                linguistic_features=_make_linguistic(),
+                acoustic_contributions={"energy_above_baseline": 0.05, "energy_burst": 0.02},
+                linguistic_contributions={},
+            )
+            labels = clf.classify(result).behaviours
+
         assert "Screaming" in labels, (
             f"Screaming not detected even with rms_mean=0.30, rms_max=0.75. "
             f"Got: {labels}. Acoustic score was deliberately set to 0.20 to simulate "

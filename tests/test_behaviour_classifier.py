@@ -67,7 +67,25 @@ class TestBehaviourClassifier:
         self.clf = BehaviourClassifier()
 
     def _classify(self, result: FusedResult) -> list[str]:
-        return self.clf.classify(result).behaviours
+        # Simulate consecutive windows for persistence gates like screaming
+        import time
+        labels = []
+        original_ts = getattr(result.acoustic_features, "end_time", None) or time.time()
+        for i in range(3):
+            # Clone and stagger the time
+            step_ts = original_ts + i * 1.0
+            
+            import copy
+            step_result = copy.copy(result)
+            
+            if step_result.acoustic_features:
+                step_acoustic = copy.copy(step_result.acoustic_features)
+                step_acoustic.start_time = step_ts - 2.0
+                step_acoustic.end_time = step_ts
+                step_result.acoustic_features = step_acoustic
+            
+            labels = self.clf.classify(step_result).behaviours
+        return labels
 
     # ---- No agitation -------------------------------------------------
 
