@@ -117,12 +117,9 @@ def _check_yelling_language(
 ) -> BehaviourLabel | None:
     if linguistic is None:
         return None
-    if linguistic.yelling_score >= 0.50:
-        return BehaviourLabel(
-            label=_canonical_label("Screaming/shouting"),
-            evidence=f"Transcript yelling score={linguistic.yelling_score:.2f}",
-            confidence=round(min(1.0, linguistic.yelling_score), 3),
-        )
+    # Text can report or mention yelling ("stop yelling at me") but cannot
+    # establish that the current microphone audio contains a scream.  Keep
+    # this cue in diagnostics; screaming itself requires acoustic evidence.
     return None
 
 
@@ -135,10 +132,13 @@ def _check_verbal_aggression(
         return None
 
     if linguistic.profanity_score >= 0.50:
-        conf = min(1.0, max(linguistic.profanity_score, 0.55 + 0.15 * result.acoustic_score))
+        transcript_quality = linguistic.evidence.get("transcript", {}).get("confidence")
+        quality_factor = 1.0 if transcript_quality is None else max(0.55, float(transcript_quality))
+        conf = min(1.0, max(linguistic.profanity_score * quality_factor, 0.55 + 0.15 * result.acoustic_score))
         return BehaviourLabel(
             label=_canonical_label("Possible verbal aggression"),
-            evidence=f"Explicit profanity score={linguistic.profanity_score:.2f}",
+            evidence=(f"Explicit profanity score={linguistic.profanity_score:.2f}; "
+                      f"ASR confidence={transcript_quality if transcript_quality is not None else 'not reported'}"),
             confidence=round(conf, 3),
         )
 
@@ -383,9 +383,29 @@ class BehaviourClassifier:
         self._scream_recovery_windows = 0
         self._scream_active = False
         self._scream_first_positive_ts: float | None = None
+        self._last_scream_window_ts: float | None = None
 
     def _scream_gate(self, label: BehaviourLabel | None, result: FusedResult) -> BehaviourLabel | None:
+        window_ts = getattr(result.acoustic_features, "end_time", None)
+        # The dashboard refreshes every second while acoustic windows arrive
+        # every 0.5 s. Never count the same acoustic window multiple times;
+        # otherwise one loud word can satisfy a three-window persistence gate.
+        if window_ts is not None and window_ts == self._last_scream_window_ts:
+            return label if self._scream_active else None
+        if window_ts is not None:
+            self._last_scream_window_ts = window_ts
         if label is None:
+            # Once confirmed, retain the active state through intermediate
+            # evidence.  This is hysteresis, not a new detection: it stops a
+            # sustained scream flickering off between feature windows.
+            if self._scream_active and result.acoustic_score >= config.SCREAM_OFF_SCORE_THRESHOLD:
+                return BehaviourLabel(
+                    label=_canonical_label("Screaming/shouting"),
+                    evidence=(f"Scream gate holding active state; acoustic score="
+                              f"{result.acoustic_score:.2f} >= off threshold "
+                              f"{config.SCREAM_OFF_SCORE_THRESHOLD:.2f}"),
+                    confidence=round(result.acoustic_score, 3),
+                )
             self._scream_positive_windows = 0
             self._scream_first_positive_ts = None
             if result.acoustic_score <= config.SCREAM_OFF_SCORE_THRESHOLD:
@@ -436,6 +456,7 @@ class BehaviourClassifier:
             "on_threshold": config.SCREAM_ON_SCORE_THRESHOLD,
             "off_threshold": config.SCREAM_OFF_SCORE_THRESHOLD,
             "min_consecutive_windows": config.SCREAM_MIN_CONSECUTIVE_WINDOWS,
+            "last_distinct_window_end_time": self._last_scream_window_ts,
         }
 
     def classify(self, result: FusedResult) -> FusedResult:

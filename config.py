@@ -65,6 +65,9 @@ BASELINE_PEAK_STD_FLOOR: float = float(os.getenv("BASELINE_PEAK_STD_FLOOR", "0.0
 BASELINE_PITCH_STD_FLOOR: float = float(os.getenv("BASELINE_PITCH_STD_FLOOR", "35"))
 BASELINE_ZCR_STD_FLOOR: float = float(os.getenv("BASELINE_ZCR_STD_FLOOR", "0.015"))
 BASELINE_CENTROID_STD_FLOOR: float = float(os.getenv("BASELINE_CENTROID_STD_FLOOR", "250"))
+# The dashboard has no resident identifier yet, so this is intentionally a
+# local per-deployment file. Set BASELINE_STORAGE_PATH per resident/device.
+BASELINE_STORAGE_PATH: str = os.getenv("BASELINE_STORAGE_PATH", ".odu_personal_baseline.json")
 
 # ---------------------------------------------------------------------------
 # Score fusion

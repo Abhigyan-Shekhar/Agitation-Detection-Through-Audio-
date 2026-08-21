@@ -160,7 +160,7 @@ class TestBehaviourClassifier:
         assert "Cursing / verbal aggression" not in labels
         assert "Screaming" in labels
 
-    def test_transcript_yelling_terms_trigger_screaming(self):
+    def test_transcript_mention_of_yelling_does_not_trigger_screaming(self):
         linguistic = LinguisticFeatures(yelling_score=0.65)
         result = _make_result(
             acoustic_score=0.10,
@@ -169,8 +169,8 @@ class TestBehaviourClassifier:
             utterance_text="Stop yelling at me.",
         )
         labels = self._classify(result)
-        assert "Screaming" in labels
-        assert "No audio agitation detected" not in labels
+        assert "Screaming" not in labels
+        assert "No audio agitation detected" in labels
 
     def test_absolute_loud_clipped_audio_triggers_screaming_without_baseline_score(self):
         acoustic = AcousticFeatureWindow(

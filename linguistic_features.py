@@ -153,6 +153,15 @@ PROFANITY_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
     (re.compile(r"\bharamzada\b", re.I), 0.55),
 )
 
+# An ASR transcript may quote or discuss a profanity without containing a
+# profanity event.  These contexts are deliberately narrow so genuine speech
+# such as "that was fucking painful" remains detectable.
+_PROFANITY_META_CONTEXT = re.compile(
+    r"\b(?:the\s+(?:word|term)|a\s+(?:curse|swear)\s+word|profanity|"
+    r"profane\s+(?:word|language)|how\s+to\s+spell|do\s+not\s+say)\b",
+    re.I,
+)
+
 YELLING_TERMS: frozenset[str] = frozenset({
     "shout", "shouting", "yell", "yelling", "scream", "screaming",
     "shut up", "shut the hell up", "stop shouting", "stop yelling",
@@ -389,6 +398,14 @@ class LinguisticAnalyzer:
         self._prune_history(utterance.end_time, history)
 
         evidence: dict = {}
+
+        confidences = [line.transcript_confidence for line in utterance.lines
+                       if line.transcript_confidence is not None]
+        transcript_confidence = float(np.clip(np.mean(confidences), 0.0, 1.0)) if confidences else None
+        evidence["transcript"] = {
+            "confidence": transcript_confidence,
+            "quality": "reported" if transcript_confidence is not None else "not_reported",
+        }
 
         # A. Repetition
         rep, q_rep, req_rep = self._repetition_scores(text, history)
@@ -643,6 +660,8 @@ class LinguisticAnalyzer:
         return min(1.0, matches / 2.0)
 
     def _profanity_score(self, text: str) -> float:
+        if _PROFANITY_META_CONTEXT.search(text):
+            return 0.0
         return min(1.0, sum(weight for pattern, weight in PROFANITY_PATTERNS if pattern.search(text)))
 
     def _yelling_score(self, text: str) -> float:

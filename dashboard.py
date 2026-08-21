@@ -286,7 +286,10 @@ def _consume() -> None:
         pass
 
     pipeline = manager.pipeline if manager is not None else None
-    _consume_acoustic_only_screaming(acoustic_worker, classifier, pipeline.latest_loudness if pipeline else None)
+    # Use the completed two-second acoustic window for screaming. Raw callback
+    # loudness is retained for diagnostics only: one loud knock or word must
+    # not bypass persistence and be presented as a behavioural event.
+    _consume_acoustic_only_screaming(acoustic_worker, classifier)
     _consume_acoustic_only_strange_noise(acoustic_worker, classifier)
 
 
@@ -325,9 +328,8 @@ def _consume_acoustic_only_screaming(
     loudness: LoudnessSnapshot | None = None,
 ) -> None:
     acoustic = acoustic_worker.latest_window() if acoustic_worker is not None else None
-    loudness_score = _loudness_scream_score(loudness)
     acoustic_score = _acoustic_scream_score(acoustic)
-    scream_score = max(loudness_score, acoustic_score)
+    scream_score = acoustic_score
     if scream_score < 0.65:
         return
 
@@ -338,12 +340,8 @@ def _consume_acoustic_only_screaming(
 
     severity = "High" if scream_score >= 0.85 else "Moderate"
     acoustic_for_result = acoustic or AcousticFeatureWindow(
-        start_time=(loudness.timestamp if loudness else now),
-        end_time=(loudness.timestamp if loudness else now),
-        rms_mean=(loudness.rms if loudness else 0.0),
-        rms_max=(loudness.peak if loudness else 0.0),
-        clipping_ratio=(loudness.clipping_ratio if loudness else 0.0),
-        voiced_ratio=1.0 if loudness else 0.0,
+        start_time=now,
+        end_time=now,
     )
     result = FusedResult(
         acoustic_score=round(scream_score, 4),
@@ -356,9 +354,6 @@ def _consume_acoustic_only_screaming(
         acoustic_features=acoustic_for_result,
         linguistic_features=LinguisticFeatures(),
         acoustic_contributions={
-            "raw_callback_rms": round(loudness.rms if loudness else 0.0, 4),
-            "raw_callback_peak": round(loudness.peak if loudness else 0.0, 4),
-            "raw_callback_clipping": round(loudness.clipping_ratio if loudness else 0.0, 4),
             "absolute_rms": round(acoustic.rms_mean if acoustic else 0.0, 4),
             "absolute_peak": round(acoustic.rms_max if acoustic else 0.0, 4),
             "clipping": round(acoustic.clipping_ratio if acoustic else 0.0, 4),
@@ -371,9 +366,9 @@ def _consume_acoustic_only_screaming(
 
     logger.info(
         "BEHAVIOUR_TRACE acoustic_only_screaming raw_rms=%.3f raw_peak=%.3f raw_clipping=%.3f window_rms=%.3f window_peak=%.3f window_clipping=%.3f labels=%s severity=%s",
-        loudness.rms if loudness else 0.0,
-        loudness.peak if loudness else 0.0,
-        loudness.clipping_ratio if loudness else 0.0,
+        0.0,
+        0.0,
+        0.0,
         acoustic.rms_mean if acoustic else 0.0,
         acoustic.rms_max if acoustic else 0.0,
         acoustic.clipping_ratio if acoustic else 0.0,
@@ -687,10 +682,19 @@ def _render_acoustic_baseline_debug() -> None:
         score_cols[3].metric("Fused agitation", "N/A")
         score_cols[4].metric("Reliability", "N/A")
 
-    classifier = st.session_state.get("classifier")
+    classifier = st.session_state.get("behaviour_classifier")
     if classifier is not None and hasattr(classifier, "scream_debug_state"):
         st.markdown("**F. Scream gate (hysteresis / persistence)**")
         st.json(classifier.scream_debug_state)
+
+    if result is not None:
+        st.markdown("**G. Latest linguistic and behaviour evidence**")
+        st.json({
+            "transcript": result.utterance.full_text if result.utterance else "",
+            "linguistic_signals": result.linguistic_features.evidence if result.linguistic_features else {},
+            "detected_behaviours": result.behaviours,
+            "reasons": [event.notes for event in result.behaviour_events],
+        })
 
 
 def _render_summary_cards(df: pd.DataFrame) -> None:

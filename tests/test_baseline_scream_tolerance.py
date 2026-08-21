@@ -37,8 +37,8 @@ def _result(acoustic: AcousticFeatureWindow, acoustic_score: float, energy: floa
     )
 
 
-def test_robust_baseline_tolerates_slightly_louder_normal_speech():
-    bm = BaselineManager()
+def test_robust_baseline_tolerates_slightly_louder_normal_speech(tmp_path):
+    bm = BaselineManager(storage_path=tmp_path / "baseline.json")
     bm.start_calibration()
     for i in range(bm.minimum_windows_for_personal):
         bm.feed(_window(float(i), rms=0.040 + (0.001 if i % 2 else 0.0), peak=0.11))
@@ -47,6 +47,20 @@ def test_robust_baseline_tolerates_slightly_louder_normal_speech():
     # 50% louder than calibration is raised conversational speech, not an
     # immediate scream. The robust floor keeps the z-score inside tolerance.
     assert bm.z_score("rms_mean", 0.060) < config.BEHAVIOUR_ENERGY_Z_SHOUT
+
+
+def test_personal_baseline_persists_and_reloads(tmp_path):
+    path = tmp_path / "baseline.json"
+    bm = BaselineManager(storage_path=path)
+    bm.start_calibration()
+    for i in range(bm.minimum_windows_for_personal):
+        bm.feed(_window(float(i), rms=0.04 + 0.001 * (i % 2), peak=0.11))
+    assert bm.stop_calibration()
+    assert path.exists()
+
+    reloaded = BaselineManager(storage_path=path)
+    assert reloaded.has_personal_baseline
+    assert reloaded.personal_baseline_stats() == bm.personal_baseline_stats()
 
 
 def test_screaming_requires_temporal_persistence_and_recovers_with_hysteresis():

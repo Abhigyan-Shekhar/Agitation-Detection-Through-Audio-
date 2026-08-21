@@ -135,6 +135,10 @@ class CommittedLine:
     speaker_label: str | None = None
     start_time: float | None = None
     end_time: float | None = None
+    # ASR confidence is propagated to the linguistic detector.  A missing
+    # value means the backend did not expose a confidence, not that the text
+    # is known to be correct.
+    transcript_confidence: float | None = None
 
 
 @dataclass

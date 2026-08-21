@@ -262,6 +262,7 @@ class TranscriptionWorker:
                     speaker_label=speaker_label,
                     start_time=start_ts,
                     end_time=end_ts,
+                    transcript_confidence=confidence,
                 )
                 logger.info(
                     "SPEAKER speaker=%s text=%r start=%.3f end=%.3f",
@@ -277,7 +278,11 @@ class TranscriptionWorker:
             # Some injected/alternative transcribers may return text without
             # segment timing. Preserve the pre-diarization behaviour for them.
             if not segments and text != self._last_text:
-                committed = CommittedLine(text=text, timestamp=result.timestamp)
+                committed = CommittedLine(
+                    text=text,
+                    timestamp=result.timestamp,
+                    transcript_confidence=confidence,
+                )
                 self._put_latest(self._committed_queue, committed)
                 emitted = True
             if emitted:

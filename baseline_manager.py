@@ -15,12 +15,15 @@ Responsibilities
 Design notes
 ------------
 * Thread-safe: all mutable state is protected by a ``threading.Lock``.
-* Persists nothing to disk in this version (future: JSON sidecar).
+* Persists validated personal-baseline statistics to a local JSON sidecar so a
+  completed calibration survives a dashboard restart.
 """
 from __future__ import annotations
 
 import logging
 import math
+import json
+from pathlib import Path
 import threading
 import time
 from collections import deque
@@ -62,7 +65,11 @@ class BaselineManager:
         Duration of the rolling fallback baseline in minutes.
     """
 
-    def __init__(self, rolling_window_min: float = config.BASELINE_ROLLING_MIN) -> None:
+    def __init__(
+        self,
+        rolling_window_min: float = config.BASELINE_ROLLING_MIN,
+        storage_path: str | Path | None = config.BASELINE_STORAGE_PATH,
+    ) -> None:
         self._lock = threading.Lock()
 
         # Personal baseline (set during explicit calibration)
@@ -81,6 +88,8 @@ class BaselineManager:
         # Rolling fallback: bounded deque keyed on timestamp
         max_rolling = int((rolling_window_min * 60) / config.ACOUSTIC_HOP_SEC) + 1
         self._rolling: Deque[AcousticFeatureWindow] = deque(maxlen=max_rolling)
+        self._storage_path = Path(storage_path) if storage_path else None
+        self._load_persisted_baseline()
 
     # ------------------------------------------------------------------
     # Calibration API (called from dashboard)
@@ -121,6 +130,7 @@ class BaselineManager:
             self._personal_p10 = p10
             self._personal_p90 = p90
             self._personal_n = len(samples)
+        self._persist_baseline()
 
         logger.info(
             "Baseline calibration complete — %d windows, personal baseline set",
@@ -138,6 +148,11 @@ class BaselineManager:
             self._personal_p90 = None
             self._personal_n = 0
             self._calibration_samples.clear()
+        if self._storage_path is not None:
+            try:
+                self._storage_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove persisted personal baseline: %s", exc)
         logger.info("Personal baseline reset")
 
     @property
@@ -264,6 +279,53 @@ class BaselineManager:
         if len(values) < 3:
             return None, None
         return float(np.median(values)), self._robust_std(feature_name, values)
+
+    def _load_persisted_baseline(self) -> None:
+        """Load a validated local calibration, never failing dashboard startup."""
+        if self._storage_path is None or not self._storage_path.exists():
+            return
+        try:
+            payload = json.loads(self._storage_path.read_text(encoding="utf-8"))
+            if payload.get("version") != 1:
+                raise ValueError("unsupported baseline format")
+            stats = {key: payload[key] for key in ("mean", "std", "median", "p10", "p90")}
+            if not all(isinstance(values, dict) and all(
+                math.isfinite(float(values.get(feature, float("nan"))))
+                for feature in _FEATURE_NAMES
+            ) for values in stats.values()):
+                raise ValueError("missing or non-finite feature statistics")
+            self._personal_mean = {feature: float(stats["mean"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_std = {feature: max(float(stats["std"][feature]), 1e-9) for feature in _FEATURE_NAMES}
+            self._personal_median = {feature: float(stats["median"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_p10 = {feature: float(stats["p10"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_p90 = {feature: float(stats["p90"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_n = max(0, int(payload.get("n", 0)))
+            logger.info("Loaded persisted personal baseline (%d windows)", self._personal_n)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring invalid persisted personal baseline %s: %s", self._storage_path, exc)
+
+    def _persist_baseline(self) -> None:
+        if self._storage_path is None:
+            return
+        with self._lock:
+            if not all((self._personal_mean, self._personal_std, self._personal_median, self._personal_p10, self._personal_p90)):
+                return
+            payload = {
+                "version": 1,
+                "n": self._personal_n,
+                "mean": self._personal_mean,
+                "std": self._personal_std,
+                "median": self._personal_median,
+                "p10": self._personal_p10,
+                "p90": self._personal_p90,
+            }
+        try:
+            self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._storage_path.with_suffix(self._storage_path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            temp_path.replace(self._storage_path)
+        except OSError as exc:
+            logger.warning("Could not persist personal baseline: %s", exc)
 
     @staticmethod
     def _compute_stats(
