@@ -112,7 +112,7 @@ class TestBehaviourClassifier:
         labels = self._classify(result)
         assert "Cursing / verbal aggression" not in labels
 
-    def test_explicit_curse_word_triggers_cursing_without_repetition(self):
+    def test_explicit_curse_word_alone_does_not_trigger_cursing(self):
         linguistic = LinguisticFeatures(
             profanity_score=0.70,
             negative_sentiment=0.2,
@@ -126,7 +126,23 @@ class TestBehaviourClassifier:
             utterance_text="What the fuck is going on?",
         )
         labels = self._classify(result)
-        assert "No audio agitation detected" not in labels
+        assert "Cursing / verbal aggression" not in labels
+
+    def test_profane_aggressive_context_triggers_cursing(self):
+        linguistic = LinguisticFeatures(
+            profanity_score=0.70,
+            negative_sentiment=0.75,
+            threat_score=0.0,
+            imperative_score=0.85,
+            yelling_score=0.70,
+        )
+        result = _make_result(
+            acoustic_score=0.78,
+            smoothed_score=0.70,
+            linguistic=linguistic,
+            utterance_text="FUCK YOU! STOP IT!",
+        )
+        labels = self._classify(result)
         assert "Cursing / verbal aggression" in labels
 
     # ---- Shouted neutral → Screaming but not verbal aggression --------
@@ -453,6 +469,41 @@ class TestBehaviourClassifier:
         assert "Making strange noises" in classified.behaviours
         assert "No audio agitation detected" not in classified.behaviours
         assert classified.behaviour_events[0].canonical_label == "Making strange noises"
+
+    def test_continuous_acoustic_strange_noise_is_one_event(self):
+        classifier = BehaviourClassifier()
+        ts = time.time()
+        event_counts = []
+        for offset in (0.0, 0.5, 1.0):
+            acoustic = AcousticFeatureWindow(
+                start_time=ts + offset - 2,
+                end_time=ts + offset,
+                non_speech_vocalization_score=0.82,
+                non_speech_vocalization_label="moaning",
+            )
+            result = _make_result(
+                acoustic_score=0.10,
+                smoothed_score=0.20,
+                acoustic=acoustic,
+                linguistic=LinguisticFeatures(),
+                utterance_text="",
+            )
+            event_counts.append(len(classifier.classify(result).behaviour_events))
+        assert event_counts == [1, 0, 0]
+
+    def test_separate_acoustic_strange_noises_create_two_events(self):
+        classifier = BehaviourClassifier()
+        ts = time.time()
+        first = AcousticFeatureWindow(start_time=ts - 2, end_time=ts, non_speech_vocalization_score=0.82)
+        assert classifier.classify(_make_result(acoustic=first, linguistic=LinguisticFeatures())).behaviour_events
+        for offset in (0.5, 1.0):
+            quiet = AcousticFeatureWindow(start_time=ts + offset - 2, end_time=ts + offset, non_speech_vocalization_score=0.0)
+            classifier.classify(_make_result(acoustic=quiet, linguistic=LinguisticFeatures()))
+        second_ts = ts + 3.0
+        second = AcousticFeatureWindow(start_time=second_ts - 2, end_time=second_ts, non_speech_vocalization_score=0.82)
+        classified = classifier.classify(_make_result(acoustic=second, linguistic=LinguisticFeatures()))
+        assert "Making strange noises" in classified.behaviours
+        assert len(classified.behaviour_events) == 1
         assert classified.behaviour_events[0].cmai_category == "Verbally non-aggressive: strange noises"
 
     def test_raw_acoustic_moaning_triggers_cmai_strange_noise_event(self):
