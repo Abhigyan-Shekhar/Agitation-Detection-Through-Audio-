@@ -40,3 +40,35 @@ ASR segments do not provide source separation.
 The default similarity threshold is intentionally close to SpeechBrain's
 native ECAPA speaker-verification threshold. Raise it only if different people
 are being merged; lower it if one person is still split into multiple IDs.
+
+## Uploaded audio transcription (Person 1)
+
+The batch module accepts WAV, MP3, M4A, FLAC, OGG, or WebM uploads (up to
+200 MB and 120 minutes), validates that they contain decodable audio, and
+resamples them in memory to mono 16 kHz float PCM for local faster-whisper.
+It deliberately retains silence so every timestamp remains aligned with the
+original audio used by the final playback UI.
+
+Run the standalone upload interface:
+
+```bash
+streamlit run person1_app.py
+```
+
+Its downloaded JSON is the Person 1 → Person 2 integration contract:
+
+```json
+[
+  {
+    "start": 10.2,
+    "end": 15.4,
+    "text": "Where is my daughter?",
+    "confidence": 0.91
+  }
+]
+```
+
+`batch_transcription.transcribe_upload` exposes the same contract directly to
+Python callers. Processing is local, so there is no network upload to compress;
+the in-memory mono 16 kHz representation already reduces the model input while
+avoiding lossy re-encoding.

@@ -6,6 +6,8 @@ scipy==1.13.1
 librosa==0.10.2
 # ASR — local direct transcription
 faster-whisper>=1.0.0
+# Explicit audio container decoding/resampling for uploaded batch files
+av>=12.0.0
 # Linguistic analysis
 vaderSentiment>=3.3.2
 rapidfuzz>=3.9.0
