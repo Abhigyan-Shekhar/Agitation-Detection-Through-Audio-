@@ -131,17 +131,6 @@ def _check_verbal_aggression(
     if linguistic is None:
         return None
 
-    if linguistic.profanity_score >= 0.50:
-        transcript_quality = linguistic.evidence.get("transcript", {}).get("confidence")
-        quality_factor = 1.0 if transcript_quality is None else max(0.55, float(transcript_quality))
-        conf = min(1.0, max(linguistic.profanity_score * quality_factor, 0.55 + 0.15 * result.acoustic_score))
-        return BehaviourLabel(
-            label=_canonical_label("Possible verbal aggression"),
-            evidence=(f"Explicit profanity score={linguistic.profanity_score:.2f}; "
-                      f"ASR confidence={transcript_quality if transcript_quality is not None else 'not reported'}"),
-            confidence=round(conf, 3),
-        )
-
     threat_ok = linguistic.threat_score >= config.BEHAVIOUR_VERBAL_AGGR_THREAT
     profanity_imperative_ok = (
         linguistic.profanity_score >= 0.30
@@ -149,6 +138,43 @@ def _check_verbal_aggression(
     )
     sentiment_ok = linguistic.negative_sentiment >= config.BEHAVIOUR_VERBAL_AGGR_SENTIMENT
     acoustic_ok = result.acoustic_score >= config.BEHAVIOUR_VERBAL_AGGR_ACOUSTIC
+    yelling_ok = linguistic.yelling_score >= 0.50
+    repeated_profane_context = (
+        linguistic.profanity_score >= 0.70
+        and (linguistic.repetition_score >= 0.50 or linguistic.urgency_score >= config.BEHAVIOUR_URGENCY_THRESHOLD)
+    )
+
+    # Profanity remains a linguistic cue, but it is not agitation evidence by
+    # itself.  Only surface cursing/verbal aggression when profanity is paired
+    # with contextual hostility (threats, imperatives, repeated urgent negative
+    # speech) or acoustic evidence that the current vocal behaviour is unusual.
+    if linguistic.profanity_score >= 0.50 and (
+        acoustic_ok
+        or threat_ok
+        or profanity_imperative_ok
+        or (sentiment_ok and (yelling_ok or repeated_profane_context))
+    ):
+        transcript_quality = linguistic.evidence.get("transcript", {}).get("confidence")
+        quality_factor = 1.0 if transcript_quality is None else max(0.55, float(transcript_quality))
+        context_score = max(
+            result.acoustic_score if acoustic_ok else 0.0,
+            linguistic.threat_score,
+            linguistic.imperative_score if profanity_imperative_ok else 0.0,
+            linguistic.yelling_score if yelling_ok else 0.0,
+            linguistic.repetition_score if repeated_profane_context else 0.0,
+            linguistic.negative_sentiment if sentiment_ok else 0.0,
+        )
+        conf = min(1.0, (0.55 * linguistic.profanity_score * quality_factor) + (0.45 * context_score))
+        return BehaviourLabel(
+            label=_canonical_label("Possible verbal aggression"),
+            evidence=(
+                f"Profanity cue score={linguistic.profanity_score:.2f} with contextual evidence; "
+                f"acoustic={result.acoustic_score:.2f}, threat={linguistic.threat_score:.2f}, "
+                f"imperative={linguistic.imperative_score:.2f}, negative={linguistic.negative_sentiment:.2f}; "
+                f"ASR confidence={transcript_quality if transcript_quality is not None else 'not reported'}"
+            ),
+            confidence=round(conf, 3),
+        )
 
     if acoustic_ok and sentiment_ok and (threat_ok or profanity_imperative_ok):
         conf = min(1.0, (result.acoustic_score + linguistic.threat_score) / 2.0)
@@ -384,6 +410,10 @@ class BehaviourClassifier:
         self._scream_active = False
         self._scream_first_positive_ts: float | None = None
         self._last_scream_window_ts: float | None = None
+        self._strange_noise_active = False
+        self._strange_noise_off_windows = 0
+        self._last_strange_noise_window_ts: float | None = None
+        self._last_strange_noise_end_ts: float | None = None
 
     def _scream_gate(self, label: BehaviourLabel | None, result: FusedResult) -> BehaviourLabel | None:
         window_ts = getattr(result.acoustic_features, "end_time", None)
@@ -447,6 +477,40 @@ class BehaviourClassifier:
         )
         return None
 
+
+    def _strange_noise_gate(self, label: BehaviourLabel | None, result: FusedResult) -> BehaviourLabel | None:
+        window_ts = getattr(result.acoustic_features, "end_time", None)
+        now = window_ts or getattr(result.utterance, "end_time", None) or time.time()
+        if window_ts is not None and window_ts == self._last_strange_noise_window_ts:
+            return None
+        if window_ts is not None:
+            self._last_strange_noise_window_ts = window_ts
+
+        if label is None:
+            if self._strange_noise_active:
+                self._strange_noise_off_windows += 1
+                if self._strange_noise_off_windows >= config.STRANGE_NOISE_OFF_CONSECUTIVE_WINDOWS:
+                    self._strange_noise_active = False
+                    self._last_strange_noise_end_ts = now
+            return None
+
+        if self._strange_noise_active:
+            self._strange_noise_off_windows = 0
+            logger.info("Strange-noise candidate merged into active episode: %s", label.evidence)
+            return None
+
+        if (
+            self._last_strange_noise_end_ts is not None
+            and now - self._last_strange_noise_end_ts < config.STRANGE_NOISE_EVENT_COOLDOWN_SEC
+        ):
+            logger.info("Strange-noise candidate suppressed by cooldown: %.2fs", now - self._last_strange_noise_end_ts)
+            return None
+
+        self._strange_noise_active = True
+        self._strange_noise_off_windows = 0
+        label.evidence += ", strange_noise_episode=start"
+        return label
+
     @property
     def scream_debug_state(self) -> dict[str, object]:
         return {
@@ -495,6 +559,8 @@ class BehaviourClassifier:
             label = rule(result, acoustic if rule in (_check_screaming, _check_acoustic_strange_noise) else linguistic)
             if rule is _check_screaming:
                 label = self._scream_gate(label, result)
+            if rule in (_check_strange_noise, _check_acoustic_strange_noise):
+                label = self._strange_noise_gate(label, result)
             if label is not None:
                 existing = next((item for item in detected if item.label == label.label), None)
                 if existing is None:

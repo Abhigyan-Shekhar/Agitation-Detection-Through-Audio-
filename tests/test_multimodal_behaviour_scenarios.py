@@ -37,7 +37,6 @@ def _classify(text: str, analyzer: LinguisticAnalyzer, ts: float) -> list[str]:
 
 
 @pytest.mark.parametrize(("text", "expected"), [
-    ("What the fuck is happening?", "Cursing / verbal aggression"),
     ("This hurts and nobody listens to me.", "Complaining"),
     ("I will not take my medicine. Leave me alone.", "Negativism"),
 ])
@@ -82,6 +81,8 @@ def test_scream_requires_three_distinct_acoustic_windows():
 
 def test_calm_textual_yelling_and_profanity_discussion_are_not_events():
     assert "Screaming" not in _classify("Please stop yelling at me.", LinguisticAnalyzer(), time.time())
+    assert "Cursing / verbal aggression" not in _classify("Fuck my life.", LinguisticAnalyzer(), time.time())
+    assert "Cursing / verbal aggression" not in _classify("Shit, I forgot my keys.", LinguisticAnalyzer(), time.time())
     assert "Cursing / verbal aggression" not in _classify(
         "The word fuck is a profanity in this example.", LinguisticAnalyzer(), time.time()
     )
