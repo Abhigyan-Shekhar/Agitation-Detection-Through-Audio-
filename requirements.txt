@@ -18,3 +18,6 @@ google-genai>=1.0.0
 streamlit>=1.38.0
 pandas
 python-dotenv>=1.0.0
+
+# Person 3 Qwen analysis via Groq
+groq>=0.9.0
