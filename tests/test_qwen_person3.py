@@ -9,6 +9,9 @@ from qwen_person3 import (
     Person3Config,
     Person3Error,
     QWEN_JSON_RESPONSE_FORMAT,
+    QWEN_MAX_COMPLETION_TOKENS,
+    QWEN_REASONING_EFFORT,
+    QWEN_REASONING_FORMAT,
     QwenPerson3Analyzer,
     analyze_person2_behaviours,
     QwenResponseValidationError,
@@ -105,8 +108,24 @@ def test_qwen_call_uses_qwen_json_object_mode_and_strict_prompt(record):
     assert result.validated is True
     assert completions.kwargs[0]["model"] == "qwen/qwen3.6-27b"
     assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
+    assert completions.kwargs[0]["max_completion_tokens"] == QWEN_MAX_COMPLETION_TOKENS
+    assert "max_tokens" not in completions.kwargs[0]
     assert "JSON object mode is enabled" in completions.kwargs[0]["messages"][0]["content"]
     assert "Return exactly one compact JSON object" in completions.kwargs[0]["messages"][1]["content"]
+
+
+def test_qwen_call_disables_reasoning_and_parses_normal_json(record):
+    completions = _Completions([valid_response()])
+    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test", model="qwen/qwen3.6-27b"), client=_Client(completions))
+
+    result = analyzer.analyze_record(record)
+
+    assert result.behaviour == "Repetitive Questioning"
+    assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
+    assert completions.kwargs[0]["reasoning_effort"] == QWEN_REASONING_EFFORT == "none"
+    assert completions.kwargs[0]["reasoning_format"] == QWEN_REASONING_FORMAT == "hidden"
+    assert completions.kwargs[0]["max_completion_tokens"] == 1024
+    assert "max_tokens" not in completions.kwargs[0]
 
 
 def test_prompt_contains_no_think_json_example_and_allowed_schema(record):
@@ -223,6 +242,8 @@ def test_json_mode_validate_failure_retries_without_response_format(record):
     assert result.validated is True
     assert completions.calls == 2
     assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
+    assert completions.kwargs[0]["max_completion_tokens"] == QWEN_MAX_COMPLETION_TOKENS
+    assert "max_tokens" not in completions.kwargs[0]
     assert "response_format" not in completions.kwargs[1]
 
 

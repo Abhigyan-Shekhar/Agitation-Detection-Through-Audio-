@@ -30,6 +30,9 @@ REQUIRED_RESPONSE_FIELDS = {
     "explanation",
 }
 QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+QWEN_MAX_COMPLETION_TOKENS = 1024
+QWEN_REASONING_EFFORT = "none"
+QWEN_REASONING_FORMAT = "hidden"
 RAW_RESPONSE_LOG_CHARS = 2000
 _LOGGER = logging.getLogger(__name__)
 
@@ -151,8 +154,11 @@ class QwenPerson3Analyzer:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
-            "max_tokens": 700,
+            "max_completion_tokens": QWEN_MAX_COMPLETION_TOKENS,
         }
+        if _supports_qwen_reasoning_controls(self.config.model):
+            kwargs["reasoning_effort"] = QWEN_REASONING_EFFORT
+            kwargs["reasoning_format"] = QWEN_REASONING_FORMAT
         if use_json_mode:
             kwargs["response_format"] = QWEN_JSON_RESPONSE_FORMAT
         return self.client.chat.completions.create(**kwargs)
@@ -361,6 +367,10 @@ def _system_prompt(*, use_json_mode: bool = True) -> str:
         "The first output character must be `{` and the last output character must be `}`. "
         "Output JSON only with keys behaviour, start, end, validated, severity, confidence, evidence, explanation."
     )
+
+
+def _supports_qwen_reasoning_controls(model: str) -> bool:
+    return model.strip().lower() == DEFAULT_QWEN_MODEL
 
 
 def _looks_like_groq_json_mode_failure(exc: Exception) -> bool:
