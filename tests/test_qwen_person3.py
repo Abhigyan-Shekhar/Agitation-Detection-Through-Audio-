@@ -7,8 +7,10 @@ import pytest
 from qwen_person3 import (
     Person3Config,
     Person3Error,
+    QWEN_JSON_RESPONSE_FORMAT,
     QwenPerson3Analyzer,
     QwenResponseValidationError,
+    build_qwen_prompt,
     validate_qwen_response,
 )
 
@@ -29,15 +31,18 @@ class _Response:
 
 
 class _Completions:
-    def __init__(self, responses: list[str] | None = None, *, fail: Exception | None = None) -> None:
+    def __init__(self, responses: list[str] | None = None, *, fail: Exception | list[Exception | None] | None = None) -> None:
         self.responses = responses or []
-        self.fail = fail
+        self.failures = fail if isinstance(fail, list) else [fail]
         self.calls = 0
+        self.kwargs: list[dict] = []
 
-    def create(self, **_kwargs):
+    def create(self, **kwargs):
         self.calls += 1
-        if self.fail:
-            raise self.fail
+        self.kwargs.append(kwargs)
+        failure = self.failures.pop(0) if self.failures else None
+        if failure:
+            raise failure
         return _Response(self.responses.pop(0))
 
 
@@ -89,6 +94,27 @@ def test_valid_qwen_response(record):
     assert result.person2_evidence == record["evidence"]
 
 
+def test_qwen_call_uses_qwen_json_object_mode_and_strict_prompt(record):
+    completions = _Completions([valid_response()])
+    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test", model="qwen/qwen3.6-27b"), client=_Client(completions))
+
+    result = analyzer.analyze_record(record)
+
+    assert result.validated is True
+    assert completions.kwargs[0]["model"] == "qwen/qwen3.6-27b"
+    assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
+    assert "JSON object mode is enabled" in completions.kwargs[0]["messages"][0]["content"]
+    assert "Return exactly one compact JSON object" in completions.kwargs[0]["messages"][1]["content"]
+
+
+def test_prompt_contains_no_think_json_example_and_allowed_schema(record):
+    prompt = build_qwen_prompt(record)
+
+    assert prompt.startswith("/no_think")
+    assert "Required JSON shape example" in prompt
+    assert "behaviour,start,end,validated,severity,confidence,evidence,explanation" in prompt.replace(" ", "")
+
+
 def test_malformed_json(record):
     with pytest.raises(QwenResponseValidationError, match="valid JSON"):
         validate_qwen_response("not-json", record)
@@ -99,6 +125,13 @@ def test_missing_required_field(record):
     del payload["explanation"]
 
     with pytest.raises(QwenResponseValidationError, match="missing required"):
+        validate_qwen_response(payload, record)
+
+
+def test_extra_field_is_rejected(record):
+    payload = json.loads(valid_response(extra="not allowed"))
+
+    with pytest.raises(QwenResponseValidationError, match="unsupported field"):
         validate_qwen_response(payload, record)
 
 
@@ -118,6 +151,21 @@ def test_api_failure(record):
 
     with pytest.raises(Person3Error, match="Qwen/Groq analysis failed"):
         analyzer.analyze_record(record)
+
+
+def test_json_mode_validate_failure_retries_without_response_format(record):
+    completions = _Completions(
+        [valid_response()],
+        fail=[RuntimeError("Error code: 400 - json_validate_failed - Failed to validate JSON."), None],
+    )
+    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test"), client=_Client(completions))
+
+    result = analyzer.analyze_record(record)
+
+    assert result.validated is True
+    assert completions.calls == 2
+    assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
+    assert "response_format" not in completions.kwargs[1]
 
 
 def test_timestamp_preservation(record):

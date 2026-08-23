@@ -8,13 +8,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 import re
 from typing import Any, Iterable
 
 
-DEFAULT_QWEN_MODEL = "qwen/qwen3-32b"
+DEFAULT_QWEN_MODEL = "qwen/qwen3.6-27b"
 VALID_SEVERITIES = {"Insufficient", "Low", "Mild", "Moderate", "High", "Severe"}
 REQUIRED_RESPONSE_FIELDS = {
     "behaviour",
@@ -26,6 +28,7 @@ REQUIRED_RESPONSE_FIELDS = {
     "evidence",
     "explanation",
 }
+QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 
 
 class Person3Error(RuntimeError):
@@ -97,11 +100,10 @@ class QwenPerson3Analyzer:
             return self._client
         if not self.config.api_key:
             raise MissingGroqApiKeyError("GROQ_API_KEY is not configured; set it before running Qwen analysis.")
-        try:
-            from groq import Groq
-        except ImportError as exc:
-            raise Person3Error("The groq package is not installed. Install requirements.txt first.") from exc
-        self._client = Groq(api_key=self.config.api_key, timeout=self.config.timeout_seconds)
+        if importlib.util.find_spec("groq") is None:
+            raise Person3Error("The groq package is not installed. Install requirements.txt first.")
+        groq_module = importlib.import_module("groq")
+        self._client = groq_module.Groq(api_key=self.config.api_key, timeout=self.config.timeout_seconds)
         return self._client
 
     def analyze_batch(self, behaviour_records: Iterable[dict[str, Any]]) -> list[FinalBehaviourResult]:
@@ -118,21 +120,37 @@ class QwenPerson3Analyzer:
         """Analyze one Person 2 behaviour evidence record."""
         prompt = build_qwen_prompt(record)
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=[
-                    {"role": "system", "content": _system_prompt()},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
+            response = self._create_completion(prompt, use_json_mode=True)
             content = response.choices[0].message.content
             return validate_qwen_response(content, record)
         except Person3Error:
             raise
         except Exception as exc:  # noqa: BLE001 - surface API/network failures to dashboard
+            if _looks_like_groq_json_mode_failure(exc):
+                try:
+                    response = self._create_completion(prompt, use_json_mode=False)
+                    content = response.choices[0].message.content
+                    return validate_qwen_response(content, record)
+                except Person3Error:
+                    raise
+                except Exception as retry_exc:  # noqa: BLE001
+                    raise Person3Error(f"Qwen/Groq analysis failed after JSON-mode retry: {retry_exc}") from retry_exc
             raise Person3Error(f"Qwen/Groq analysis failed: {exc}") from exc
+
+    def _create_completion(self, prompt: str, *, use_json_mode: bool) -> Any:
+        """Call Groq with Qwen-compatible JSON mode or a plain-JSON fallback."""
+        kwargs: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": _system_prompt(use_json_mode=use_json_mode)},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 700,
+        }
+        if use_json_mode:
+            kwargs["response_format"] = QWEN_JSON_RESPONSE_FORMAT
+        return self.client.chat.completions.create(**kwargs)
 
 
 def analyze_person2_behaviours(
@@ -158,11 +176,27 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "chunk_id": record.get("chunk_id"),
         "repetition": record.get("repetition"),
     }
+    example = {
+        "behaviour": payload["initial_behaviour"] or "Unknown behaviour",
+        "start": payload["start"],
+        "end": payload["end"],
+        "validated": True,
+        "severity": "Moderate",
+        "confidence": 0.94,
+        "evidence": "Short evidence string grounded only in the supplied transcript/evidence.",
+        "explanation": "Short explanation of why the evidence supports or does not support the behaviour.",
+    }
     return (
-        "Evaluate this Person 2 audio-behaviour evidence as decision support, not medical diagnosis. "
-        "Use only supplied evidence/transcript. Do not invent behaviours. If evidence is insufficient, set "
-        "validated=false, severity='Insufficient', and explain what is missing. Preserve the exact start/end timestamps. "
-        "Return only JSON with keys: behaviour, start, end, validated, severity, confidence, evidence, explanation.\n\n"
+        "/no_think\n"
+        "Evaluate this Person 2 audio-behaviour evidence as research decision support, not medical diagnosis. "
+        "Use only supplied evidence/transcript. Do not invent behaviours. If evidence is insufficient, use "
+        "validated=false, severity=\"Insufficient\", confidence between 0 and 1, and explain what is missing. "
+        "Preserve the exact start/end timestamp numbers from the input.\n\n"
+        "Return exactly one compact JSON object. Do not return markdown, code fences, comments, XML/thinking tags, "
+        "or any text before or after the JSON object. The JSON object must contain exactly these keys: "
+        "behaviour, start, end, validated, severity, confidence, evidence, explanation. "
+        f"Allowed severity values: {', '.join(sorted(VALID_SEVERITIES))}.\n\n"
+        f"Required JSON shape example:\n{json.dumps(example, separators=(',', ':'))}\n\n"
         f"Person 2 evidence JSON:\n{json.dumps(payload, indent=2, sort_keys=True)}"
     )
 
@@ -173,6 +207,9 @@ def validate_qwen_response(raw_content: str | dict[str, Any], source_record: dic
     missing = REQUIRED_RESPONSE_FIELDS.difference(data)
     if missing:
         raise QwenResponseValidationError(f"Qwen response is missing required field(s): {', '.join(sorted(missing))}")
+    extras = set(data).difference(REQUIRED_RESPONSE_FIELDS)
+    if extras:
+        raise QwenResponseValidationError(f"Qwen response included unsupported field(s): {', '.join(sorted(extras))}")
 
     start = float(source_record["start"])
     end = float(source_record["end"])
@@ -193,7 +230,7 @@ def validate_qwen_response(raw_content: str | dict[str, Any], source_record: dic
         behaviour=str(data["behaviour"]).strip() or str(source_record.get("behaviour", "Unknown behaviour")),
         start=start,
         end=end,
-        validated=bool(data["validated"]),
+        validated=_coerce_bool(data["validated"]),
         severity=severity,
         confidence=round(confidence, 4),
         evidence=str(data["evidence"]).strip(),
@@ -221,11 +258,36 @@ def _parse_json_object(raw_content: str | dict[str, Any]) -> dict[str, Any]:
             raise QwenResponseValidationError("Qwen response was not valid JSON.") from exc
 
 
-def _system_prompt() -> str:
-    return (
-        "You are Person 3 in a research audio-analysis pipeline. Validate Person 2 behaviour evidence conservatively. "
-        "This is decision support, not diagnosis. Return strict JSON only."
+def _system_prompt(*, use_json_mode: bool = True) -> str:
+    mode_note = (
+        "Groq JSON object mode is enabled; your entire response must be one valid JSON object."
+        if use_json_mode
+        else "JSON object mode retry is disabled; still return one valid JSON object only."
     )
+    return (
+        "/no_think\n"
+        "You are Person 3 in a research audio-analysis pipeline. Validate Person 2 behaviour evidence conservatively. "
+        "This is decision support, not diagnosis. "
+        f"{mode_note} Do not include markdown, prose, code fences, or hidden reasoning. "
+        "Output JSON only with keys behaviour, start, end, validated, severity, confidence, evidence, explanation."
+    )
+
+
+def _looks_like_groq_json_mode_failure(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "json_validate_failed" in message or "failed to validate json" in message
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise QwenResponseValidationError("Qwen validated field must be a boolean.")
 
 
 def _optional_float(value: Any) -> float | None:

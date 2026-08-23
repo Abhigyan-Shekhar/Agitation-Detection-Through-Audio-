@@ -189,7 +189,7 @@ Required environment variables for Person 3:
 
 ```text
 GROQ_API_KEY=your_groq_api_key
-QWEN_MODEL=qwen/qwen3-32b
+QWEN_MODEL=qwen/qwen3.6-27b
 QWEN_TIMEOUT_SECONDS=30
 ```
 
