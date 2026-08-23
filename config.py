@@ -157,6 +157,22 @@ RELIABILITY_MISSING_BASELINE_PENALTY: float = 0.15
 TRANSCRIPT_HISTORY_SEC: float = 60.0   # rolling window for linguistic analysis
 
 # ---------------------------------------------------------------------------
+# Person 2 batch transcript evidence layer
+# ---------------------------------------------------------------------------
+PERSON2_MAX_CHUNK_DURATION_SECONDS: float = float(os.getenv("PERSON2_MAX_CHUNK_DURATION_SECONDS", "20"))
+PERSON2_CHUNK_MAX_DURATION_SEC: float = float(
+    os.getenv("PERSON2_CHUNK_MAX_DURATION_SEC", str(PERSON2_MAX_CHUNK_DURATION_SECONDS))
+)
+PERSON2_CHUNK_MAX_SEGMENTS: int = int(os.getenv("PERSON2_CHUNK_MAX_SEGMENTS", "8"))
+PERSON2_CHUNK_OVERLAP_SEGMENTS: int = int(os.getenv("PERSON2_CHUNK_OVERLAP_SEGMENTS", "1"))
+PERSON2_REPETITION_MIN_OCCURRENCES: int = int(os.getenv("PERSON2_REPETITION_MIN_OCCURRENCES", "2"))
+PERSON2_REPETITION_SIMILARITY_THRESHOLD: float = float(os.getenv("PERSON2_REPETITION_SIMILARITY_THRESHOLD", "0.90"))
+PERSON2_SEMANTIC_SIMILARITY_THRESHOLD: float = float(os.getenv("PERSON2_SEMANTIC_SIMILARITY_THRESHOLD", "0.70"))
+PERSON2_EMBEDDING_BACKEND: str = os.getenv("PERSON2_EMBEDDING_BACKEND", "sentence-transformers")
+PERSON2_EMBEDDING_MODEL: str = os.getenv("PERSON2_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+PERSON2_EMBEDDING_DIMENSION: int = int(os.getenv("PERSON2_EMBEDDING_DIMENSION", "384"))
+
+# ---------------------------------------------------------------------------
 # Analysis mode
 # ---------------------------------------------------------------------------
 ANALYSIS_MODE: str = os.getenv("ANALYSIS_MODE", "rule_based")

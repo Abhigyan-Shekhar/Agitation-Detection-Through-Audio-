@@ -201,3 +201,95 @@ The acoustic path currently targets sustained pitched vocalizations such as moan
 ## 8. Notes for dashboard and downstream consumers
 
 Downstream components should prefer the structured behaviour events over free-form labels. This keeps the behaviour taxonomy explicit, auditable, and consistent across the dashboard and tests.
+
+## 9. Person 2 batch transcript evidence contract
+
+Person 2 consumes Person 1's uploaded-audio transcript contract:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| start | float | Audio-relative start timestamp in seconds. |
+| end | float | Audio-relative end timestamp in seconds. |
+| text | str | ASR transcript text for the segment. |
+| confidence | float \| None | Optional ASR confidence reported by the transcriber. |
+
+Person 2 preserves these timestamps through every stage. Contextual chunk
+timestamps are derived from the earliest `start` and latest `end` among their
+included transcript segments. Behaviour timestamps are the evidence range,
+using repeated occurrence timestamps when repetition caused the signal.
+
+### Chunking and repetition
+
+The module groups nearby transcript segments into contextual chunks rather than
+treating every utterance as a standalone unit. Defaults are configured in
+`config.py`: a maximum 20-second chunk, at most 8 transcript segments, and 1
+overlap segment for local context continuity. This 20-second duration is an MVP
+engineering baseline for local analysis, not a CMAI-mandated scoring window,
+and should be validated experimentally against labelled examples.
+
+Repetition detection normalizes case, whitespace, and punctuation, then groups
+nearby repeated or highly similar segment text. Evidence preserves the repeated
+phrase, occurrence count, occurrence timestamps, whether the phrase is a
+question or request, and the surrounding chunk text.
+
+The CMAI manual distinguishes repetitive sentences/questions from complaining.
+Person 2 therefore treats semantic similarity as supporting evidence only when
+nearby utterances are question-like or request-like. Similar complaint
+statements such as food complaints are left for the complaint/negativism
+heuristics and are not automatically relabelled as repetitive
+sentences/questions.
+
+### Embeddings
+
+The default backend is `sentence-transformers/all-MiniLM-L6-v2`, which produces
+384-dimensional semantic embeddings. The model is loaded through a reusable
+provider abstraction and cached by model name so it is not recreated per
+segment. Hashing remains available as an optional experimental backend, but it
+is not the default. These embeddings are feature vectors for downstream
+comparison or retrieval. They are not behaviour classifications, CMAI frequency
+ratings, or clinical probabilities.
+
+### Initial behaviour result
+
+Person 2 emits Person 3-ready structured evidence:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| start | float | Evidence start timestamp in seconds. |
+| end | float | Evidence end timestamp in seconds. |
+| behaviour | str | Canonical label from `audio_behaviour_taxonomy.py`. |
+| internal_code | str | Canonical internal code such as `AUDIO_REPETITIVE`. |
+| cmai_category | str | CMAI-style mapping label from the taxonomy. |
+| score | float | Heuristic evidence score in the range 0-1. |
+| score_type | str | Score source, such as `heuristic_repetition_score` or `heuristic_linguistic_score`. |
+| evidence | str | Short explainable reason for the signal. |
+| text | str | Relevant chunk/transcript text. |
+| chunk_id | str | Contextual chunk identifier. |
+| repetition | dict \| None | Repetition detail when repetition caused the evidence. |
+| modality | str | Currently `audio`. |
+| mapping_status | str | Currently `mapped` for emitted Person 2 behaviours. |
+
+The Person 2 layer is an initial evidence generator only. It does not call
+Qwen, Groq, Gemini, or any other LLM, and it does not assign final clinical
+severity.
+
+### Transcript-supported and excluded behaviours
+
+The transcript-only Person 2 layer may emit these existing canonical taxonomy
+labels:
+
+- Cursing / verbal aggression
+- Making verbal sexual advances
+- Repetitive sentences or questions
+- Making strange noises, when transcript/audio-caption text contains a
+  non-speech vocalization label
+- Complaining
+- Negativism
+- Constant unwarranted requests for attention/help
+- Distressed/urgent verbalization
+
+`Screaming` is audio-observable in the wider prototype, but it requires
+acoustic intensity evidence and is not claimed from Person 1's transcript JSON
+alone. Physical or visual behaviours such as pacing, restlessness, hitting,
+kicking, grabbing, pushing, walking, or leaving are intentionally not mapped by
+the transcript/audio-only layer.

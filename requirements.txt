@@ -11,6 +11,7 @@ av>=12.0.0
 # Linguistic analysis
 vaderSentiment>=3.3.2
 rapidfuzz>=3.9.0
+sentence-transformers>=2.7.0,<4.0.0
 # Gemini (optional ablation — disabled by default)
 google-genai>=1.0.0
 # Dashboard
