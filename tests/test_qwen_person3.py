@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -115,9 +116,43 @@ def test_prompt_contains_no_think_json_example_and_allowed_schema(record):
     assert "behaviour,start,end,validated,severity,confidence,evidence,explanation" in prompt.replace(" ", "")
 
 
+def test_json_inside_markdown_fence(record):
+    fenced = f"```json\n{valid_response()}\n```"
+
+    result = validate_qwen_response(fenced, record)
+
+    assert result.behaviour == "Repetitive Questioning"
+    assert result.start == record["start"]
+    assert result.end == record["end"]
+
+
+def test_json_with_harmless_surrounding_text(record):
+    wrapped = f"Here is the JSON:\n{valid_response()}\nDone."
+
+    result = validate_qwen_response(wrapped, record)
+
+    assert result.validated is True
+
+
 def test_malformed_json(record):
     with pytest.raises(QwenResponseValidationError, match="valid JSON"):
         validate_qwen_response("not-json", record)
+
+
+def test_empty_response_has_clear_error(record):
+    with pytest.raises(QwenResponseValidationError, match="no usable content"):
+        validate_qwen_response(None, record)
+
+
+def test_unparseable_response_is_logged_safely(record, caplog):
+    caplog.set_level(logging.WARNING, logger="qwen_person3")
+
+    with pytest.raises(QwenResponseValidationError, match="valid JSON"):
+        validate_qwen_response("Bearer secret-token not-json", record)
+
+    assert "could not parse model response preview" in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "bearer=<redacted>" in caplog.text.lower()
 
 
 def test_missing_required_field(record):

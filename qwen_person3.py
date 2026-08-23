@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import re
 from typing import Any, Iterable
@@ -29,6 +30,8 @@ REQUIRED_RESPONSE_FIELDS = {
     "explanation",
 }
 QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+RAW_RESPONSE_LOG_CHARS = 2000
+_LOGGER = logging.getLogger(__name__)
 
 
 class Person3Error(RuntimeError):
@@ -121,7 +124,8 @@ class QwenPerson3Analyzer:
         prompt = build_qwen_prompt(record)
         try:
             response = self._create_completion(prompt, use_json_mode=True)
-            content = response.choices[0].message.content
+            content = _extract_message_content(response)
+            _log_raw_model_response(content)
             return validate_qwen_response(content, record)
         except Person3Error:
             raise
@@ -129,7 +133,8 @@ class QwenPerson3Analyzer:
             if _looks_like_groq_json_mode_failure(exc):
                 try:
                     response = self._create_completion(prompt, use_json_mode=False)
-                    content = response.choices[0].message.content
+                    content = _extract_message_content(response)
+                    _log_raw_model_response(content, retry=True)
                     return validate_qwen_response(content, record)
                 except Person3Error:
                     raise
@@ -192,7 +197,8 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "Use only supplied evidence/transcript. Do not invent behaviours. If evidence is insufficient, use "
         "validated=false, severity=\"Insufficient\", confidence between 0 and 1, and explain what is missing. "
         "Preserve the exact start/end timestamp numbers from the input.\n\n"
-        "Return exactly one compact JSON object. Do not return markdown, code fences, comments, XML/thinking tags, "
+        "Return exactly one compact JSON object. The first character must be `{` and the last character must be `}`. "
+        "Do not return markdown, code fences, comments, XML/thinking tags, "
         "or any text before or after the JSON object. The JSON object must contain exactly these keys: "
         "behaviour, start, end, validated, severity, confidence, evidence, explanation. "
         f"Allowed severity values: {', '.join(sorted(VALID_SEVERITIES))}.\n\n"
@@ -201,9 +207,13 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
     )
 
 
-def validate_qwen_response(raw_content: str | dict[str, Any], source_record: dict[str, Any]) -> FinalBehaviourResult:
+def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_record: dict[str, Any]) -> FinalBehaviourResult:
     """Validate and normalize Qwen JSON without silently accepting malformed output."""
-    data = _parse_json_object(raw_content)
+    try:
+        data = _parse_json_object(raw_content)
+    except QwenResponseValidationError:
+        _log_raw_model_response(raw_content, parse_error=True)
+        raise
     missing = REQUIRED_RESPONSE_FIELDS.difference(data)
     if missing:
         raise QwenResponseValidationError(f"Qwen response is missing required field(s): {', '.join(sorted(missing))}")
@@ -243,19 +253,90 @@ def validate_qwen_response(raw_content: str | dict[str, Any], source_record: dic
     )
 
 
-def _parse_json_object(raw_content: str | dict[str, Any]) -> dict[str, Any]:
+def _parse_json_object(raw_content: str | dict[str, Any] | None) -> dict[str, Any]:
     if isinstance(raw_content, dict):
         return raw_content
+    if raw_content is None or not str(raw_content).strip():
+        raise QwenResponseValidationError("Qwen returned no usable content to parse as JSON.")
+
+    text = str(raw_content).strip()
+    candidate = _strip_markdown_json_fence(text)
     try:
-        return json.loads(raw_content)
+        parsed = json.loads(candidate)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw_content, flags=re.DOTALL)
-        if not match:
+        extracted = _extract_first_balanced_json_object(candidate)
+        if extracted is None:
             raise QwenResponseValidationError("Qwen response was not valid JSON.") from None
         try:
-            return json.loads(match.group(0))
+            parsed = json.loads(extracted)
         except json.JSONDecodeError as exc:
             raise QwenResponseValidationError("Qwen response was not valid JSON.") from exc
+
+    if not isinstance(parsed, dict):
+        raise QwenResponseValidationError("Qwen response JSON must be an object with the Person 3 schema.")
+    return parsed
+
+
+def _strip_markdown_json_fence(text: str) -> str:
+    fence_match = re.fullmatch(r"```(?:json|JSON)?\s*(.*?)\s*```", text, flags=re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    return text
+
+
+def _extract_first_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _extract_message_content(response: Any) -> str | None:
+    try:
+        return response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise QwenResponseValidationError("Groq response did not contain message content for Qwen analysis.") from exc
+
+
+def _log_raw_model_response(raw_content: Any, *, retry: bool = False, parse_error: bool = False) -> None:
+    label = "retry raw" if retry else "raw"
+    if parse_error:
+        label = "unparseable raw"
+    preview = _safe_response_preview(raw_content)
+    _LOGGER.debug("Qwen Person 3 %s response preview: %s", label, preview)
+    if parse_error:
+        _LOGGER.warning("Qwen Person 3 could not parse model response preview: %s", preview)
+
+
+def _safe_response_preview(raw_content: Any) -> str:
+    if raw_content is None:
+        return "<empty>"
+    text = str(raw_content)
+    text = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*(?:[:=]\s*)?[^\s,}]+", r"\1=<redacted>", text)
+    if len(text) > RAW_RESPONSE_LOG_CHARS:
+        return text[:RAW_RESPONSE_LOG_CHARS] + "...<truncated>"
+    return text
 
 
 def _system_prompt(*, use_json_mode: bool = True) -> str:
@@ -269,6 +350,7 @@ def _system_prompt(*, use_json_mode: bool = True) -> str:
         "You are Person 3 in a research audio-analysis pipeline. Validate Person 2 behaviour evidence conservatively. "
         "This is decision support, not diagnosis. "
         f"{mode_note} Do not include markdown, prose, code fences, or hidden reasoning. "
+        "The first output character must be `{` and the last output character must be `}`. "
         "Output JSON only with keys behaviour, start, end, validated, severity, confidence, evidence, explanation."
     )
 
