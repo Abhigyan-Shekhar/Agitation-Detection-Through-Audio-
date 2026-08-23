@@ -174,3 +174,27 @@ Scores are heuristic linguistic or repetition evidence scores in the range
 0–1. They are not clinical probabilities and are not final CMAI severity
 ratings. Person 3 can use this payload, plus the timestamped text evidence, as
 structured input to the later Qwen/Groq interpretation stage.
+
+## New MVP dashboard (Person 1 → Person 2 → Person 3)
+
+`dashboard_v2.py` implements the new upload-first MVP path without modifying the
+legacy `dashboard.py` or `person3_module.py` flow. It runs uploaded audio through
+`batch_transcription.transcribe_upload()`, passes the timestamped transcript to
+`person2_module.analyze_person1_transcript()`, sends `behaviour_contract()`
+records to `qwen_person3.analyze_person2_behaviours()`, and displays the final
+validated behaviour table, audio-relative timeline, evidence details, and a
+playback clip extracted from the original upload timestamps.
+
+Required environment variables for Person 3:
+
+```text
+GROQ_API_KEY=your_groq_api_key
+QWEN_MODEL=qwen/qwen3.6-27b
+QWEN_TIMEOUT_SECONDS=30
+```
+
+Run the new dashboard with:
+
+```bash
+streamlit run dashboard_v2.py
+```
