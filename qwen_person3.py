@@ -30,6 +30,9 @@ REQUIRED_RESPONSE_FIELDS = {
     "explanation",
 }
 QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
+QWEN_MAX_COMPLETION_TOKENS = 1024
+QWEN_REASONING_EFFORT = "none"
+QWEN_REASONING_FORMAT = "hidden"
 RAW_RESPONSE_LOG_CHARS = 2000
 _LOGGER = logging.getLogger(__name__)
 
@@ -151,8 +154,11 @@ class QwenPerson3Analyzer:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
-            "max_tokens": 700,
+            "max_completion_tokens": QWEN_MAX_COMPLETION_TOKENS,
         }
+        if _supports_qwen_reasoning_controls(self.config.model):
+            kwargs["reasoning_effort"] = QWEN_REASONING_EFFORT
+            kwargs["reasoning_format"] = QWEN_REASONING_FORMAT
         if use_json_mode:
             kwargs["response_format"] = QWEN_JSON_RESPONSE_FORMAT
         return self.client.chat.completions.create(**kwargs)
@@ -259,7 +265,9 @@ def _parse_json_object(raw_content: str | dict[str, Any] | None) -> dict[str, An
     if raw_content is None or not str(raw_content).strip():
         raise QwenResponseValidationError("Qwen returned no usable content to parse as JSON.")
 
-    text = str(raw_content).strip()
+    text = _remove_thinking_sections(str(raw_content)).strip()
+    if not text:
+        raise QwenResponseValidationError("Qwen returned no usable content to parse as JSON after removing thinking sections.")
     candidate = _strip_markdown_json_fence(text)
     try:
         parsed = json.loads(candidate)
@@ -275,6 +283,12 @@ def _parse_json_object(raw_content: str | dict[str, Any] | None) -> dict[str, An
     if not isinstance(parsed, dict):
         raise QwenResponseValidationError("Qwen response JSON must be an object with the Person 3 schema.")
     return parsed
+
+
+def _remove_thinking_sections(text: str) -> str:
+    """Remove Qwen reasoning blocks before parsing or displaying model output."""
+    without_closed_blocks = re.sub(r"(?is)<think\b[^>]*>.*?</think>", "", text)
+    return re.sub(r"(?is)<think\b[^>]*>.*$", "", without_closed_blocks)
 
 
 def _strip_markdown_json_fence(text: str) -> str:
@@ -332,7 +346,7 @@ def _log_raw_model_response(raw_content: Any, *, retry: bool = False, parse_erro
 def _safe_response_preview(raw_content: Any) -> str:
     if raw_content is None:
         return "<empty>"
-    text = str(raw_content)
+    text = _remove_thinking_sections(str(raw_content)).strip() or "<thinking redacted>"
     text = re.sub(r"(?i)(api[_-]?key|authorization|bearer)\s*(?:[:=]\s*)?[^\s,}]+", r"\1=<redacted>", text)
     if len(text) > RAW_RESPONSE_LOG_CHARS:
         return text[:RAW_RESPONSE_LOG_CHARS] + "...<truncated>"
@@ -353,6 +367,10 @@ def _system_prompt(*, use_json_mode: bool = True) -> str:
         "The first output character must be `{` and the last output character must be `}`. "
         "Output JSON only with keys behaviour, start, end, validated, severity, confidence, evidence, explanation."
     )
+
+
+def _supports_qwen_reasoning_controls(model: str) -> bool:
+    return model.strip().lower() == DEFAULT_QWEN_MODEL
 
 
 def _looks_like_groq_json_mode_failure(exc: Exception) -> bool:
