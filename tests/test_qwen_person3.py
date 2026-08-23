@@ -10,6 +10,7 @@ from qwen_person3 import (
     Person3Error,
     QWEN_JSON_RESPONSE_FORMAT,
     QwenPerson3Analyzer,
+    analyze_person2_behaviours,
     QwenResponseValidationError,
     build_qwen_prompt,
     validate_qwen_response,
@@ -132,6 +133,28 @@ def test_json_with_harmless_surrounding_text(record):
     result = validate_qwen_response(wrapped, record)
 
     assert result.validated is True
+
+
+def test_analyze_person2_behaviours_strips_observed_qwen_thinking_block(record):
+    raw_content = f"""<think>
+Here's a thinking process:
+...
+</think>
+{valid_response(behaviour="Complaining", evidence="The transcript contains repeated complaints about the situation.", explanation="Complaining is supported by the supplied transcript context.")}"""
+    completions = _Completions([raw_content])
+
+    results = analyze_person2_behaviours(
+        [record],
+        config=Person3Config(api_key="test"),
+        client=_Client(completions),
+    )
+
+    assert len(results) == 1
+    assert results[0].behaviour == "Complaining"
+    assert results[0].start == record["start"]
+    assert results[0].end == record["end"]
+    assert "thinking process" not in results[0].evidence
+    assert "thinking process" not in results[0].explanation
 
 
 def test_malformed_json(record):
