@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from hashlib import sha256
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 import wave
 
@@ -12,6 +14,15 @@ import streamlit as st
 from batch_transcription import SUPPORTED_AUDIO_EXTENSIONS, preprocess_upload, transcribe_upload
 from person2_module import analyze_person1_transcript
 from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_behaviours
+
+
+ANALYSIS_RESULT_STATE_KEY = "mvp_analysis_result"
+ANALYSIS_UPLOAD_STATE_KEY = "mvp_analysis_upload_key"
+
+
+def upload_cache_key(data: bytes, filename: str) -> str:
+    """Return a stable identity for the uploaded audio currently being viewed."""
+    return f"{Path(filename).name}:{sha256(data).hexdigest()}"
 
 
 def format_timestamp(seconds: float) -> str:
@@ -119,6 +130,13 @@ def main() -> None:
 
     data = uploaded.getvalue()
     filename = uploaded.name
+    current_upload_key = upload_cache_key(data, filename)
+    if st.session_state.get(ANALYSIS_UPLOAD_STATE_KEY) != current_upload_key:
+        # A different upload must never show the previous file's analysis, but
+        # interactions with the same file (such as timestamp selection) keep it.
+        st.session_state[ANALYSIS_UPLOAD_STATE_KEY] = current_upload_key
+        st.session_state.pop(ANALYSIS_RESULT_STATE_KEY, None)
+
     st.subheader("1. Audio Upload")
     try:
         processed = preprocess_upload(data, filename)
@@ -128,22 +146,25 @@ def main() -> None:
         st.error(f"Audio validation failed: {exc}")
         return
 
-    if not st.button("Run MVP analysis", type="primary"):
+    run_analysis = st.button("Run MVP analysis", type="primary")
+    pipeline = st.session_state.get(ANALYSIS_RESULT_STATE_KEY)
+    if run_analysis:
+        try:
+            with st.status("Processing audio-analysis pipeline...", expanded=True) as status:
+                st.write("Person 1: transcription with timestamps")
+                pipeline = run_pipeline(data, filename)
+                st.write("Person 2: contextual chunks, embeddings, initial behaviour evidence")
+                st.write("Person 3: Qwen validation through Groq")
+                status.update(label="Processing complete", state="complete")
+            st.session_state[ANALYSIS_RESULT_STATE_KEY] = pipeline
+        except Person3Error as exc:
+            st.error(f"Qwen/Groq analysis error: {exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Pipeline failed: {exc}")
+            return
+    elif pipeline is None:
         st.info("Click Run MVP analysis to process the upload.")
-        return
-
-    try:
-        with st.status("Processing audio-analysis pipeline...", expanded=True) as status:
-            st.write("Person 1: transcription with timestamps")
-            pipeline = run_pipeline(data, filename)
-            st.write("Person 2: contextual chunks, embeddings, initial behaviour evidence")
-            st.write("Person 3: Qwen validation through Groq")
-            status.update(label="Processing complete", state="complete")
-    except Person3Error as exc:
-        st.error(f"Qwen/Groq analysis error: {exc}")
-        return
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Pipeline failed: {exc}")
         return
 
     transcript = pipeline["transcript"]

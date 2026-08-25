@@ -45,7 +45,7 @@ def _install_dashboard_import_stubs():
 
 def test_dashboard_formatting_helpers():
     _install_dashboard_import_stubs()
-    from dashboard_v2 import final_results_table, format_timestamp, result_timestamp, timeline_table, transcript_rows
+    from dashboard_v2 import final_results_table, format_timestamp, result_timestamp, timeline_table, transcript_rows, upload_cache_key
 
     result = FinalBehaviourResult(
         behaviour="Repetitive Questioning",
@@ -67,3 +67,5 @@ def test_dashboard_formatting_helpers():
     assert transcript_rows([{"start": 10.2, "end": 15.4, "text": "Where is my daughter?"}])[0]["Timestamp"] == "00:10.2 – 00:15.4"
     assert list(final_results_table([result]).columns) == ["Behaviour", "Timestamp", "Severity", "Confidence", "Validated"]
     assert timeline_table([result]).iloc[0]["start_sec"] == 10.2
+    assert upload_cache_key(b"audio", "recording.wav") == upload_cache_key(b"audio", "recording.wav")
+    assert upload_cache_key(b"audio", "recording.wav") != upload_cache_key(b"changed", "recording.wav")
