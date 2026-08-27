@@ -26,6 +26,7 @@ class Person1TranscriptSegment:
     end: float
     text: str
     confidence: float | None = None
+    acoustic: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ class BehaviourEvidenceResult:
     repetition: dict[str, Any] | None = None
     modality: str = "audio"
     mapping_status: str = "mapped"
+    acoustic: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -250,6 +252,7 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 end=float(item["end"]),
                 text=str(item["text"]).strip(),
                 confidence=_coerce_confidence(item.get("confidence")),
+                acoustic=_coerce_acoustic(item.get("acoustic")),
             )
         else:
             segment = Person1TranscriptSegment(
@@ -257,10 +260,11 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 end=float(getattr(item, "end")),
                 text=str(getattr(item, "text")).strip(),
                 confidence=_coerce_confidence(getattr(item, "confidence", None)),
+                acoustic=_coerce_acoustic(getattr(item, "acoustic", None)),
             )
         if segment.start < 0 or segment.end < segment.start:
             raise ValueError("Person 1 transcript segments must have non-negative ordered timestamps")
-        if segment.text:
+        if segment.text or segment.acoustic is not None:
             segments.append(segment)
     return segments
 
@@ -529,6 +533,42 @@ def detect_initial_behaviours(
                 seen.add(key)
                 results.append(result)
 
+        # Acoustic evidence is aligned by Person 1 to each original segment,
+        # not inferred by this text layer.  Keep these candidates segment
+        # scoped so a loud utterance does not contaminate a whole 20-second
+        # contextual chunk.
+        for segment in chunk.segments:
+            acoustic = segment.acoustic or {}
+            if not acoustic.get("available"):
+                continue
+            agitation = float(acoustic.get("agitation_score", 0.0))
+            scream = float(acoustic.get("scream_score", 0.0))
+            urgency = features.urgency_score if segment.text else 0.0
+            if scream >= config.PERSON2_ACOUSTIC_SCREAM_THRESHOLD:
+                label, score, rationale = "Screaming/shouting", scream, "Strong timestamp-aligned scream evidence from source audio."
+            elif agitation >= config.PERSON2_ACOUSTIC_AGITATION_THRESHOLD:
+                label, score, rationale = "Vocal agitation", agitation, "Strong timestamp-aligned acoustic agitation with no requirement for hostile wording."
+            elif agitation >= config.PERSON2_ACOUSTIC_COMBINED_THRESHOLD and urgency >= config.BEHAVIOUR_URGENCY_THRESHOLD:
+                label, score, rationale = "Distressed/urgent verbalization", min(1.0, (agitation + urgency) / 2), "Urgent language corroborated by acoustic activation."
+            else:
+                continue
+            mapped = map_observed_behaviour(label)
+            if mapped.mapping_status != "mapped":
+                continue
+            result = BehaviourEvidenceResult(
+                start=segment.start, end=segment.end, behaviour=mapped.canonical_label,
+                internal_code=str(mapped.internal_code), cmai_category=mapped.cmai_category,
+                score=round(score, 3), score_type="fused_acoustic_linguistic_score",
+                evidence=(f"{rationale} acoustic_agitation={agitation:.2f}, scream_score={scream:.2f}, "
+                          f"relative_energy={float(acoustic.get('relative_energy', 0.0)):.2f}, "
+                          f"burst={float(acoustic.get('burst_score', 0.0)):.2f}, urgency={urgency:.2f}"),
+                text=segment.text, chunk_id=chunk.chunk_id, acoustic=acoustic,
+            )
+            key = (result.behaviour, result.chunk_id, result.start, result.end)
+            if key not in seen:
+                seen.add(key)
+                results.append(result)
+
     return sorted(results, key=lambda item: (item.start, item.end, item.behaviour))
 
 
@@ -560,7 +600,7 @@ def analyze_person1_transcript(
 
 
 def supported_person2_behaviours() -> dict[str, str]:
-    """Return behaviours this transcript-only Person 2 module may emit."""
+    """Return behaviours Person 2 may emit from transcript and upload acoustics."""
     detectable_codes = {
         "AUDIO_CURSING",
         "AUDIO_VERBAL_SEXUAL_ADVANCES",
@@ -570,6 +610,8 @@ def supported_person2_behaviours() -> dict[str, str]:
         "AUDIO_NEGATIVISM",
         "AUDIO_CONSTANT_REQUEST",
         "AUDIO_URGENT_DISTRESS",
+        "AUDIO_VOCAL_AGITATION",
+        "AUDIO_SCREAMING",
     }
     return {
         entry.canonical_label: entry.description
@@ -579,11 +621,11 @@ def supported_person2_behaviours() -> dict[str, str]:
 
 
 def transcript_only_excluded_behaviours() -> dict[str, str]:
-    """Return taxonomy behaviours excluded because Person 1 provides transcript only."""
+    """Describe labels unavailable to legacy records that omit acoustic data."""
     return {
-        entry.canonical_label: "Requires acoustic intensity/audio-feature evidence that is not present in Person 1's transcript JSON."
+        entry.canonical_label: "Requires timestamp-aligned acoustic evidence; legacy transcript-only records remain supported."
         for entry in get_supported_behaviours()
-        if entry.internal_code == "AUDIO_SCREAMING"
+        if entry.internal_code in {"AUDIO_SCREAMING", "AUDIO_VOCAL_AGITATION"}
     }
 
 
@@ -621,6 +663,19 @@ def _coerce_confidence(value: Any) -> float | None:
     if value is None:
         return None
     return min(1.0, max(0.0, float(value)))
+
+
+def _coerce_acoustic(value: Any) -> dict[str, Any] | None:
+    """Accept additive Person 1 metadata without making legacy records fail."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Person 1 acoustic evidence must be an object when supplied")
+    evidence = dict(value)
+    for key in ("agitation_score", "scream_score", "relative_energy", "burst_score", "rms_mean", "rms_peak", "clipping_ratio", "voiced_ratio"):
+        if key in evidence:
+            evidence[key] = float(evidence[key])
+    return evidence
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

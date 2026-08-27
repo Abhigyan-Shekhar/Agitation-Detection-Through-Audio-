@@ -44,6 +44,14 @@ class MappedBehaviour:
 
 SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
     BehaviourTaxonomyEntry(
+        internal_code="AUDIO_VOCAL_AGITATION",
+        canonical_label="Vocal agitation",
+        cmai_category="Verbally agitated: activated vocal delivery",
+        modality="audio",
+        description="Acoustically activated, distressed, or aggressive vocal delivery without requiring profanity or screaming.",
+        aliases=("vocal agitation", "acoustic agitation", "agitated vocal delivery"),
+    ),
+    BehaviourTaxonomyEntry(
         internal_code="AUDIO_SCREAMING",
         canonical_label="Screaming",
         cmai_category="Verbally agitated: screaming/shouting",

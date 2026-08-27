@@ -13,6 +13,7 @@ from batch_transcription import (
     transcribe_upload,
     validate_upload,
 )
+from batch_transcription import _acoustic_only_events
 
 
 def _wav_bytes(*, seconds: float = 0.25, sample_rate: int = 8_000, channels: int = 2) -> bytes:
@@ -81,3 +82,7 @@ def test_transcribe_upload_returns_timestamped_person2_contract():
         {"start": 0.01, "end": 0.12, "text": "Where is my daughter?", "confidence": 0.9},
         {"start": 0.13, "end": 0.25, "text": "Where is my daughter?", "confidence": 1.0},
     ]
+
+
+def test_acoustic_only_persistence_rejects_silence():
+    assert _acoustic_only_events(np.zeros(16_000, dtype=np.float32), 16_000, 0.01) == []

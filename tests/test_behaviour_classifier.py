@@ -193,6 +193,18 @@ class TestBehaviourClassifier:
         assert "Screaming" in labels
         assert "No audio agitation detected" not in labels
 
+    def test_high_confidence_urgent_language_is_not_suppressed(self):
+        linguistic = LinguisticFeatures(urgency_score=0.90, evidence={"transcript": {"confidence": 0.95}})
+        result = _make_result(acoustic_score=0.20, smoothed_score=0.20, linguistic=linguistic)
+        labels = self._classify(result)
+        assert "Distressed/urgent verbalization" in labels
+
+    def test_extreme_short_scream_bypasses_persistence(self):
+        acoustic = AcousticFeatureWindow(start_time=time.time() - 0.5, end_time=time.time(), rms_mean=0.55, rms_max=0.95, voiced_ratio=0.9)
+        result = _make_result(acoustic_score=0.98, smoothed_score=0.80, acoustic=acoustic,
+                              acoustic_contributions={"energy_above_baseline": 0.30, "energy_burst": 0.20})
+        assert "Screaming" in self.clf.classify(result).behaviours
+
     def test_normal_volume_audio_does_not_trigger_screaming_absolute_fallback(self):
         acoustic = AcousticFeatureWindow(
             start_time=time.time() - 2,

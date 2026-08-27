@@ -186,6 +186,7 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "transcript_context": record.get("text"),
         "chunk_id": record.get("chunk_id"),
         "repetition": record.get("repetition"),
+        "acoustic_evidence": record.get("acoustic"),
     }
     example = {
         "behaviour": payload["initial_behaviour"] or "Unknown behaviour",
@@ -200,7 +201,7 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
     return (
         "/no_think\n"
         "Evaluate this Person 2 audio-behaviour evidence as research decision support, not medical diagnosis. "
-        "Use only supplied evidence/transcript. Do not invent behaviours. If evidence is insufficient, use "
+        "Use only supplied evidence/transcript. Acoustic features are measured from the source recording: use them only when explicitly supplied, and do not infer unreported vocal tone from transcript wording. Do not invent behaviours. If evidence is insufficient, use "
         "validated=false, severity=\"Insufficient\", confidence between 0 and 1, and explain what is missing. "
         "Preserve the exact start/end timestamp numbers from the input.\n\n"
         "Return exactly one compact JSON object. The first character must be `{` and the last character must be `}`. "

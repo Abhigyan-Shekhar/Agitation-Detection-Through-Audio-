@@ -335,12 +335,16 @@ def _check_distressed_verbalization(
 ) -> BehaviourLabel | None:
     if linguistic is None:
         return None
-    if (
-        linguistic.urgency_score >= config.BEHAVIOUR_URGENCY_THRESHOLD
-        and (
-            result.acoustic_score >= config.BEHAVIOUR_URGENCY_ACOUSTIC
-            or result.reliability < 0.90
-        )
+    transcript_confidence = linguistic.evidence.get("transcript", {}).get("confidence")
+    transcript_reliable = (
+        transcript_confidence is None
+        or float(transcript_confidence) >= config.BEHAVIOUR_URGENCY_MIN_TRANSCRIPT_CONFIDENCE
+    )
+    # ASR confidence is evidence quality, not evidence of calmness.  Strong
+    # urgent language may stand on its own when the transcript is reliable;
+    # weaker text needs acoustic corroboration.
+    if linguistic.urgency_score >= config.BEHAVIOUR_URGENCY_THRESHOLD and (
+        transcript_reliable or result.acoustic_score >= config.BEHAVIOUR_URGENCY_ACOUSTIC
     ):
         acoustic_component = result.acoustic_score if result.acoustic_features is not None else linguistic.urgency_score
         conf = min(1.0, (linguistic.urgency_score + acoustic_component) / 2.0)
@@ -416,6 +420,12 @@ class BehaviourClassifier:
 
         now = getattr(result.acoustic_features, "end_time", None) or time.time()
         gate_score = label.confidence
+        if gate_score >= config.SCREAM_EXTREME_SCORE_THRESHOLD:
+            self._scream_active = True
+            self._scream_positive_windows = 1
+            self._scream_recovery_windows = 0
+            label.evidence += ", scream_gate=immediate_extreme_event"
+            return label
         if gate_score >= config.SCREAM_ON_SCORE_THRESHOLD:
             self._scream_positive_windows += 1
             self._scream_recovery_windows = 0

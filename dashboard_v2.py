@@ -102,7 +102,7 @@ def run_pipeline(data: bytes, filename: str) -> dict[str, Any]:
     """Run the complete MVP processing pipeline for one uploaded audio file."""
     person1 = transcribe_upload(data, filename)
     transcript_contract = person1.transcript_contract()
-    person2 = analyze_person1_transcript(transcript_contract)
+    person2 = analyze_person1_transcript(person1.person2_contract())
     behaviour_contract = person2.behaviour_contract()
     final_results = analyze_person2_behaviours(behaviour_contract)
     return {

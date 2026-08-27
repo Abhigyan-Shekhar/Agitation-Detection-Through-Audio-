@@ -358,3 +358,38 @@ def test_person1_to_person2_to_person3_output_contract_contains_required_fields(
 def test_invalid_person1_timestamps_are_rejected():
     with pytest.raises(ValueError, match="ordered timestamps"):
         contextual_chunk_transcript([{"start": 5.0, "end": 4.0, "text": "bad"}])
+
+
+def test_strong_acoustic_agitation_flags_neutral_words_but_loud_constant_speech_does_not():
+    result = analyze_person1_transcript(
+        [
+            {"start": 0.0, "end": 2.0, "text": "Fine. Whatever.", "confidence": 0.95,
+             "acoustic": {"available": True, "agitation_score": 0.88, "scream_score": 0.20,
+                          "relative_energy": 4.0, "burst_score": 0.70}},
+            {"start": 3.0, "end": 5.0, "text": "Welcome everyone.", "confidence": 0.95,
+             "acoustic": {"available": True, "agitation_score": 0.20, "scream_score": 0.20,
+                          "relative_energy": 1.0, "burst_score": 0.02}},
+        ], settings=Person2Config(max_chunk_duration_sec=3.0, max_segments_per_chunk=1, overlap_segments=0),
+        embedding_provider=CountingEmbeddingProvider(),
+    )
+    assert any(item.behaviour == "Vocal agitation" and item.start == 0.0 for item in result.behaviours)
+    assert not any(item.behaviour == "Vocal agitation" and item.start == 3.0 for item in result.behaviours)
+
+
+def test_acoustic_only_extreme_scream_reaches_person2_when_asr_has_no_text():
+    result = analyze_person1_transcript(
+        [{"start": 10.0, "end": 10.5, "text": "", "acoustic": {
+            "available": True, "agitation_score": 0.90, "scream_score": 0.96,
+            "relative_energy": 5.0, "burst_score": 0.85,
+        }}],
+        embedding_provider=CountingEmbeddingProvider(),
+    )
+    assert any(item.behaviour == "Screaming" for item in result.behaviours)
+
+
+def test_legacy_transcript_record_without_acoustics_still_works():
+    result = analyze_person1_transcript(
+        [{"start": 0.0, "end": 1.0, "text": "Please help me now.", "confidence": 0.95}],
+        embedding_provider=CountingEmbeddingProvider(),
+    )
+    assert any(item.behaviour == "Distressed/urgent verbalization" for item in result.behaviours)
