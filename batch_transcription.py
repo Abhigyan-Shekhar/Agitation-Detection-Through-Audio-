@@ -17,6 +17,7 @@ import numpy as np
 
 import config
 from transcriber import DirectWhisperTranscriber, TranscriptSegment, TranscriptWord
+from upload_speaker_diarization import SpeakerAttribution, UnknownSpeakerDiarizer, UploadSpeakerDiarizer
 
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".webm"})
@@ -74,6 +75,8 @@ class TimestampedTranscript:
     acoustic: dict[str, float | bool] | None = None
     id: str | None = None
     source_segment_ids: list[str] | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
 
     def as_dict(self, *, include_acoustic: bool = True, include_source_metadata: bool = True) -> dict[str, Any]:
         payload = asdict(self)
@@ -587,12 +590,20 @@ def _with_acoustic(
     baseline_rms: float,
     *,
     audio_start: float = 0.0,
+    diarizer: UploadSpeakerDiarizer | None = None,
 ) -> TimestampedTranscript:
     start = max(0, int((segment.start - audio_start) * sample_rate))
     end = min(samples.size, max(start + 1, int((segment.end - audio_start) * sample_rate)))
     local_baseline = _local_baseline_rms(samples, sample_rate, start, end, fallback=baseline_rms)
-    return replace(segment, acoustic=_acoustic_evidence(samples[start:end], sample_rate, local_baseline))
+    speaker = _speaker_for_span(samples[start:end], sample_rate, segment.start, segment.end, diarizer)
+    return replace(segment, acoustic=_acoustic_evidence(samples[start:end], sample_rate, local_baseline), speaker_id=speaker.speaker_id, speaker_label=speaker.speaker_label)
 
+
+
+def _speaker_for_span(audio: np.ndarray, sample_rate: int, start: float, end: float, diarizer: UploadSpeakerDiarizer | None) -> SpeakerAttribution:
+    if diarizer is None or not config.BATCH_ENABLE_SPEAKER_DIARIZATION:
+        return SpeakerAttribution()
+    return diarizer.identify(audio, sample_rate, start, end)
 
 def _local_baseline_rms(
     samples: np.ndarray,
@@ -601,19 +612,26 @@ def _local_baseline_rms(
     end_sample: int,
     *,
     fallback: float,
-    context_seconds: float = 30.0,
+    context_seconds: float | None = None,
 ) -> float:
-    """Robust local RMS baseline around one evidence span."""
-    pad = int(context_seconds * sample_rate)
-    start = max(0, start_sample - pad)
-    end = min(samples.size, end_sample + pad)
-    if end <= start:
-        return fallback
-    local = _recording_baseline_rms(samples[start:end], sample_rate)
-    return float(local if local > 0 else fallback)
+    """Robust preceding RMS baseline that excludes the current evidence span."""
+    history_seconds = config.BATCH_LOCAL_BASELINE_HISTORY_SEC if context_seconds is None else context_seconds
+    frame = max(1, int(config.BATCH_LOCAL_BASELINE_FRAME_SEC * sample_rate))
+    hist_start = max(0, start_sample - int(history_seconds * sample_rate))
+    hist_end = max(hist_start, start_sample)
+    history = np.asarray(samples[hist_start:hist_end], dtype=np.float32)
+    if history.size < int(config.BATCH_LOCAL_BASELINE_MIN_HISTORY_SEC * sample_rate):
+        return float(max(fallback, config.BATCH_LOCAL_BASELINE_MIN_RMS))
+    rms = np.asarray([np.sqrt(np.mean(history[i:i + frame] ** 2)) for i in range(0, history.size, frame) if history[i:i + frame].size], dtype=float)
+    active = rms[rms >= config.BATCH_LOCAL_BASELINE_MIN_RMS]
+    if active.size < 3:
+        return float(max(fallback, config.BATCH_LOCAL_BASELINE_MIN_RMS))
+    logs = np.log(active + 1e-8)
+    median_log = float(np.median(logs))
+    return float(max(np.exp(median_log), config.BATCH_LOCAL_BASELINE_MIN_RMS))
 
 
-def _acoustic_evidence(audio: np.ndarray, sample_rate: int, baseline_rms: float) -> dict[str, float | bool]:
+def _acoustic_evidence(audio: np.ndarray, sample_rate: int, baseline_rms: float) -> dict[str, float | bool | str | None]:
     """Small, deterministic upload feature set aligned to one time region.
 
     These are recording-relative features, deliberately requiring more than
@@ -628,6 +646,9 @@ def _acoustic_evidence(audio: np.ndarray, sample_rate: int, baseline_rms: float)
     mean_rms = float(np.mean(rms))
     peak = float(np.max(np.abs(y)))
     relative = mean_rms / max(baseline_rms, 1e-4)
+    log_current = float(np.log(max(mean_rms, 1e-8)))
+    log_baseline = float(np.log(max(baseline_rms, 1e-8)))
+    energy_deviation = (log_current - log_baseline) / max(config.BATCH_LOCAL_BASELINE_MIN_LOG_SCALE, 1e-6)
     burst = float(max(0.0, (np.percentile(rms, 95) - np.median(rms)) / max(np.percentile(rms, 95), 1e-4)))
     clipping = float(np.mean(np.abs(y) >= 0.99))
     zcr = float(np.mean(np.abs(np.diff(np.signbit(y))))) if y.size > 1 else 0.0
@@ -643,7 +664,7 @@ def _acoustic_evidence(audio: np.ndarray, sample_rate: int, baseline_rms: float)
     scream = float(np.clip((0.38 * energy_score + 0.30 * peak_score + 0.18 * burst + 0.14 * min(1.0, clipping / 0.04)) * (1.0 if voice_like and voiced_ratio >= 0.30 else 0.35), 0.0, 1.0))
     return {
         "available": True, "rms_mean": round(mean_rms, 4), "rms_peak": round(peak, 4),
-        "relative_energy": round(relative, 3), "clipping_ratio": round(clipping, 4),
+        "relative_energy": round(relative, 3), "log_rms": round(log_current, 4), "baseline_log_rms": round(log_baseline, 4), "energy_deviation": round(energy_deviation, 3), "clipping_ratio": round(clipping, 4),
         "voiced_ratio": round(voiced_ratio, 3), "burst_score": round(burst, 3),
         "voice_like": voice_like, "agitation_score": round(agitation, 3), "scream_score": round(scream, 3),
     }
@@ -668,7 +689,7 @@ def _acoustic_only_events(samples: np.ndarray, sample_rate: int, baseline_rms: f
     for start, end, evidence in positives:
         if events and start <= events[-1].end:
             previous = events[-1]
-            events[-1] = TimestampedTranscript(previous.start, max(previous.end, end), "", None, evidence)
+            events[-1] = TimestampedTranscript(previous.start, max(previous.end, end), "", None, _merge_acoustic_evidence(previous.acoustic or {}, evidence))
         else:
             events.append(TimestampedTranscript(start, end, "", None, evidence))
     # Borderline candidates need the configured number of overlapping windows.
@@ -683,6 +704,23 @@ def _acoustic_only_events(samples: np.ndarray, sample_rate: int, baseline_rms: f
     # evidence; ordinary candidates must meet the real window-count coverage.
     return [event for event in events if float(event.acoustic["scream_score"]) >= config.SCREAM_EXTREME_SCORE_THRESHOLD or event.end - event.start >= required_coverage]
 
+
+
+def _merge_acoustic_evidence(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(left)
+    for key, value in right.items():
+        if isinstance(value, (int, float)) and isinstance(merged.get(key), (int, float)):
+            if key in {"scream_score", "agitation_score", "relative_energy", "rms_peak", "energy_deviation"}:
+                merged[key] = max(float(merged[key]), float(value))
+            else:
+                merged[key] = value
+        else:
+            merged[key] = value if value not in (None, "") else merged.get(key)
+    merged["max_scream_score"] = max(float(left.get("max_scream_score", left.get("scream_score", 0.0)) or 0.0), float(right.get("max_scream_score", right.get("scream_score", 0.0)) or 0.0))
+    merged["max_agitation_score"] = max(float(left.get("max_agitation_score", left.get("agitation_score", 0.0)) or 0.0), float(right.get("max_agitation_score", right.get("agitation_score", 0.0)) or 0.0))
+    merged["positive_window_count"] = int(left.get("positive_window_count", 1)) + int(right.get("positive_window_count", 1))
+    merged["consecutive_window_count"] = merged["positive_window_count"]
+    return merged
 
 def _acoustic_only_events_streaming(data: bytes, sample_rate: int, baseline_rms: float) -> list[TimestampedTranscript]:
     """Streaming acoustic-only event detection with the same fixed windows."""
@@ -714,7 +752,7 @@ def _acoustic_only_events_streaming(data: bytes, sample_rate: int, baseline_rms:
             )
             if events and absolute.start <= events[-1].end:
                 previous = events[-1]
-                events[-1] = TimestampedTranscript(previous.start, max(previous.end, absolute.end), "", None, absolute.acoustic)
+                events[-1] = TimestampedTranscript(previous.start, max(previous.end, absolute.end), "", None, _merge_acoustic_evidence(previous.acoustic or {}, absolute.acoustic or {}))
             else:
                 events.append(absolute)
     return events

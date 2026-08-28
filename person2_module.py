@@ -29,6 +29,8 @@ class Person1TranscriptSegment:
     acoustic: dict[str, Any] | None = None
     id: str | None = None
     source_segment_ids: list[str] | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,7 @@ class Person2Config:
     semantic_similarity_threshold: float = config.PERSON2_SEMANTIC_SIMILARITY_THRESHOLD
     prototype_similarity_threshold: float = config.PERSON2_PROTOTYPE_SIMILARITY_THRESHOLD
     dedupe_iou_threshold: float = config.PERSON2_DEDUPE_IOU_THRESHOLD
+    target_speaker_id: str | None = config.BATCH_TARGET_SPEAKER_ID
     embedding_backend: str = config.PERSON2_EMBEDDING_BACKEND
     embedding_model: str = config.PERSON2_EMBEDDING_MODEL
     embedding_dimension: int = config.PERSON2_EMBEDDING_DIMENSION
@@ -134,6 +137,8 @@ class BehaviourEvidenceResult:
     modality: str = "audio"
     mapping_status: str = "mapped"
     acoustic: dict[str, Any] | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -301,6 +306,8 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 acoustic=_coerce_acoustic(item.get("acoustic")),
                 id=str(item["id"]) if item.get("id") is not None else None,
                 source_segment_ids=_coerce_source_segment_ids(item.get("source_segment_ids")),
+                speaker_id=item.get("speaker_id"),
+                speaker_label=str(item["speaker_label"]) if item.get("speaker_label") is not None else None,
             )
         else:
             segment = Person1TranscriptSegment(
@@ -311,13 +318,15 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 acoustic=_coerce_acoustic(getattr(item, "acoustic", None)),
                 id=str(getattr(item, "id")) if getattr(item, "id", None) is not None else None,
                 source_segment_ids=_coerce_source_segment_ids(getattr(item, "source_segment_ids", None)),
+                speaker_id=getattr(item, "speaker_id", None),
+                speaker_label=str(getattr(item, "speaker_label")) if getattr(item, "speaker_label", None) is not None else None,
             )
         if segment.start < 0 or segment.end < segment.start:
             raise ValueError("Person 1 transcript segments must have non-negative ordered timestamps")
         if segment.text or segment.acoustic is not None:
             segment_id = segment.id or f"seg-{len(segments):06d}"
             source_ids = segment.source_segment_ids or [segment_id]
-            segments.append(Person1TranscriptSegment(segment.start, segment.end, segment.text, segment.confidence, segment.acoustic, segment_id, source_ids))
+            segments.append(Person1TranscriptSegment(segment.start, segment.end, segment.text, segment.confidence, segment.acoustic, segment_id, source_ids, segment.speaker_id, segment.speaker_label))
     return segments
 
 
@@ -509,14 +518,11 @@ def detect_initial_behaviours(
 ) -> list[BehaviourEvidenceResult]:
     """Emit initial, transcript-supported CMAI-aligned behaviour evidence."""
     settings = settings or Person2Config()
-    analyzer = LinguisticAnalyzer(history_sec=config.TRANSCRIPT_HISTORY_SEC)
     results: list[BehaviourEvidenceResult] = []
     provider = provider or build_default_embedding_provider(settings)
     prototype_embeddings = _embed_semantic_prototypes(provider)
 
     for chunk in chunks:
-        utterance = _chunk_to_utterance(chunk)
-        features = analyzer.analyze(utterance)
         chunk_repetitions = repetitions.get(chunk.chunk_id, [])
 
         for repetition in chunk_repetitions:
@@ -565,7 +571,9 @@ def detect_initial_behaviours(
         for local_idx, segment in enumerate(chunk.segments):
             if not segment.text:
                 continue
-            segment_features = analyzer.analyze(_segment_to_utterance(segment))
+            if not _is_target_speaker(segment, settings):
+                continue
+            segment_features = LinguisticAnalyzer(history_sec=0).analyze(_segment_to_utterance(segment))
             linguistic_candidates = [
                 ("Cursing / verbal aggression", segment_features.profanity_score, "Explicit profanity/verbal aggression cue in transcript."),
                 ("Making verbal sexual advances", segment_features.sexual_advance_score, "Sexualized verbal proposition or comment in transcript."),
@@ -605,7 +613,7 @@ def detect_initial_behaviours(
                 continue
             agitation = float(acoustic.get("agitation_score", 0.0))
             scream = float(acoustic.get("scream_score", 0.0))
-            urgency = features.urgency_score if segment.text else 0.0
+            urgency = LinguisticAnalyzer(history_sec=0).analyze(_segment_to_utterance(segment)).urgency_score if segment.text and _is_target_speaker(segment, settings) else 0.0
             if scream >= config.PERSON2_ACOUSTIC_SCREAM_THRESHOLD:
                 label, score, rationale = "Screaming/shouting", scream, "Strong timestamp-aligned scream evidence from source audio."
             elif agitation >= config.PERSON2_ACOUSTIC_AGITATION_THRESHOLD:
@@ -716,6 +724,8 @@ def _segment_to_utterance(segment: Person1TranscriptSegment) -> Utterance:
                 start_time=segment.start,
                 end_time=segment.end,
                 transcript_confidence=segment.confidence,
+        speaker_id=segment.speaker_id,
+        speaker_label=segment.speaker_label,
             )
         ],
         start_time=segment.start,
@@ -749,8 +759,18 @@ def _behaviour_from_segment(
         evidence_segments=[_segment_payload(segment)],
         context_start=chunk.start,
         context_end=chunk.end,
+        speaker_id=segment.speaker_id,
+        speaker_label=segment.speaker_label,
     )
 
+
+
+def _is_target_speaker(segment: Person1TranscriptSegment, settings: Person2Config) -> bool:
+    """Return whether transcript may create resident linguistic evidence."""
+    target = settings.target_speaker_id
+    if target is None or str(target).strip() == "":
+        return True
+    return segment.speaker_id is not None and str(segment.speaker_id) == str(target)
 
 def _embed_semantic_prototypes(provider: TextEmbeddingProvider) -> dict[str, list[tuple[str, list[float]]]]:
     embedded: dict[str, list[tuple[str, list[float]]]] = {}
@@ -794,6 +814,8 @@ def _semantic_prototype_behaviours(
         prototype, similarity = max(scored, key=lambda item: item[1])
         if similarity < settings.prototype_similarity_threshold:
             continue
+        if label == "Constant unwarranted requests for attention/help" and not _has_repeated_requests_in_chunk(chunk, settings):
+            continue
         result = _behaviour_from_segment(
             label,
             min(0.89, 0.45 + 0.45 * similarity),
@@ -808,6 +830,12 @@ def _semantic_prototype_behaviours(
         if result is not None:
             results.append(result)
     return results
+
+
+def _has_repeated_requests_in_chunk(chunk: TranscriptChunk, settings: Person2Config) -> bool:
+    requests = [segment for segment in chunk.segments if _is_target_speaker(segment, settings) and _is_request(segment.text)]
+    unique_ids = {segment.id or f"{segment.start:.3f}-{segment.end:.3f}" for segment in requests}
+    return len(unique_ids) >= settings.repetition_min_occurrences
 
 
 def _source_ids_for_occurrences(chunk: TranscriptChunk, occurrences: list[RepetitionOccurrence]) -> list[str]:
@@ -845,6 +873,8 @@ def _segment_payload(segment: Person1TranscriptSegment) -> dict[str, Any]:
         "start": segment.start,
         "end": segment.end,
         "text": segment.text,
+        "speaker_id": segment.speaker_id,
+        "speaker_label": segment.speaker_label,
     }
 
 
@@ -909,6 +939,8 @@ def _merge_behaviour_pair(left: BehaviourEvidenceResult, right: BehaviourEvidenc
         modality=strongest.modality,
         mapping_status=strongest.mapping_status,
         acoustic=acoustic,
+        speaker_id=strongest.speaker_id if strongest.speaker_id is not None else other.speaker_id,
+        speaker_label=strongest.speaker_label if strongest.speaker_label is not None else other.speaker_label,
     )
 
 
