@@ -88,6 +88,13 @@ class FinalBehaviourResult:
     transcript: str
     chunk_id: str | None = None
     evidence_segment_ids: list[str] | None = None
+    support: str = "supported"
+    model_support_score: float | None = None
+    calibrated_confidence: float | None = None
+    source_segment_ids: list[str] | None = None
+    evidence_segments: list[dict[str, Any]] | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
     error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -209,6 +216,8 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "chunk_id": record.get("chunk_id"),
         "repetition": record.get("repetition"),
         "acoustic_evidence": record.get("acoustic"),
+        "speaker_id": record.get("speaker_id"),
+        "speaker_label": record.get("speaker_label"),
     }
     example = {
         "behaviour": payload["initial_behaviour"] or "Unknown behaviour",
@@ -223,12 +232,12 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "/no_think\n"
         "Evaluate this Person 2 audio-behaviour evidence as research decision support, not medical diagnosis. "
         "Use only supplied evidence/transcript. Acoustic features are measured from the source recording: use them only when explicitly supplied, and do not infer unreported vocal tone from transcript wording. Do not invent behaviours. If evidence is insufficient, use "
-        "support=\"insufficient\", severity=\"Insufficient\", confidence between 0 and 1, and explain what is missing. "
+        "support=\"insufficient\", severity=\"Insufficient\", confidence between 0 and 1 as an uncalibrated model support score, and explain what is missing. "
         "Do not invent, modify, or return timestamps. Select only source_transcript_units IDs that directly support the decision.\n\n"
         "Return exactly one compact JSON object. The first character must be `{` and the last character must be `}`. "
         "Do not return markdown, code fences, comments, XML/thinking tags, "
         "or any text before or after the JSON object. The JSON object must contain exactly these keys: "
-        "behaviour, support, evidence_segment_ids, severity, confidence, evidence, explanation. "
+        "behaviour, support, evidence_segment_ids, severity, confidence, evidence, explanation. The confidence field is an uncalibrated verifier support score, not a clinical probability. "
         f"Allowed support values: {', '.join(sorted(VALID_SUPPORT))}. "
         f"Allowed severity values: {', '.join(sorted(VALID_SEVERITIES))}.\n\n"
         f"Required JSON shape example:\n{json.dumps(example, separators=(',', ':'))}\n\n"
@@ -283,6 +292,9 @@ def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_reco
         validated=support == "supported",
         severity=severity,
         confidence=round(confidence, 4),
+        support=support,
+        model_support_score=round(confidence, 4),
+        calibrated_confidence=None,
         evidence=str(data["evidence"]).strip(),
         explanation=str(data["explanation"]).strip(),
         initial_behaviour=str(source_record.get("behaviour", "")),
@@ -291,6 +303,10 @@ def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_reco
         transcript=str(source_record.get("text", "")),
         chunk_id=str(source_record.get("chunk_id")) if source_record.get("chunk_id") is not None else None,
         evidence_segment_ids=selected_ids,
+        source_segment_ids=list(source_record.get("source_segment_ids") or selected_ids),
+        evidence_segments=source_record.get("evidence_segments"),
+        speaker_id=source_record.get("speaker_id"),
+        speaker_label=source_record.get("speaker_label"),
     )
 
 
@@ -307,6 +323,8 @@ def _source_units(record: dict[str, Any]) -> list[dict[str, Any]]:
                 "start": float(unit["start"]),
                 "end": float(unit["end"]),
                 "text": str(unit.get("text", "")),
+                "speaker_id": unit.get("speaker_id"),
+                "speaker_label": unit.get("speaker_label"),
             })
         if units:
             return units
@@ -336,7 +354,7 @@ def deduplicate_final_results(results: list[FinalBehaviourResult], *, iou_thresh
         key = (result.behaviour, ids or (round(result.start, 1), round(result.end, 1)))
         exact[key] = _merge_final_pair(exact[key], result) if key in exact else result
     merged: list[FinalBehaviourResult] = []
-    for result in sorted(exact.values(), key=lambda item: (item.start, item.end, item.behaviour, -item.confidence)):
+    for result in sorted(exact.values(), key=lambda item: (item.start, item.end, item.behaviour, -float(item.model_support_score if item.model_support_score is not None else item.confidence))):
         match_index = next(
             (
                 index
@@ -354,7 +372,7 @@ def deduplicate_final_results(results: list[FinalBehaviourResult], *, iou_thresh
 
 
 def _merge_final_pair(left: FinalBehaviourResult, right: FinalBehaviourResult) -> FinalBehaviourResult:
-    strongest = left if left.confidence >= right.confidence else right
+    strongest = _select_primary_final(left, right)
     other = right if strongest is left else left
     ids = list(dict.fromkeys([*(strongest.evidence_segment_ids or []), *(other.evidence_segment_ids or [])]))
     evidence = strongest.evidence
@@ -364,9 +382,12 @@ def _merge_final_pair(left: FinalBehaviourResult, right: FinalBehaviourResult) -
         behaviour=strongest.behaviour,
         start=min(left.start, right.start),
         end=max(left.end, right.end),
-        validated=left.validated or right.validated,
+        validated=strongest.support == "supported",
         severity=strongest.severity,
-        confidence=max(left.confidence, right.confidence),
+        confidence=float(strongest.model_support_score if strongest.model_support_score is not None else strongest.confidence),
+        support=strongest.support,
+        model_support_score=strongest.model_support_score if strongest.model_support_score is not None else strongest.confidence,
+        calibrated_confidence=strongest.calibrated_confidence,
         evidence=evidence,
         explanation=strongest.explanation,
         initial_behaviour=strongest.initial_behaviour,
@@ -375,8 +396,31 @@ def _merge_final_pair(left: FinalBehaviourResult, right: FinalBehaviourResult) -
         transcript=strongest.transcript if len(strongest.transcript) >= len(other.transcript) else other.transcript,
         chunk_id=strongest.chunk_id,
         evidence_segment_ids=ids,
+        source_segment_ids=list(dict.fromkeys([*(strongest.source_segment_ids or []), *(other.source_segment_ids or [])])),
+        evidence_segments=_merge_evidence_segments(strongest.evidence_segments, other.evidence_segments),
+        speaker_id=strongest.speaker_id if strongest.speaker_id is not None else other.speaker_id,
+        speaker_label=strongest.speaker_label if strongest.speaker_label is not None else other.speaker_label,
         error=strongest.error or other.error,
     )
+
+
+def _select_primary_final(left: FinalBehaviourResult, right: FinalBehaviourResult) -> FinalBehaviourResult:
+    precedence = {"supported": 2, "insufficient": 1, "unsupported": 0}
+    l_sup = left.support if left.support in precedence else ("supported" if left.validated else "unsupported")
+    r_sup = right.support if right.support in precedence else ("supported" if right.validated else "unsupported")
+    if precedence[l_sup] != precedence[r_sup]:
+        return left if precedence[l_sup] > precedence[r_sup] else right
+    l_score = float(left.model_support_score if left.model_support_score is not None else left.confidence)
+    r_score = float(right.model_support_score if right.model_support_score is not None else right.confidence)
+    return left if l_score >= r_score else right
+
+
+def _merge_evidence_segments(left: list[dict[str, Any]] | None, right: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    merged: dict[str, dict[str, Any]] = {}
+    for item in [*(left or []), *(right or [])]:
+        if isinstance(item, dict):
+            merged[str(item.get("id", len(merged)))] = item
+    return list(merged.values()) or None
 
 
 def _interval_iou(a_start: float, a_end: float, b_start: float, b_end: float) -> float:

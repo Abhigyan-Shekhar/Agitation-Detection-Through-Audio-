@@ -38,6 +38,13 @@ BATCH_WHISPER_VAD_SPEECH_PAD_MS: int = int(os.getenv("BATCH_WHISPER_VAD_SPEECH_P
 BATCH_TRANSCRIPT_SENTENCE_GAP_SEC: float = float(os.getenv("BATCH_TRANSCRIPT_SENTENCE_GAP_SEC", "0.55"))
 BATCH_TRANSCRIPT_MAX_UTTERANCE_SEC: float = float(os.getenv("BATCH_TRANSCRIPT_MAX_UTTERANCE_SEC", "8.0"))
 
+# Upload/batch speaker attribution. Diarization remains optional; when a
+# target speaker id is configured, Person 2 filters linguistic resident-CMAI
+# candidates to that speaker and keeps unknown-speaker acoustic evidence marked
+# unknown instead of assigning it to the resident.
+BATCH_ENABLE_SPEAKER_DIARIZATION: bool = os.getenv("BATCH_ENABLE_SPEAKER_DIARIZATION", "false").lower() == "true"
+BATCH_TARGET_SPEAKER_ID: str | None = os.getenv("BATCH_TARGET_SPEAKER_ID") or None
+
 # Local speaker diarization. The ECAPA model is loaded lazily on the
 # transcription worker, never in the sounddevice callback or Streamlit loop.
 ENABLE_SPEAKER_DIARIZATION: bool = os.getenv("ENABLE_SPEAKER_DIARIZATION", "true").lower() == "true"
@@ -191,6 +198,13 @@ PERSON2_EMBEDDING_DIMENSION: int = int(os.getenv("PERSON2_EMBEDDING_DIMENSION", 
 PERSON2_ACOUSTIC_AGITATION_THRESHOLD: float = float(os.getenv("PERSON2_ACOUSTIC_AGITATION_THRESHOLD", "0.72"))
 PERSON2_ACOUSTIC_COMBINED_THRESHOLD: float = float(os.getenv("PERSON2_ACOUSTIC_COMBINED_THRESHOLD", "0.48"))
 PERSON2_ACOUSTIC_SCREAM_THRESHOLD: float = float(os.getenv("PERSON2_ACOUSTIC_SCREAM_THRESHOLD", "0.72"))
+
+BATCH_LOCAL_BASELINE_HISTORY_SEC: float = float(os.getenv("BATCH_LOCAL_BASELINE_HISTORY_SEC", "90"))
+BATCH_LOCAL_BASELINE_MIN_HISTORY_SEC: float = float(os.getenv("BATCH_LOCAL_BASELINE_MIN_HISTORY_SEC", "8"))
+BATCH_LOCAL_BASELINE_FRAME_SEC: float = float(os.getenv("BATCH_LOCAL_BASELINE_FRAME_SEC", "0.04"))
+BATCH_LOCAL_BASELINE_MIN_RMS: float = float(os.getenv("BATCH_LOCAL_BASELINE_MIN_RMS", "0.003"))
+BATCH_LOCAL_BASELINE_MIN_LOG_SCALE: float = float(os.getenv("BATCH_LOCAL_BASELINE_MIN_LOG_SCALE", "0.15"))
+BATCH_GAIN_ADAPTATION_SEC: float = float(os.getenv("BATCH_GAIN_ADAPTATION_SEC", "15"))
 PERSON2_DEDUPE_IOU_THRESHOLD: float = float(os.getenv("PERSON2_DEDUPE_IOU_THRESHOLD", "0.70"))
 
 # ---------------------------------------------------------------------------
