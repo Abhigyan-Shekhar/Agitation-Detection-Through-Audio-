@@ -4,20 +4,26 @@ from __future__ import annotations
 from dataclasses import asdict
 from hashlib import sha256
 from io import BytesIO
+import logging
 from pathlib import Path
+import time
 from typing import Any
 import wave
 
 import pandas as pd
 import streamlit as st
 
-from batch_transcription import SUPPORTED_AUDIO_EXTENSIONS, preprocess_upload, transcribe_upload
+import numpy as np
+
+import config
+from batch_transcription import SUPPORTED_AUDIO_EXTENSIONS, inspect_upload, iter_transcription_chunks, transcribe_upload
 from person2_module import analyze_person1_transcript
 from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_behaviours
 
 
 ANALYSIS_RESULT_STATE_KEY = "mvp_analysis_result"
 ANALYSIS_UPLOAD_STATE_KEY = "mvp_analysis_upload_key"
+LOGGER = logging.getLogger(__name__)
 
 
 def upload_cache_key(data: bytes, filename: str) -> str:
@@ -83,28 +89,84 @@ def timeline_table(results: list[FinalBehaviourResult]) -> pd.DataFrame:
 
 def extract_audio_segment_wav(data: bytes, filename: str, start: float, end: float) -> bytes:
     """Return a WAV segment aligned to original audio-relative timestamps."""
-    processed = preprocess_upload(data, filename)
-    start_index = max(0, int(start * processed.sample_rate))
-    end_index = min(processed.samples.size, int(end * processed.sample_rate))
-    if end_index <= start_index:
-        end_index = min(processed.samples.size, start_index + int(0.25 * processed.sample_rate))
-    pcm = (processed.samples[start_index:end_index].clip(-1.0, 1.0) * 32767).astype("<i2")
+    sample_rate = config.SAMPLE_RATE
+    requested_start = max(0.0, float(start))
+    requested_end = max(requested_start + 0.25, float(end))
+    parts: list[np.ndarray] = []
+    for chunk in iter_transcription_chunks(
+        data,
+        filename,
+        target_sample_rate=sample_rate,
+        chunk_seconds=max(30.0, requested_end - requested_start + 1.0),
+        overlap_seconds=0.0,
+    ):
+        if chunk.primary_end <= requested_start:
+            continue
+        if chunk.primary_start >= requested_end:
+            break
+        local_start = max(0, int((requested_start - chunk.primary_start) * sample_rate))
+        local_end = min(chunk.samples.size, int((requested_end - chunk.primary_start) * sample_rate))
+        if local_end > local_start:
+            parts.append(chunk.samples[local_start:local_end])
+    if not parts:
+        parts = [np.zeros(int(0.25 * sample_rate), dtype=np.float32)]
+    samples = np.concatenate(parts)
+    pcm = (samples.clip(-1.0, 1.0) * 32767).astype("<i2")
     buffer = BytesIO()
     with wave.open(buffer, "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
-        wav_file.setframerate(processed.sample_rate)
+        wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm.tobytes())
     return buffer.getvalue()
 
 
-def run_pipeline(data: bytes, filename: str) -> dict[str, Any]:
+def run_pipeline(data: bytes, filename: str, *, progress_callback: Any | None = None) -> dict[str, Any]:
     """Run the complete MVP processing pipeline for one uploaded audio file."""
-    person1 = transcribe_upload(data, filename)
+    started = time.monotonic()
+    LOGGER.info("MVP pipeline started filename=%s bytes=%d", filename, len(data))
+    if progress_callback is not None:
+        progress_callback("preparing", 0, 1, "Preparing audio")
+    person1 = transcribe_upload(data, filename, progress_callback=progress_callback)
+    LOGGER.info(
+        "Person 1 complete filename=%s duration=%.3fs transcript_segments=%d elapsed=%.2fs",
+        filename,
+        person1.duration,
+        len(person1.segments),
+        time.monotonic() - started,
+    )
     transcript_contract = person1.transcript_contract()
+    if progress_callback is not None:
+        progress_callback("person2", 0, 1, "Analyzing behaviour evidence")
     person2 = analyze_person1_transcript(person1.person2_contract())
+    LOGGER.info(
+        "Person 2 complete filename=%s chunks=%d behaviours=%d elapsed=%.2fs",
+        filename,
+        len(person2.chunks),
+        len(person2.behaviours),
+        time.monotonic() - started,
+    )
     behaviour_contract = person2.behaviour_contract()
-    final_results = analyze_person2_behaviours(behaviour_contract)
+    if progress_callback is not None:
+        progress_callback("person3", 0, max(1, len(behaviour_contract)), "Validating Person 2 results")
+    def person3_progress(completed: int, total: int, record: dict[str, Any]) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                "person3",
+                completed,
+                max(1, total),
+                f"Validating {completed}/{total}: {record.get('behaviour', 'behaviour evidence')}",
+            )
+
+    final_results = analyze_person2_behaviours(behaviour_contract, progress_callback=person3_progress)
+    if progress_callback is not None:
+        progress_callback("person3", len(behaviour_contract), max(1, len(behaviour_contract)), "Validation complete")
+    LOGGER.info(
+        "MVP pipeline complete filename=%s final_results=%d elapsed=%.2fs",
+        filename,
+        len(final_results),
+        time.monotonic() - started,
+    )
     return {
         "person1": person1,
         "transcript": transcript_contract,
@@ -139,9 +201,10 @@ def main() -> None:
 
     st.subheader("1. Audio Upload")
     try:
-        processed = preprocess_upload(data, filename)
-        st.write(f"Filename: **{processed.filename}**")
-        st.write(f"Duration: **{processed.duration:.1f} seconds**")
+        metadata = inspect_upload(data, filename)
+        st.write(f"Filename: **{metadata.filename}**")
+        st.write(f"Duration: **{metadata.duration:.1f} seconds**")
+        st.write(f"Upload size: **{metadata.source_bytes / (1024 * 1024):.1f} MB / 200 MB**")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Audio validation failed: {exc}")
         return
@@ -151,16 +214,30 @@ def main() -> None:
     if run_analysis:
         try:
             with st.status("Processing audio-analysis pipeline...", expanded=True) as status:
-                st.write("Person 1: transcription with timestamps")
-                pipeline = run_pipeline(data, filename)
-                st.write("Person 2: contextual chunks, embeddings, initial behaviour evidence")
-                st.write("Person 3: Qwen validation through Groq")
+                progress_bar = st.progress(0.0)
+                stage_line = st.empty()
+
+                def update_progress(stage: str, completed: int, total: int, message: str) -> None:
+                    stage_weights = {
+                        "preparing": (0.00, 0.05),
+                        "transcribing": (0.05, 0.70),
+                        "person2": (0.70, 0.15),
+                        "person3": (0.85, 0.15),
+                    }
+                    base, span = stage_weights.get(stage, (0.0, 1.0))
+                    fraction = 1.0 if total <= 0 else min(1.0, max(0.0, completed / total))
+                    progress_bar.progress(min(1.0, base + span * fraction))
+                    stage_line.write(message)
+
+                pipeline = run_pipeline(data, filename, progress_callback=update_progress)
                 status.update(label="Processing complete", state="complete")
             st.session_state[ANALYSIS_RESULT_STATE_KEY] = pipeline
         except Person3Error as exc:
+            LOGGER.exception("Qwen/Groq analysis error for filename=%s", filename)
             st.error(f"Qwen/Groq analysis error: {exc}")
             return
         except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("MVP pipeline failed for filename=%s", filename)
             st.error(f"Pipeline failed: {exc}")
             return
     elif pipeline is None:

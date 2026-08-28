@@ -26,6 +26,8 @@ TRANSCRIPTION_WINDOW_SECONDS: float = float(os.getenv("TRANSCRIPTION_WINDOW_SECO
 TRANSCRIPTION_INTERVAL_SECONDS: float = float(os.getenv("TRANSCRIPTION_INTERVAL_SECONDS", "1"))
 TRANSCRIPTION_STOP_TIMEOUT_SECONDS: float = float(os.getenv("TRANSCRIPTION_STOP_TIMEOUT_SECONDS", "30"))
 USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() == "true"
+BATCH_TRANSCRIPTION_CHUNK_SECONDS: float = float(os.getenv("BATCH_TRANSCRIPTION_CHUNK_SECONDS", "300"))
+BATCH_TRANSCRIPTION_OVERLAP_SECONDS: float = float(os.getenv("BATCH_TRANSCRIPTION_OVERLAP_SECONDS", "5"))
 
 # Local speaker diarization. The ECAPA model is loaded lazily on the
 # transcription worker, never in the sounddevice callback or Streamlit loop.

@@ -45,7 +45,7 @@ are being merged; lower it if one person is still split into multiple IDs.
 
 The batch module accepts WAV, MP3, M4A, FLAC, OGG, or WebM uploads (up to
 200 MB and 120 minutes), validates that they contain decodable audio, and
-resamples them in memory to mono 16 kHz float PCM for local faster-whisper.
+streams them as bounded mono 16 kHz float PCM chunks for local faster-whisper.
 It deliberately retains silence so every timestamp remains aligned with the
 original audio used by the final playback UI.
 
@@ -70,8 +70,8 @@ Its downloaded JSON is the Person 1 → Person 2 integration contract:
 
 `batch_transcription.transcribe_upload` exposes the same contract directly to
 Python callers. Processing is local, so there is no network upload to compress;
-the in-memory mono 16 kHz representation already reduces the model input while
-avoiding lossy re-encoding.
+the chunked mono 16 kHz representation keeps model inputs bounded while avoiding
+lossy re-encoding.
 
 ## Person 2 transcript evidence layer
 

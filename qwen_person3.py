@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 DEFAULT_QWEN_MODEL = "qwen/qwen3.6-27b"
@@ -112,14 +112,25 @@ class QwenPerson3Analyzer:
         self._client = groq_module.Groq(api_key=self.config.api_key, timeout=self.config.timeout_seconds)
         return self._client
 
-    def analyze_batch(self, behaviour_records: Iterable[dict[str, Any]]) -> list[FinalBehaviourResult]:
+    def analyze_batch(
+        self,
+        behaviour_records: Iterable[dict[str, Any]],
+        *,
+        progress_callback: Callable[[int, int, dict[str, Any]], None] | None = None,
+    ) -> list[FinalBehaviourResult]:
         """Analyze multiple Person 2 records, reusing results for duplicate evidence."""
+        records = list(behaviour_records)
         results: list[FinalBehaviourResult] = []
-        for record in behaviour_records:
+        total = len(records)
+        for index, record in enumerate(records):
+            if progress_callback is not None:
+                progress_callback(index, total, record)
             cache_key = _record_cache_key(record)
             if cache_key not in self._cache:
                 self._cache[cache_key] = self.analyze_record(record)
             results.append(self._cache[cache_key])
+            if progress_callback is not None:
+                progress_callback(index + 1, total, record)
         return results
 
     def analyze_record(self, record: dict[str, Any]) -> FinalBehaviourResult:
@@ -169,9 +180,13 @@ def analyze_person2_behaviours(
     *,
     config: Person3Config | None = None,
     client: Any | None = None,
+    progress_callback: Callable[[int, int, dict[str, Any]], None] | None = None,
 ) -> list[FinalBehaviourResult]:
     """Convenience integration point for Person 2's ``behaviour_contract()`` output."""
-    return QwenPerson3Analyzer(config=config, client=client).analyze_batch(behaviour_records)
+    return QwenPerson3Analyzer(config=config, client=client).analyze_batch(
+        behaviour_records,
+        progress_callback=progress_callback,
+    )
 
 
 def build_qwen_prompt(record: dict[str, Any]) -> str:
