@@ -6,16 +6,17 @@ float PCM, and returns transcript segments using audio-relative timestamps.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterable, Iterator
 
 import av
 import numpy as np
 
 import config
-from transcriber import DirectWhisperTranscriber, TranscriptSegment
+from transcriber import DirectWhisperTranscriber, TranscriptSegment, TranscriptWord
 
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".webm"})
@@ -71,11 +72,18 @@ class TimestampedTranscript:
     text: str
     confidence: float | None = None
     acoustic: dict[str, float | bool] | None = None
+    id: str | None = None
+    source_segment_ids: list[str] | None = None
 
-    def as_dict(self, *, include_acoustic: bool = True) -> dict[str, Any]:
+    def as_dict(self, *, include_acoustic: bool = True, include_source_metadata: bool = True) -> dict[str, Any]:
         payload = asdict(self)
         if not include_acoustic:
             payload.pop("acoustic", None)
+        if not include_source_metadata:
+            payload.pop("id", None)
+            payload.pop("source_segment_ids", None)
+        elif payload.get("source_segment_ids") is None and payload.get("id"):
+            payload["source_segment_ids"] = [payload["id"]]
         return payload
 
 
@@ -94,7 +102,7 @@ class BatchTranscriptionResult:
         """Return the JSON-ready payload consumed by Person 2."""
         # Preserve the public download/UI payload used by existing callers.
         # The richer additive record is exposed through person2_contract().
-        return [segment.as_dict(include_acoustic=False) for segment in self.segments]
+        return [segment.as_dict(include_acoustic=False, include_source_metadata=False) for segment in self.segments]
 
     def person2_contract(self) -> list[dict[str, Any]]:
         """Return transcript records plus acoustic-only upload events.
@@ -359,7 +367,7 @@ def transcribe_upload(
     """Process one uploaded file into the Person 1 timestamped contract."""
     metadata = inspect_upload(data, filename)
     sample_rate = config.SAMPLE_RATE
-    engine = transcriber or DirectWhisperTranscriber(sample_rate=sample_rate)
+    engine = transcriber or _build_batch_transcriber(sample_rate)
     baseline_rms = _recording_baseline_rms_streaming(data, sample_rate)
     segments: list[TimestampedTranscript] = []
     for chunk in iter_transcription_chunks(
@@ -394,6 +402,8 @@ def transcribe_upload(
             )
     segments.sort(key=lambda item: (item.start, item.end, item.text))
     acoustic_events = _acoustic_only_events_streaming(data, sample_rate, baseline_rms)
+    segments = _assign_segment_ids(segments)
+    acoustic_events = _assign_segment_ids(acoustic_events, start_index=len(segments))
     model_name = str(getattr(engine, "model_size", config.WHISPER_MODEL))
     return BatchTranscriptionResult(
         segments=segments,
@@ -402,6 +412,24 @@ def transcribe_upload(
         sample_rate=sample_rate,
         model=model_name,
         acoustic_events=acoustic_events,
+    )
+
+
+def _build_batch_transcriber(sample_rate: int) -> DirectWhisperTranscriber:
+    """Build the offline upload transcriber without changing live defaults."""
+    use_gpu = config.USE_GPU_IF_AVAILABLE and DirectWhisperTranscriber._cuda_available()
+    model_size = config.BATCH_WHISPER_GPU_MODEL if use_gpu else config.BATCH_WHISPER_CPU_MODEL
+    return DirectWhisperTranscriber(
+        model_size=model_size,
+        sample_rate=sample_rate,
+        language=config.BATCH_WHISPER_LANGUAGE,
+        use_gpu_if_available=config.USE_GPU_IF_AVAILABLE,
+        beam_size=config.BATCH_WHISPER_BEAM_SIZE,
+        word_timestamps=config.BATCH_WHISPER_WORD_TIMESTAMPS,
+        vad_parameters={
+            "min_silence_duration_ms": config.BATCH_WHISPER_VAD_MIN_SILENCE_MS,
+            "speech_pad_ms": config.BATCH_WHISPER_VAD_SPEECH_PAD_MS,
+        },
     )
 
 
@@ -417,6 +445,18 @@ def _normalise_segments(
     for segment in segments:
         text = str(getattr(segment, "text", "")).strip()
         if not text:
+            continue
+        words = _normalise_words(getattr(segment, "words", ()), duration, offset=offset)
+        if words:
+            for unit in _word_units_to_transcripts(words, include_start=include_start, include_end=include_end):
+                confidence = _mean_word_confidence(unit)
+                yield TimestampedTranscript(
+                    start=round(unit[0].start, 3),
+                    end=round(unit[-1].end, 3),
+                    text=_join_word_text(unit),
+                    confidence=confidence,
+                )
+            previous_end = max(previous_end, max(word.end for word in words))
             continue
         raw_start = getattr(segment, "start", None)
         raw_end = getattr(segment, "end", None)
@@ -440,6 +480,78 @@ def _normalise_segments(
             confidence=confidence,
         )
         previous_end = end
+
+
+def _normalise_words(
+    words: Iterable[TranscriptWord | Any],
+    duration: float,
+    *,
+    offset: float,
+) -> list[TranscriptWord]:
+    normalized: list[TranscriptWord] = []
+    for word in words:
+        text = str(getattr(word, "text", getattr(word, "word", ""))).strip()
+        raw_start = getattr(word, "start", None)
+        raw_end = getattr(word, "end", None)
+        if not text or raw_start is None or raw_end is None:
+            continue
+        start = min(duration, max(0.0, float(raw_start) + offset))
+        end = min(duration, max(start, float(raw_end) + offset))
+        if end <= start:
+            continue
+        confidence = getattr(word, "confidence", getattr(word, "probability", None))
+        normalized.append(TranscriptWord(text=text, start=start, end=end, confidence=confidence))
+    return normalized
+
+
+def _word_units_to_transcripts(
+    words: list[TranscriptWord],
+    *,
+    include_start: float | None,
+    include_end: float | None,
+) -> Iterable[list[TranscriptWord]]:
+    unit: list[TranscriptWord] = []
+    sentence_end_re = re.compile(r"[.!?][\"')\]]*$")
+    for word in words:
+        if include_start is not None and include_end is not None:
+            midpoint = float(word.start or 0.0) + (float(word.end or 0.0) - float(word.start or 0.0)) / 2
+            if midpoint < include_start or midpoint > include_end:
+                if unit:
+                    yield unit
+                    unit = []
+                continue
+        if unit:
+            gap = float(word.start or 0.0) - float(unit[-1].end or unit[-1].start or 0.0)
+            span = float(word.end or word.start or 0.0) - float(unit[0].start or 0.0)
+            if gap >= config.BATCH_TRANSCRIPT_SENTENCE_GAP_SEC or span > config.BATCH_TRANSCRIPT_MAX_UTTERANCE_SEC:
+                yield unit
+                unit = []
+        unit.append(word)
+        if sentence_end_re.search(word.text):
+            yield unit
+            unit = []
+    if unit:
+        yield unit
+
+
+def _join_word_text(words: list[TranscriptWord]) -> str:
+    text = " ".join(word.text.strip() for word in words if word.text.strip()).strip()
+    return re.sub(r"\s+([,.;:!?])", r"\1", text)
+
+
+def _mean_word_confidence(words: list[TranscriptWord]) -> float | None:
+    values = [float(word.confidence) for word in words if word.confidence is not None]
+    if not values:
+        return None
+    return round(float(np.clip(np.mean(values), 0.0, 1.0)), 4)
+
+
+def _assign_segment_ids(segments: list[TimestampedTranscript], *, start_index: int = 0) -> list[TimestampedTranscript]:
+    assigned: list[TimestampedTranscript] = []
+    for index, segment in enumerate(segments, start=start_index):
+        segment_id = segment.id or f"seg-{index:06d}"
+        assigned.append(replace(segment, id=segment_id, source_segment_ids=segment.source_segment_ids or [segment_id]))
+    return assigned
 
 
 def _recording_baseline_rms(samples: np.ndarray, sample_rate: int) -> float:
@@ -478,8 +590,27 @@ def _with_acoustic(
 ) -> TimestampedTranscript:
     start = max(0, int((segment.start - audio_start) * sample_rate))
     end = min(samples.size, max(start + 1, int((segment.end - audio_start) * sample_rate)))
-    return TimestampedTranscript(segment.start, segment.end, segment.text, segment.confidence,
-                                 _acoustic_evidence(samples[start:end], sample_rate, baseline_rms))
+    local_baseline = _local_baseline_rms(samples, sample_rate, start, end, fallback=baseline_rms)
+    return replace(segment, acoustic=_acoustic_evidence(samples[start:end], sample_rate, local_baseline))
+
+
+def _local_baseline_rms(
+    samples: np.ndarray,
+    sample_rate: int,
+    start_sample: int,
+    end_sample: int,
+    *,
+    fallback: float,
+    context_seconds: float = 30.0,
+) -> float:
+    """Robust local RMS baseline around one evidence span."""
+    pad = int(context_seconds * sample_rate)
+    start = max(0, start_sample - pad)
+    end = min(samples.size, end_sample + pad)
+    if end <= start:
+        return fallback
+    local = _recording_baseline_rms(samples[start:end], sample_rate)
+    return float(local if local > 0 else fallback)
 
 
 def _acoustic_evidence(audio: np.ndarray, sample_rate: int, baseline_rms: float) -> dict[str, float | bool]:
@@ -524,7 +655,10 @@ def _acoustic_only_events(samples: np.ndarray, sample_rate: int, baseline_rms: f
     positives: list[tuple[float, float, dict[str, float | bool]]] = []
     for start in np.arange(0.0, samples.size / sample_rate, hop):
         end = min(samples.size / sample_rate, start + window)
-        evidence = _acoustic_evidence(samples[int(start * sample_rate):int(end * sample_rate)], sample_rate, baseline_rms)
+        start_sample = int(start * sample_rate)
+        end_sample = int(end * sample_rate)
+        local_baseline = _local_baseline_rms(samples, sample_rate, start_sample, end_sample, fallback=baseline_rms)
+        evidence = _acoustic_evidence(samples[start_sample:end_sample], sample_rate, local_baseline)
         score = float(evidence["scream_score"])
         if score >= config.SCREAM_EXTREME_SCORE_THRESHOLD:
             positives.append((float(start), float(end), evidence))

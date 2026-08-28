@@ -4,6 +4,7 @@ import pytest
 
 from person2_module import (
     EmbeddingService,
+    BehaviourEvidenceResult,
     HashingTextEmbeddingProvider,
     Person2Config,
     SentenceTransformerEmbeddingProvider,
@@ -11,6 +12,7 @@ from person2_module import (
     contextual_chunk_transcript,
     cosine_similarity,
     detect_semantic_repetition_evidence,
+    deduplicate_behaviours,
     detect_repetitions,
     supported_person2_behaviours,
     transcript_only_excluded_behaviours,
@@ -47,6 +49,20 @@ class SemanticTestEmbeddingProvider:
         if "weather" in lower:
             return [0.0, 0.0, 1.0, 0.0]
         return [0.0, 0.0, 0.0, 1.0]
+
+
+class PrototypeTestEmbeddingProvider:
+    model_name = "prototype-test-embedding"
+
+    def embed(self, text: str) -> list[float]:
+        lower = text.lower()
+        if "medicine" in lower or "refus" in lower or "comply" in lower:
+            return [1.0, 0.0, 0.0, 0.0, 0.0]
+        if "help" in lower or "attention" in lower:
+            return [0.0, 1.0, 0.0, 0.0, 0.0]
+        if "terrible" in lower or "complain" in lower:
+            return [0.0, 0.0, 1.0, 0.0, 0.0]
+        return [0.0, 0.0, 0.0, 1.0, 0.0]
 
 
 class FakeMiniLMModel:
@@ -299,6 +315,74 @@ def test_person2_detects_other_transcript_supported_cmai_behaviours():
     assert "Negativism" in labels
     assert "Making strange noises" in labels
     assert "Distressed/urgent verbalization" in labels
+
+
+def test_person2_linguistic_behaviour_uses_evidence_segment_not_context_span():
+    result = analyze_person1_transcript(
+        [
+            {"id": "seg-a", "start": 0.0, "end": 2.0, "text": "The weather is fine."},
+            {"id": "seg-b", "start": 10.0, "end": 11.2, "text": "I won't take my medicine."},
+        ],
+        settings=Person2Config(max_chunk_duration_sec=20.0, max_segments_per_chunk=4),
+        embedding_provider=CountingEmbeddingProvider(),
+    )
+
+    negativism = [item for item in result.behaviours if item.behaviour == "Negativism"]
+
+    assert negativism
+    assert negativism[0].start == 10.0
+    assert negativism[0].end == 11.2
+    assert negativism[0].source_segment_ids == ["seg-b"]
+    assert negativism[0].context_start == 0.0
+    assert negativism[0].context_end == 11.2
+
+
+def test_semantic_prototypes_nominate_negativism_without_regex_match():
+    result = analyze_person1_transcript(
+        [{"id": "seg-1", "start": 5.0, "end": 6.0, "text": "Refusing medicine is happening here."}],
+        settings=Person2Config(prototype_similarity_threshold=0.90),
+        embedding_provider=PrototypeTestEmbeddingProvider(),
+    )
+
+    candidates = [item for item in result.behaviours if item.score_type == "semantic_prototype_candidate_score"]
+    assert any(item.behaviour == "Negativism" and item.source_segment_ids == ["seg-1"] for item in candidates)
+
+
+def test_person2_deduplicates_overlap_chunks_without_chunk_id_identity():
+    first = BehaviourEvidenceResult(
+        start=10.0,
+        end=12.0,
+        behaviour="Negativism",
+        internal_code="AUDIO_NEGATIVISM",
+        cmai_category="Verbally non-aggressive: negativism/refusal",
+        score=0.6,
+        score_type="heuristic_linguistic_score",
+        evidence="first",
+        text="I won't go.",
+        chunk_id="chunk-0001",
+        source_segment_ids=["seg-9"],
+        evidence_segments=[{"id": "seg-9", "start": 10.0, "end": 12.0, "text": "I won't go."}],
+    )
+    second = BehaviourEvidenceResult(
+        start=10.1,
+        end=12.1,
+        behaviour="Negativism",
+        internal_code="AUDIO_NEGATIVISM",
+        cmai_category="Verbally non-aggressive: negativism/refusal",
+        score=0.9,
+        score_type="semantic_prototype_candidate_score",
+        evidence="second",
+        text="I won't go.",
+        chunk_id="chunk-0002",
+        source_segment_ids=["seg-9"],
+        evidence_segments=[{"id": "seg-9", "start": 10.1, "end": 12.1, "text": "I won't go."}],
+    )
+
+    merged = deduplicate_behaviours([first, second], Person2Config())
+
+    assert len(merged) == 1
+    assert merged[0].score == 0.9
+    assert merged[0].chunk_id == "chunk-0002"
 
 
 def test_person2_does_not_claim_transcript_only_screaming_or_physical_behaviours():

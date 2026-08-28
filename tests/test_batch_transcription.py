@@ -9,6 +9,7 @@ import pytest
 
 from batch_transcription import (
     AudioValidationError,
+    _normalise_segments,
     inspect_upload,
     iter_transcription_chunks,
     preprocess_upload,
@@ -141,6 +142,33 @@ def test_transcribe_upload_offsets_chunk_timestamps_without_duplicating_overlap(
         ("boundary", 0.9, 1.1),
         ("second", 1.1, 1.4),
         ("third", 2.05, 2.25),
+    ]
+
+
+def test_word_timestamps_split_oversized_whisper_segment_into_evidence_units():
+    raw = [
+        SimpleNamespace(
+            text="I am fine. I won't take my medicine.",
+            start=0.0,
+            end=20.0,
+            words=[
+                SimpleNamespace(word="I", start=0.0, end=0.1, probability=0.9),
+                SimpleNamespace(word="am", start=0.1, end=0.2, probability=0.9),
+                SimpleNamespace(word="fine.", start=0.2, end=0.5, probability=0.9),
+                SimpleNamespace(word="I", start=12.0, end=12.1, probability=0.8),
+                SimpleNamespace(word="won't", start=12.1, end=12.4, probability=0.8),
+                SimpleNamespace(word="take", start=12.4, end=12.7, probability=0.8),
+                SimpleNamespace(word="my", start=12.7, end=12.9, probability=0.8),
+                SimpleNamespace(word="medicine.", start=12.9, end=13.4, probability=0.8),
+            ],
+        )
+    ]
+
+    units = list(_normalise_segments(raw, 30.0))
+
+    assert [(unit.text, unit.start, unit.end) for unit in units] == [
+        ("I am fine.", 0.0, 0.5),
+        ("I won't take my medicine.", 12.0, 13.4),
     ]
 
 

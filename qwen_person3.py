@@ -1,8 +1,9 @@
 """Person 3 Qwen/Groq validation for Person 2 behaviour evidence.
 
 This module consumes only the stable ``Person2AnalysisResult.behaviour_contract``
-payload and returns validated, timestamp-preserving behaviour decisions. It does
-not run transcription, chunking, embedding, or initial behaviour detection.
+payload and returns validated behaviour decisions whose timestamps are computed
+from selected source transcript units. It does not run transcription, chunking,
+embedding, or initial behaviour detection.
 """
 from __future__ import annotations
 
@@ -16,19 +17,21 @@ import os
 import re
 from typing import Any, Callable, Iterable
 
+import config
+
 
 DEFAULT_QWEN_MODEL = "qwen/qwen3.6-27b"
 VALID_SEVERITIES = {"Insufficient", "Low", "Mild", "Moderate", "High", "Severe"}
 REQUIRED_RESPONSE_FIELDS = {
     "behaviour",
-    "start",
-    "end",
-    "validated",
+    "support",
+    "evidence_segment_ids",
     "severity",
     "confidence",
     "evidence",
     "explanation",
 }
+VALID_SUPPORT = {"supported", "unsupported", "insufficient"}
 QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 QWEN_MAX_COMPLETION_TOKENS = 1024
 QWEN_REASONING_EFFORT = "none"
@@ -84,6 +87,7 @@ class FinalBehaviourResult:
     person2_evidence: str
     transcript: str
     chunk_id: str | None = None
+    evidence_segment_ids: list[str] | None = None
     error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -131,7 +135,7 @@ class QwenPerson3Analyzer:
             results.append(self._cache[cache_key])
             if progress_callback is not None:
                 progress_callback(index + 1, total, record)
-        return results
+        return deduplicate_final_results(results)
 
     def analyze_record(self, record: dict[str, Any]) -> FinalBehaviourResult:
         """Analyze one Person 2 behaviour evidence record."""
@@ -191,23 +195,25 @@ def analyze_person2_behaviours(
 
 def build_qwen_prompt(record: dict[str, Any]) -> str:
     """Build the user prompt for one Person 2 behaviour record."""
+    source_units = _source_units(record)
     payload = {
-        "start": record.get("start"),
-        "end": record.get("end"),
         "initial_behaviour": record.get("behaviour"),
         "initial_score": record.get("score"),
         "score_type": record.get("score_type"),
         "person2_evidence": record.get("evidence"),
+        "evidence_source_segment_ids": record.get("source_segment_ids"),
+        "context_start": record.get("context_start"),
+        "context_end": record.get("context_end"),
         "transcript_context": record.get("text"),
+        "source_transcript_units": source_units,
         "chunk_id": record.get("chunk_id"),
         "repetition": record.get("repetition"),
         "acoustic_evidence": record.get("acoustic"),
     }
     example = {
         "behaviour": payload["initial_behaviour"] or "Unknown behaviour",
-        "start": payload["start"],
-        "end": payload["end"],
-        "validated": True,
+        "support": "supported",
+        "evidence_segment_ids": [source_units[0]["id"]] if source_units else [],
         "severity": "Moderate",
         "confidence": 0.94,
         "evidence": "Short evidence string grounded only in the supplied transcript/evidence.",
@@ -217,12 +223,13 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "/no_think\n"
         "Evaluate this Person 2 audio-behaviour evidence as research decision support, not medical diagnosis. "
         "Use only supplied evidence/transcript. Acoustic features are measured from the source recording: use them only when explicitly supplied, and do not infer unreported vocal tone from transcript wording. Do not invent behaviours. If evidence is insufficient, use "
-        "validated=false, severity=\"Insufficient\", confidence between 0 and 1, and explain what is missing. "
-        "Preserve the exact start/end timestamp numbers from the input.\n\n"
+        "support=\"insufficient\", severity=\"Insufficient\", confidence between 0 and 1, and explain what is missing. "
+        "Do not invent, modify, or return timestamps. Select only source_transcript_units IDs that directly support the decision.\n\n"
         "Return exactly one compact JSON object. The first character must be `{` and the last character must be `}`. "
         "Do not return markdown, code fences, comments, XML/thinking tags, "
         "or any text before or after the JSON object. The JSON object must contain exactly these keys: "
-        "behaviour, start, end, validated, severity, confidence, evidence, explanation. "
+        "behaviour, support, evidence_segment_ids, severity, confidence, evidence, explanation. "
+        f"Allowed support values: {', '.join(sorted(VALID_SUPPORT))}. "
         f"Allowed severity values: {', '.join(sorted(VALID_SEVERITIES))}.\n\n"
         f"Required JSON shape example:\n{json.dumps(example, separators=(',', ':'))}\n\n"
         f"Person 2 evidence JSON:\n{json.dumps(payload, indent=2, sort_keys=True)}"
@@ -243,12 +250,23 @@ def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_reco
     if extras:
         raise QwenResponseValidationError(f"Qwen response included unsupported field(s): {', '.join(sorted(extras))}")
 
-    start = float(source_record["start"])
-    end = float(source_record["end"])
-    output_start = float(data["start"])
-    output_end = float(data["end"])
-    if abs(output_start - start) > 1e-6 or abs(output_end - end) > 1e-6:
-        raise QwenResponseValidationError("Qwen response did not preserve the supplied timestamps.")
+    support = str(data["support"]).strip().lower()
+    if support not in VALID_SUPPORT:
+        raise QwenResponseValidationError(f"Qwen support must be one of: {', '.join(sorted(VALID_SUPPORT))}.")
+    source_units = _source_units(source_record)
+    units_by_id = {str(unit["id"]): unit for unit in source_units}
+    selected_ids = _coerce_segment_ids(data["evidence_segment_ids"])
+    unknown_ids = [segment_id for segment_id in selected_ids if segment_id not in units_by_id]
+    if unknown_ids:
+        raise QwenResponseValidationError(f"Qwen selected unknown evidence segment id(s): {', '.join(unknown_ids)}")
+    if support == "supported":
+        if not selected_ids:
+            raise QwenResponseValidationError("Qwen must select evidence_segment_ids when support is supported.")
+        selected_units = [units_by_id[segment_id] for segment_id in selected_ids]
+    else:
+        selected_units = source_units
+    start = min(float(unit["start"]) for unit in selected_units) if selected_units else float(source_record["start"])
+    end = max(float(unit["end"]) for unit in selected_units) if selected_units else float(source_record["end"])
 
     confidence = float(data["confidence"])
     if not 0.0 <= confidence <= 1.0:
@@ -262,7 +280,7 @@ def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_reco
         behaviour=str(data["behaviour"]).strip() or str(source_record.get("behaviour", "Unknown behaviour")),
         start=start,
         end=end,
-        validated=_coerce_bool(data["validated"]),
+        validated=support == "supported",
         severity=severity,
         confidence=round(confidence, 4),
         evidence=str(data["evidence"]).strip(),
@@ -272,7 +290,99 @@ def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_reco
         person2_evidence=str(source_record.get("evidence", "")),
         transcript=str(source_record.get("text", "")),
         chunk_id=str(source_record.get("chunk_id")) if source_record.get("chunk_id") is not None else None,
+        evidence_segment_ids=selected_ids,
     )
+
+
+def _source_units(record: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_units = record.get("evidence_segments")
+    if isinstance(raw_units, list) and raw_units:
+        units = []
+        for index, unit in enumerate(raw_units):
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("id") or f"seg-{index:06d}")
+            units.append({
+                "id": unit_id,
+                "start": float(unit["start"]),
+                "end": float(unit["end"]),
+                "text": str(unit.get("text", "")),
+            })
+        if units:
+            return units
+    source_ids = record.get("source_segment_ids") or []
+    if isinstance(source_ids, str):
+        source_ids = [source_ids]
+    return [{
+        "id": str(source_ids[0]) if source_ids else "seg-unknown",
+        "start": float(record["start"]),
+        "end": float(record["end"]),
+        "text": str(record.get("text", "")),
+    }]
+
+
+def _coerce_segment_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        raise QwenResponseValidationError("Qwen evidence_segment_ids must be a list.")
+    return [str(item) for item in value]
+
+
+def deduplicate_final_results(results: list[FinalBehaviourResult], *, iou_threshold: float | None = None) -> list[FinalBehaviourResult]:
+    """Remove exact and near duplicate final rows after model validation."""
+    threshold = config.PERSON2_DEDUPE_IOU_THRESHOLD if iou_threshold is None else iou_threshold
+    exact: dict[tuple[str, tuple[str, ...] | tuple[float, float]], FinalBehaviourResult] = {}
+    for result in results:
+        ids = tuple(sorted(result.evidence_segment_ids or []))
+        key = (result.behaviour, ids or (round(result.start, 1), round(result.end, 1)))
+        exact[key] = _merge_final_pair(exact[key], result) if key in exact else result
+    merged: list[FinalBehaviourResult] = []
+    for result in sorted(exact.values(), key=lambda item: (item.start, item.end, item.behaviour, -item.confidence)):
+        match_index = next(
+            (
+                index
+                for index, existing in enumerate(merged)
+                if existing.behaviour == result.behaviour
+                and _interval_iou(existing.start, existing.end, result.start, result.end) >= threshold
+            ),
+            None,
+        )
+        if match_index is None:
+            merged.append(result)
+        else:
+            merged[match_index] = _merge_final_pair(merged[match_index], result)
+    return sorted(merged, key=lambda item: (item.start, item.end, item.behaviour))
+
+
+def _merge_final_pair(left: FinalBehaviourResult, right: FinalBehaviourResult) -> FinalBehaviourResult:
+    strongest = left if left.confidence >= right.confidence else right
+    other = right if strongest is left else left
+    ids = list(dict.fromkeys([*(strongest.evidence_segment_ids or []), *(other.evidence_segment_ids or [])]))
+    evidence = strongest.evidence
+    if other.evidence and other.evidence != evidence:
+        evidence = f"{evidence} Additional duplicate evidence: {other.evidence}"
+    return FinalBehaviourResult(
+        behaviour=strongest.behaviour,
+        start=min(left.start, right.start),
+        end=max(left.end, right.end),
+        validated=left.validated or right.validated,
+        severity=strongest.severity,
+        confidence=max(left.confidence, right.confidence),
+        evidence=evidence,
+        explanation=strongest.explanation,
+        initial_behaviour=strongest.initial_behaviour,
+        initial_score=strongest.initial_score,
+        person2_evidence=strongest.person2_evidence,
+        transcript=strongest.transcript if len(strongest.transcript) >= len(other.transcript) else other.transcript,
+        chunk_id=strongest.chunk_id,
+        evidence_segment_ids=ids,
+        error=strongest.error or other.error,
+    )
+
+
+def _interval_iou(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    intersection = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+    union = max(a_end, b_end) - min(a_start, b_start)
+    return intersection / union if union > 0 else 0.0
 
 
 def _parse_json_object(raw_content: str | dict[str, Any] | None) -> dict[str, Any]:
@@ -381,7 +491,7 @@ def _system_prompt(*, use_json_mode: bool = True) -> str:
         "This is decision support, not diagnosis. "
         f"{mode_note} Do not include markdown, prose, code fences, or hidden reasoning. "
         "The first output character must be `{` and the last output character must be `}`. "
-        "Output JSON only with keys behaviour, start, end, validated, severity, confidence, evidence, explanation."
+        "Output JSON only with keys behaviour, support, evidence_segment_ids, severity, confidence, evidence, explanation."
     )
 
 
@@ -392,18 +502,6 @@ def _supports_qwen_reasoning_controls(model: str) -> bool:
 def _looks_like_groq_json_mode_failure(exc: Exception) -> bool:
     message = str(exc).lower()
     return "json_validate_failed" in message or "failed to validate json" in message
-
-
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized == "true":
-            return True
-        if normalized == "false":
-            return False
-    raise QwenResponseValidationError("Qwen validated field must be a boolean.")
 
 
 def _optional_float(value: Any) -> float | None:
@@ -421,6 +519,8 @@ def _record_cache_key(record: dict[str, Any]) -> str:
             "evidence": record.get("evidence"),
             "text": record.get("text"),
             "score": record.get("score"),
+            "source_segment_ids": record.get("source_segment_ids"),
+            "evidence_segments": record.get("evidence_segments"),
         },
         sort_keys=True,
         default=str,

@@ -27,6 +27,8 @@ class Person1TranscriptSegment:
     text: str
     confidence: float | None = None
     acoustic: dict[str, Any] | None = None
+    id: str | None = None
+    source_segment_ids: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,8 @@ class Person2Config:
     repetition_min_occurrences: int = config.PERSON2_REPETITION_MIN_OCCURRENCES
     repetition_similarity_threshold: float = config.PERSON2_REPETITION_SIMILARITY_THRESHOLD
     semantic_similarity_threshold: float = config.PERSON2_SEMANTIC_SIMILARITY_THRESHOLD
+    prototype_similarity_threshold: float = config.PERSON2_PROTOTYPE_SIMILARITY_THRESHOLD
+    dedupe_iou_threshold: float = config.PERSON2_DEDUPE_IOU_THRESHOLD
     embedding_backend: str = config.PERSON2_EMBEDDING_BACKEND
     embedding_model: str = config.PERSON2_EMBEDDING_MODEL
     embedding_dimension: int = config.PERSON2_EMBEDDING_DIMENSION
@@ -122,6 +126,10 @@ class BehaviourEvidenceResult:
     evidence: str
     text: str
     chunk_id: str
+    source_segment_ids: list[str] = field(default_factory=list)
+    evidence_segments: list[dict[str, Any]] = field(default_factory=list)
+    context_start: float | None = None
+    context_end: float | None = None
     repetition: dict[str, Any] | None = None
     modality: str = "audio"
     mapping_status: str = "mapped"
@@ -230,6 +238,44 @@ class EmbeddingService:
             return EmbeddedChunk(chunk=chunk, embedding=[], embedding_model=self.provider.model_name, embedding_error=str(exc))
 
 
+SEMANTIC_PROTOTYPES: dict[str, tuple[str, ...]] = {
+    "Negativism": (
+        "refusal to comply",
+        "refusal of care",
+        "resisting an instruction",
+        "leave me alone",
+        "refusing medicine",
+        "refusing to move or go somewhere",
+        "you are not making me do that",
+    ),
+    "Complaining": (
+        "complaining about discomfort",
+        "saying this is terrible",
+        "unhappy with care or surroundings",
+        "nobody listens to me",
+        "this hurts and I do not like it",
+    ),
+    "Constant unwarranted requests for attention/help": (
+        "repeatedly asking for help",
+        "constant requests for attention",
+        "calling for nurse again and again",
+        "please help me repeated request",
+    ),
+    "Distressed/urgent verbalization": (
+        "urgent plea for help",
+        "saying help me now",
+        "wanting to leave immediately",
+        "asking someone to stop urgently",
+        "distressed call for assistance",
+    ),
+    "Cursing / verbal aggression": (
+        "insulting hostile language",
+        "verbal aggression with profanity",
+        "angry abusive statement",
+    ),
+}
+
+
 def build_default_embedding_provider(settings: Person2Config | None = None) -> TextEmbeddingProvider:
     """Build the configured embedding provider without forcing heavy dependencies."""
     settings = settings or Person2Config()
@@ -253,6 +299,8 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 text=str(item["text"]).strip(),
                 confidence=_coerce_confidence(item.get("confidence")),
                 acoustic=_coerce_acoustic(item.get("acoustic")),
+                id=str(item["id"]) if item.get("id") is not None else None,
+                source_segment_ids=_coerce_source_segment_ids(item.get("source_segment_ids")),
             )
         else:
             segment = Person1TranscriptSegment(
@@ -261,11 +309,15 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 text=str(getattr(item, "text")).strip(),
                 confidence=_coerce_confidence(getattr(item, "confidence", None)),
                 acoustic=_coerce_acoustic(getattr(item, "acoustic", None)),
+                id=str(getattr(item, "id")) if getattr(item, "id", None) is not None else None,
+                source_segment_ids=_coerce_source_segment_ids(getattr(item, "source_segment_ids", None)),
             )
         if segment.start < 0 or segment.end < segment.start:
             raise ValueError("Person 1 transcript segments must have non-negative ordered timestamps")
         if segment.text or segment.acoustic is not None:
-            segments.append(segment)
+            segment_id = segment.id or f"seg-{len(segments):06d}"
+            source_ids = segment.source_segment_ids or [segment_id]
+            segments.append(Person1TranscriptSegment(segment.start, segment.end, segment.text, segment.confidence, segment.acoustic, segment_id, source_ids))
     return segments
 
 
@@ -451,11 +503,16 @@ def embed_chunks(
 def detect_initial_behaviours(
     chunks: list[TranscriptChunk],
     repetitions: dict[str, list[RepetitionEvidence]],
+    *,
+    provider: TextEmbeddingProvider | None = None,
+    settings: Person2Config | None = None,
 ) -> list[BehaviourEvidenceResult]:
     """Emit initial, transcript-supported CMAI-aligned behaviour evidence."""
+    settings = settings or Person2Config()
     analyzer = LinguisticAnalyzer(history_sec=config.TRANSCRIPT_HISTORY_SEC)
     results: list[BehaviourEvidenceResult] = []
-    seen: set[tuple[str, str, float, float]] = set()
+    provider = provider or build_default_embedding_provider(settings)
+    prototype_embeddings = _embed_semantic_prototypes(provider)
 
     for chunk in chunks:
         utterance = _chunk_to_utterance(chunk)
@@ -490,6 +547,10 @@ def detect_initial_behaviours(
                         evidence=evidence_text,
                         text=repetition.surrounding_text,
                         chunk_id=chunk.chunk_id,
+                        source_segment_ids=_source_ids_for_occurrences(chunk, repetition.occurrences),
+                        evidence_segments=_evidence_segments_for_occurrences(chunk, repetition.occurrences),
+                        context_start=chunk.start,
+                        context_end=chunk.end,
                         repetition={
                             "repeated_phrase": repetition.repeated_phrase,
                             "count": repetition.count,
@@ -501,36 +562,37 @@ def detect_initial_behaviours(
                     )
                 )
 
-        linguistic_candidates = [
-            ("Cursing / verbal aggression", features.profanity_score, "Explicit profanity/verbal aggression cue in transcript."),
-            ("Making verbal sexual advances", features.sexual_advance_score, "Sexualized verbal proposition or comment in transcript."),
-            ("Complaining", features.complaint_score, "Complaint semantics detected in transcript."),
-            ("Negativism", features.negativism_score, "Refusal/resistance/non-compliance/defiance language detected in transcript."),
-            ("Making strange noises", features.strange_noise_score, "Transcript contains a non-speech vocalization label."),
-            ("Distressed/urgent verbalization", features.urgency_score, "Urgent help-seeking, escape, or stop cue in transcript."),
-        ]
-        for label, score, evidence in linguistic_candidates:
-            threshold = _threshold_for(label)
-            if score < threshold:
+        for local_idx, segment in enumerate(chunk.segments):
+            if not segment.text:
                 continue
-            mapped = map_observed_behaviour(label)
-            if mapped.mapping_status != "mapped":
-                continue
-            result = BehaviourEvidenceResult(
-                start=chunk.start,
-                end=chunk.end,
-                behaviour=mapped.canonical_label,
-                internal_code=str(mapped.internal_code),
-                cmai_category=mapped.cmai_category,
-                score=round(float(score), 3),
-                score_type="heuristic_linguistic_score",
-                evidence=evidence,
-                text=chunk.text,
-                chunk_id=chunk.chunk_id,
-            )
-            key = (result.behaviour, result.chunk_id, result.start, result.end)
-            if key not in seen:
-                seen.add(key)
+            segment_features = analyzer.analyze(_segment_to_utterance(segment))
+            linguistic_candidates = [
+                ("Cursing / verbal aggression", segment_features.profanity_score, "Explicit profanity/verbal aggression cue in transcript."),
+                ("Making verbal sexual advances", segment_features.sexual_advance_score, "Sexualized verbal proposition or comment in transcript."),
+                ("Complaining", segment_features.complaint_score, "Complaint semantics detected in transcript."),
+                ("Negativism", segment_features.negativism_score, "Refusal/resistance/non-compliance/defiance language detected in transcript."),
+                ("Making strange noises", segment_features.strange_noise_score, "Transcript contains a non-speech vocalization label."),
+                ("Distressed/urgent verbalization", segment_features.urgency_score, "Urgent help-seeking, escape, or stop cue in transcript."),
+            ]
+            for label, score, evidence in linguistic_candidates:
+                if score >= _threshold_for(label):
+                    result = _behaviour_from_segment(
+                        label,
+                        score,
+                        "heuristic_linguistic_score",
+                        evidence,
+                        segment,
+                        chunk,
+                    )
+                    if result is not None:
+                        results.append(result)
+            for result in _semantic_prototype_behaviours(
+                segment,
+                chunk,
+                provider,
+                prototype_embeddings,
+                settings,
+            ):
                 results.append(result)
 
         # Acoustic evidence is aligned by Person 1 to each original segment,
@@ -562,14 +624,16 @@ def detect_initial_behaviours(
                 evidence=(f"{rationale} acoustic_agitation={agitation:.2f}, scream_score={scream:.2f}, "
                           f"relative_energy={float(acoustic.get('relative_energy', 0.0)):.2f}, "
                           f"burst={float(acoustic.get('burst_score', 0.0)):.2f}, urgency={urgency:.2f}"),
-                text=segment.text, chunk_id=chunk.chunk_id, acoustic=acoustic,
+                text=segment.text, chunk_id=chunk.chunk_id,
+                source_segment_ids=list(segment.source_segment_ids or [segment.id or f"seg-{chunk.segment_indices[chunk.segments.index(segment)]:06d}"]),
+                evidence_segments=[_segment_payload(segment)],
+                context_start=chunk.start,
+                context_end=chunk.end,
+                acoustic=acoustic,
             )
-            key = (result.behaviour, result.chunk_id, result.start, result.end)
-            if key not in seen:
-                seen.add(key)
-                results.append(result)
+            results.append(result)
 
-    return sorted(results, key=lambda item: (item.start, item.end, item.behaviour))
+    return deduplicate_behaviours(sorted(results, key=lambda item: (item.start, item.end, item.behaviour)), settings)
 
 
 def analyze_person1_transcript(
@@ -590,7 +654,7 @@ def analyze_person1_transcript(
         for chunk in chunks
     }
     embedded = embed_chunks(chunks, provider=provider, settings=settings)
-    behaviours = detect_initial_behaviours(chunks, repetitions)
+    behaviours = detect_initial_behaviours(chunks, repetitions, provider=provider, settings=settings)
     return Person2AnalysisResult(
         chunks=chunks,
         repetitions=repetitions,
@@ -643,6 +707,217 @@ def _chunk_to_utterance(chunk: TranscriptChunk) -> Utterance:
     return Utterance(lines=lines, start_time=chunk.start, end_time=chunk.end)
 
 
+def _segment_to_utterance(segment: Person1TranscriptSegment) -> Utterance:
+    return Utterance(
+        lines=[
+            CommittedLine(
+                text=segment.text,
+                timestamp=segment.end,
+                start_time=segment.start,
+                end_time=segment.end,
+                transcript_confidence=segment.confidence,
+            )
+        ],
+        start_time=segment.start,
+        end_time=segment.end,
+    )
+
+
+def _behaviour_from_segment(
+    label: str,
+    score: float,
+    score_type: str,
+    evidence: str,
+    segment: Person1TranscriptSegment,
+    chunk: TranscriptChunk,
+) -> BehaviourEvidenceResult | None:
+    mapped = map_observed_behaviour(label)
+    if mapped.mapping_status != "mapped":
+        return None
+    return BehaviourEvidenceResult(
+        start=segment.start,
+        end=segment.end,
+        behaviour=mapped.canonical_label,
+        internal_code=str(mapped.internal_code),
+        cmai_category=mapped.cmai_category,
+        score=round(float(score), 3),
+        score_type=score_type,
+        evidence=evidence,
+        text=segment.text,
+        chunk_id=chunk.chunk_id,
+        source_segment_ids=list(segment.source_segment_ids or [segment.id or ""]),
+        evidence_segments=[_segment_payload(segment)],
+        context_start=chunk.start,
+        context_end=chunk.end,
+    )
+
+
+def _embed_semantic_prototypes(provider: TextEmbeddingProvider) -> dict[str, list[tuple[str, list[float]]]]:
+    embedded: dict[str, list[tuple[str, list[float]]]] = {}
+    for label, prototypes in SEMANTIC_PROTOTYPES.items():
+        values: list[tuple[str, list[float]]] = []
+        for prototype in prototypes:
+            try:
+                embedding = provider.embed(prototype)
+            except Exception:  # noqa: BLE001
+                return {}
+            if embedding:
+                values.append((prototype, embedding))
+        embedded[label] = values
+    return embedded
+
+
+def _semantic_prototype_behaviours(
+    segment: Person1TranscriptSegment,
+    chunk: TranscriptChunk,
+    provider: TextEmbeddingProvider,
+    prototype_embeddings: dict[str, list[tuple[str, list[float]]]],
+    settings: Person2Config,
+) -> list[BehaviourEvidenceResult]:
+    if not segment.text.strip() or not prototype_embeddings:
+        return []
+    try:
+        embedding = provider.embed(segment.text)
+    except Exception:  # noqa: BLE001
+        return []
+    if len(embedding) < 4:
+        return []
+    results: list[BehaviourEvidenceResult] = []
+    for label, prototypes in prototype_embeddings.items():
+        scored = [
+            (prototype, cosine_similarity(embedding, prototype_embedding))
+            for prototype, prototype_embedding in prototypes
+            if len(prototype_embedding) == len(embedding)
+        ]
+        if not scored:
+            continue
+        prototype, similarity = max(scored, key=lambda item: item[1])
+        if similarity < settings.prototype_similarity_threshold:
+            continue
+        result = _behaviour_from_segment(
+            label,
+            min(0.89, 0.45 + 0.45 * similarity),
+            "semantic_prototype_candidate_score",
+            (
+                f"Semantic prototype candidate matched '{prototype}' "
+                f"(similarity={similarity:.3f}); used only to nominate evidence for verification."
+            ),
+            segment,
+            chunk,
+        )
+        if result is not None:
+            results.append(result)
+    return results
+
+
+def _source_ids_for_occurrences(chunk: TranscriptChunk, occurrences: list[RepetitionOccurrence]) -> list[str]:
+    ids: list[str] = []
+    index_to_segment = dict(zip(chunk.segment_indices, chunk.segments, strict=True))
+    for occurrence in occurrences:
+        segment = index_to_segment.get(occurrence.segment_index)
+        if segment is None:
+            continue
+        for source_id in segment.source_segment_ids or [segment.id or f"seg-{occurrence.segment_index:06d}"]:
+            if source_id not in ids:
+                ids.append(source_id)
+    return ids
+
+
+def _evidence_segments_for_occurrences(chunk: TranscriptChunk, occurrences: list[RepetitionOccurrence]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    index_to_segment = dict(zip(chunk.segment_indices, chunk.segments, strict=True))
+    for occurrence in occurrences:
+        segment = index_to_segment.get(occurrence.segment_index)
+        if segment is None:
+            continue
+        payload = _segment_payload(segment)
+        key = str(payload["id"])
+        if key not in seen:
+            seen.add(key)
+            payloads.append(payload)
+    return payloads
+
+
+def _segment_payload(segment: Person1TranscriptSegment) -> dict[str, Any]:
+    return {
+        "id": segment.id,
+        "start": segment.start,
+        "end": segment.end,
+        "text": segment.text,
+    }
+
+
+def deduplicate_behaviours(
+    behaviours: list[BehaviourEvidenceResult],
+    settings: Person2Config | None = None,
+) -> list[BehaviourEvidenceResult]:
+    """Remove exact and heavily-overlapping duplicates independent of chunk id."""
+    settings = settings or Person2Config()
+    exact: dict[tuple[str, tuple[str, ...] | tuple[float, float]], BehaviourEvidenceResult] = {}
+    for behaviour in behaviours:
+        ids = tuple(sorted(behaviour.source_segment_ids))
+        time_key = (round(behaviour.start, 1), round(behaviour.end, 1))
+        key = (behaviour.behaviour, ids or time_key)
+        exact[key] = _merge_behaviour_pair(exact[key], behaviour) if key in exact else behaviour
+
+    merged: list[BehaviourEvidenceResult] = []
+    for behaviour in sorted(exact.values(), key=lambda item: (item.start, item.end, item.behaviour, -item.score)):
+        match_index = next(
+            (
+                idx
+                for idx, existing in enumerate(merged)
+                if existing.behaviour == behaviour.behaviour
+                and _interval_iou(existing.start, existing.end, behaviour.start, behaviour.end) >= settings.dedupe_iou_threshold
+            ),
+            None,
+        )
+        if match_index is None:
+            merged.append(behaviour)
+        else:
+            merged[match_index] = _merge_behaviour_pair(merged[match_index], behaviour)
+    return sorted(merged, key=lambda item: (item.start, item.end, item.behaviour))
+
+
+def _merge_behaviour_pair(left: BehaviourEvidenceResult, right: BehaviourEvidenceResult) -> BehaviourEvidenceResult:
+    strongest = left if left.score >= right.score else right
+    other = right if strongest is left else left
+    source_ids = list(dict.fromkeys([*strongest.source_segment_ids, *other.source_segment_ids]))
+    evidence_segments = list({str(item.get("id")): item for item in [*strongest.evidence_segments, *other.evidence_segments]}.values())
+    evidence = strongest.evidence
+    if other.evidence and other.evidence != evidence:
+        evidence = f"{evidence} Additional duplicate evidence: {other.evidence}"
+    acoustic = strongest.acoustic or other.acoustic
+    return BehaviourEvidenceResult(
+        start=min(left.start, right.start),
+        end=max(left.end, right.end),
+        behaviour=strongest.behaviour,
+        internal_code=strongest.internal_code,
+        cmai_category=strongest.cmai_category,
+        score=max(left.score, right.score),
+        score_type=strongest.score_type,
+        evidence=evidence,
+        text=strongest.text if len(strongest.text) >= len(other.text) else other.text,
+        chunk_id=strongest.chunk_id,
+        source_segment_ids=source_ids,
+        evidence_segments=evidence_segments,
+        context_start=min(value for value in (left.context_start, right.context_start) if value is not None)
+        if left.context_start is not None or right.context_start is not None else None,
+        context_end=max(value for value in (left.context_end, right.context_end) if value is not None)
+        if left.context_end is not None or right.context_end is not None else None,
+        repetition=strongest.repetition or other.repetition,
+        modality=strongest.modality,
+        mapping_status=strongest.mapping_status,
+        acoustic=acoustic,
+    )
+
+
+def _interval_iou(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    intersection = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+    union = max(a_end, b_end) - min(a_start, b_start)
+    return intersection / union if union > 0 else 0.0
+
+
 def _threshold_for(label: str) -> float:
     if label == "Cursing / verbal aggression":
         return 0.50
@@ -676,6 +951,14 @@ def _coerce_acoustic(value: Any) -> dict[str, Any] | None:
         if key in evidence:
             evidence[key] = float(evidence[key])
     return evidence
+
+
+def _coerce_source_segment_ids(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

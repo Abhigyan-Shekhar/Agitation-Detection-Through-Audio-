@@ -71,15 +71,19 @@ def record() -> dict:
         "evidence": "Phrase repeated 3 times within nearby transcript segments.",
         "text": "Where is my daughter? Where is my daughter?",
         "chunk_id": "chunk-0002",
+        "source_segment_ids": ["seg-104", "seg-105"],
+        "evidence_segments": [
+            {"id": "seg-104", "start": 10.2, "end": 11.4, "text": "Where is my daughter?"},
+            {"id": "seg-105", "start": 26.1, "end": 27.5, "text": "Where is my daughter?"},
+        ],
     }
 
 
 def valid_response(**overrides) -> str:
     payload = {
         "behaviour": "Repetitive Questioning",
-        "start": 10.2,
-        "end": 27.5,
-        "validated": True,
+        "support": "supported",
+        "evidence_segment_ids": ["seg-104", "seg-105"],
         "severity": "Moderate",
         "confidence": 0.94,
         "evidence": "The same question occurs repeatedly within the contextual window.",
@@ -97,6 +101,9 @@ def test_valid_qwen_response(record):
     assert result.severity == "Moderate"
     assert result.confidence == 0.94
     assert result.person2_evidence == record["evidence"]
+    assert result.start == 10.2
+    assert result.end == 27.5
+    assert result.evidence_segment_ids == ["seg-104", "seg-105"]
 
 
 def test_qwen_call_uses_qwen_json_object_mode_and_strict_prompt(record):
@@ -133,7 +140,8 @@ def test_prompt_contains_no_think_json_example_and_allowed_schema(record):
 
     assert prompt.startswith("/no_think")
     assert "Required JSON shape example" in prompt
-    assert "behaviour,start,end,validated,severity,confidence,evidence,explanation" in prompt.replace(" ", "")
+    assert "behaviour,support,evidence_segment_ids,severity,confidence,evidence,explanation" in prompt.replace(" ", "")
+    assert "Do not invent, modify, or return timestamps" in prompt
 
 
 def test_json_inside_markdown_fence(record):
@@ -248,8 +256,16 @@ def test_json_mode_validate_failure_retries_without_response_format(record):
 
 
 def test_timestamp_preservation(record):
-    with pytest.raises(QwenResponseValidationError, match="preserve"):
-        validate_qwen_response(valid_response(start=11.0), record)
+    payload = json.loads(valid_response(evidence_segment_ids=["seg-999"]))
+    with pytest.raises(QwenResponseValidationError, match="unknown evidence segment"):
+        validate_qwen_response(payload, record)
+
+
+def test_qwen_computes_timestamp_from_selected_source_segment(record):
+    result = validate_qwen_response(valid_response(evidence_segment_ids=["seg-104"]), record)
+
+    assert result.start == 10.2
+    assert result.end == 11.4
 
 
 def test_multiple_behaviour_records_deduplicates_duplicate_evidence(record):
@@ -258,6 +274,5 @@ def test_multiple_behaviour_records_deduplicates_duplicate_evidence(record):
 
     results = analyzer.analyze_batch([record, dict(record)])
 
-    assert len(results) == 2
-    assert results[0] == results[1]
+    assert len(results) == 1
     assert completions.calls == 1

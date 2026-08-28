@@ -27,6 +27,16 @@ _ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 
 
 @dataclass(frozen=True)
+class TranscriptWord:
+    """One word-level timestamp returned by faster-whisper when enabled."""
+
+    text: str
+    start: float | None = None
+    end: float | None = None
+    confidence: float | None = None
+
+
+@dataclass(frozen=True)
 class TranscriptSegment:
     """One timestamped segment returned by faster-whisper."""
 
@@ -34,6 +44,7 @@ class TranscriptSegment:
     start: float | None = None
     end: float | None = None
     confidence: float | None = None
+    words: tuple[TranscriptWord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -57,6 +68,9 @@ class DirectWhisperTranscriber:
         sample_rate: int = config.SAMPLE_RATE,
         language: str | None = config.WHISPER_LANGUAGE,
         use_gpu_if_available: bool = config.USE_GPU_IF_AVAILABLE,
+        beam_size: int = 1,
+        word_timestamps: bool = False,
+        vad_parameters: dict[str, Any] | None = None,
         model: Any | None = None,
     ) -> None:
         if model_size not in _ALLOWED_MODELS:
@@ -65,6 +79,9 @@ class DirectWhisperTranscriber:
         self.sample_rate = sample_rate
         self.language = language
         self.use_gpu_if_available = use_gpu_if_available
+        self.beam_size = beam_size
+        self.word_timestamps = word_timestamps
+        self.vad_parameters = vad_parameters
         self.model = model if model is not None else self._load_model()
 
     def _load_model(self) -> Any:
@@ -96,7 +113,9 @@ class DirectWhisperTranscriber:
             np.asarray(audio, dtype=np.float32),
             language=self.language,
             vad_filter=True,
-            beam_size=1,
+            beam_size=self.beam_size,
+            word_timestamps=self.word_timestamps,
+            vad_parameters=self.vad_parameters,
         )
         segments = list(self._coerce_segments(segments_iter))
         text = " ".join(s.text.strip() for s in segments if s.text.strip()).strip()
@@ -113,7 +132,22 @@ class DirectWhisperTranscriber:
             confidence = getattr(segment, "confidence", None)
             if confidence is None and getattr(segment, "avg_logprob", None) is not None:
                 confidence = float(np.exp(float(segment.avg_logprob)))
-            yield TranscriptSegment(text=text, start=start, end=end, confidence=confidence)
+            words = tuple(_coerce_words(getattr(segment, "words", None)))
+            yield TranscriptSegment(text=text, start=start, end=end, confidence=confidence, words=words)
+
+
+def _coerce_words(raw_words: Iterable[Any] | None) -> Iterable[TranscriptWord]:
+    if raw_words is None:
+        return
+    for word in raw_words:
+        text = getattr(word, "word", getattr(word, "text", ""))
+        confidence = getattr(word, "probability", getattr(word, "confidence", None))
+        yield TranscriptWord(
+            text=str(text),
+            start=getattr(word, "start", None),
+            end=getattr(word, "end", None),
+            confidence=float(confidence) if confidence is not None else None,
+        )
 
 
 class TranscriptionWorker:
