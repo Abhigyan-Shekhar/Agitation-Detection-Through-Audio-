@@ -7,9 +7,13 @@ float PCM, and returns transcript segments using audio-relative timestamps.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import collections
 from io import BytesIO
+import logging
 from pathlib import Path
 import re
+import threading
+import time
 from typing import Any, Callable, Iterable, Iterator
 
 import av
@@ -22,10 +26,17 @@ from transcriber import DirectWhisperTranscriber, TranscriptSegment, TranscriptW
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".webm"})
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_AUDIO_DURATION_SECONDS = 2 * 60 * 60
+LOGGER = logging.getLogger(__name__)
+_BATCH_TRANSCRIBER_CACHE: dict[tuple[Any, ...], DirectWhisperTranscriber] = {}
+_BATCH_TRANSCRIBER_CACHE_LOCK = threading.Lock()
 
 
 class AudioValidationError(ValueError):
     """Raised when an upload cannot safely be processed as supported audio."""
+
+
+class BatchTranscriberLoadError(RuntimeError):
+    """Raised when the configured upload Whisper model cannot be initialized."""
 
 
 @dataclass(frozen=True)
@@ -225,6 +236,7 @@ def iter_transcription_chunks(
     chunk_seconds: float = config.BATCH_TRANSCRIPTION_CHUNK_SECONDS,
     overlap_seconds: float = config.BATCH_TRANSCRIPTION_OVERLAP_SECONDS,
     max_duration_seconds: float = MAX_AUDIO_DURATION_SECONDS,
+    metadata: AudioMetadata | None = None,
 ) -> Iterator[TranscriptionAudioChunk]:
     """Yield bounded ASR chunks that cover the full upload exactly once.
 
@@ -232,11 +244,8 @@ def iter_transcription_chunks(
     context. The ``primary_*`` interval is the non-overlapping source-audio
     range owned by that chunk.
     """
-    metadata = inspect_upload(
-        data,
-        filename,
-        target_sample_rate=target_sample_rate,
-        max_duration_seconds=max_duration_seconds,
+    metadata = metadata or inspect_upload(
+        data, filename, target_sample_rate=target_sample_rate, max_duration_seconds=max_duration_seconds,
     )
     if chunk_seconds <= 0:
         raise ValueError("chunk_seconds must be positive")
@@ -365,24 +374,40 @@ def transcribe_upload(
     overlap_seconds: float = config.BATCH_TRANSCRIPTION_OVERLAP_SECONDS,
 ) -> BatchTranscriptionResult:
     """Process one uploaded file into the Person 1 timestamped contract."""
+    started = time.monotonic()
+    if progress_callback is not None:
+        progress_callback("preparing", 0, 1, "Validating audio...")
+    inspection_started = time.monotonic()
     metadata = inspect_upload(data, filename)
+    LOGGER.info("Audio inspection complete filename=%s duration=%.2fs elapsed=%.2fs", metadata.filename, metadata.duration, time.monotonic() - inspection_started)
     sample_rate = config.SAMPLE_RATE
-    engine = transcriber or _build_batch_transcriber(sample_rate)
-    baseline_rms = _recording_baseline_rms_streaming(data, sample_rate)
+    engine = transcriber or get_batch_transcriber(sample_rate=sample_rate, progress_callback=progress_callback)
+    if progress_callback is not None:
+        progress_callback("preparing", 1, 1, "Preparing transcription...")
     segments: list[TimestampedTranscript] = []
+    acoustic_events: list[TimestampedTranscript] = []
+    baseline_history: collections.deque[float] = collections.deque(maxlen=60)
+    transcription_started = time.monotonic()
+    chunks_processed = 0
     for chunk in iter_transcription_chunks(
         data,
         filename,
         target_sample_rate=sample_rate,
         chunk_seconds=chunk_seconds,
         overlap_seconds=overlap_seconds,
+        metadata=metadata,
     ):
+        chunks_processed += 1
+        chunk_started = time.monotonic()
+        chunk_baseline = _recording_baseline_rms(chunk.samples, chunk.sample_rate)
+        baseline_history.append(chunk_baseline)
+        baseline_rms = float(np.median(baseline_history))
         if progress_callback is not None:
             progress_callback(
                 "transcribing",
                 chunk.index,
                 chunk.total,
-                f"Transcribing {chunk.primary_start:.1f}s-{chunk.primary_end:.1f}s",
+                f"Transcribing chunk {chunk.index + 1}/{chunk.total} ({chunk.primary_start:.1f}s-{chunk.primary_end:.1f}s)...",
             )
         _text, raw_segments, _confidence = engine.transcribe(chunk.samples)
         for segment in _normalise_segments(
@@ -393,18 +418,22 @@ def transcribe_upload(
             include_end=chunk.primary_end,
         ):
             segments.append(_with_acoustic(segment, chunk.samples, chunk.sample_rate, baseline_rms, audio_start=chunk.input_start))
+        _append_chunk_acoustic_events(acoustic_events, chunk, baseline_rms)
+        chunk_elapsed = time.monotonic() - chunk_started
+        LOGGER.info("Transcription chunk %d/%d complete source=%.1f-%.1fs elapsed=%.2fs", chunk.index + 1, chunk.total, chunk.primary_start, chunk.primary_end, chunk_elapsed)
         if progress_callback is not None:
             progress_callback(
                 "transcribing",
                 chunk.index + 1,
                 chunk.total,
-                f"Transcribed {chunk.primary_end:.1f}s of {chunk.duration:.1f}s",
+                f"Transcribed chunk {chunk.index + 1}/{chunk.total}",
             )
+    LOGGER.info("Upload transcription complete chunks=%d elapsed=%.2fs", chunks_processed, time.monotonic() - transcription_started)
     segments.sort(key=lambda item: (item.start, item.end, item.text))
-    acoustic_events = _acoustic_only_events_streaming(data, sample_rate, baseline_rms)
     segments = _assign_segment_ids(segments)
     acoustic_events = _assign_segment_ids(acoustic_events, start_index=len(segments))
     model_name = str(getattr(engine, "model_size", config.WHISPER_MODEL))
+    LOGGER.info("Person 1 upload processing complete filename=%s elapsed=%.2fs", metadata.filename, time.monotonic() - started)
     return BatchTranscriptionResult(
         segments=segments,
         filename=metadata.filename,
@@ -415,22 +444,96 @@ def transcribe_upload(
     )
 
 
-def _build_batch_transcriber(sample_rate: int) -> DirectWhisperTranscriber:
-    """Build the offline upload transcriber without changing live defaults."""
-    use_gpu = config.USE_GPU_IF_AVAILABLE and DirectWhisperTranscriber._cuda_available()
-    model_size = config.BATCH_WHISPER_GPU_MODEL if use_gpu else config.BATCH_WHISPER_CPU_MODEL
-    return DirectWhisperTranscriber(
-        model_size=model_size,
-        sample_rate=sample_rate,
-        language=config.BATCH_WHISPER_LANGUAGE,
-        use_gpu_if_available=config.USE_GPU_IF_AVAILABLE,
-        beam_size=config.BATCH_WHISPER_BEAM_SIZE,
-        word_timestamps=config.BATCH_WHISPER_WORD_TIMESTAMPS,
-        vad_parameters={
-            "min_silence_duration_ms": config.BATCH_WHISPER_VAD_MIN_SILENCE_MS,
-            "speech_pad_ms": config.BATCH_WHISPER_VAD_SPEECH_PAD_MS,
-        },
+def get_batch_transcriber(
+    *,
+    sample_rate: int = config.SAMPLE_RATE,
+    model_size: str | None = None,
+    device: str | None = None,
+    compute_type: str | None = None,
+    language: str | None = None,
+    beam_size: int | None = None,
+    word_timestamps: bool | None = None,
+    progress_callback: Callable[[str, int, int, str], None] | None = None,
+) -> DirectWhisperTranscriber:
+    """Return one process-wide upload transcriber per compatible configuration."""
+    resolved_device = device or ("cuda" if config.USE_GPU_IF_AVAILABLE and DirectWhisperTranscriber._cuda_available() else "cpu")
+    resolved_compute = compute_type or ("float16" if resolved_device == "cuda" else "int8")
+    resolved_model = model_size or (config.BATCH_WHISPER_GPU_MODEL if resolved_device == "cuda" else config.BATCH_WHISPER_CPU_MODEL)
+    resolved_language = config.BATCH_WHISPER_LANGUAGE if language is None else language
+    resolved_beam = config.BATCH_WHISPER_BEAM_SIZE if beam_size is None else beam_size
+    resolved_words = config.BATCH_WHISPER_WORD_TIMESTAMPS if word_timestamps is None else word_timestamps
+    key = (
+        resolved_model, resolved_device, resolved_compute, sample_rate, resolved_language,
+        resolved_beam, resolved_words, config.BATCH_WHISPER_VAD_MIN_SILENCE_MS,
+        config.BATCH_WHISPER_VAD_SPEECH_PAD_MS,
     )
+    with _BATCH_TRANSCRIBER_CACHE_LOCK:
+        cached = _BATCH_TRANSCRIBER_CACHE.get(key)
+        if cached is not None:
+            if progress_callback is not None:
+                progress_callback("loading_model", 1, 1, f"Reusing Whisper {resolved_model} on {resolved_device.upper()}.")
+            return cached
+        message = f"Loading Whisper {resolved_model} on {resolved_device.upper()}..."
+        if progress_callback is not None:
+            progress_callback("loading_model", 0, 1, message)
+        load_started = time.monotonic()
+        try:
+            transcriber = DirectWhisperTranscriber(
+                model_size=resolved_model,
+                sample_rate=sample_rate,
+                language=resolved_language,
+                use_gpu_if_available=resolved_device == "cuda",
+                beam_size=resolved_beam,
+                word_timestamps=resolved_words,
+                device=resolved_device,
+                compute_type=resolved_compute,
+                vad_parameters={
+                    "min_silence_duration_ms": config.BATCH_WHISPER_VAD_MIN_SILENCE_MS,
+                    "speech_pad_ms": config.BATCH_WHISPER_VAD_SPEECH_PAD_MS,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise BatchTranscriberLoadError(
+                f"Failed to load Whisper model {resolved_model!r} on {resolved_device.upper()}: {exc}"
+            ) from exc
+        _BATCH_TRANSCRIBER_CACHE[key] = transcriber
+        elapsed = time.monotonic() - load_started
+        LOGGER.info("Whisper model ready model=%s device=%s compute_type=%s elapsed=%.2fs", resolved_model, resolved_device, resolved_compute, elapsed)
+        if progress_callback is not None:
+            progress_callback("loading_model", 1, 1, f"Whisper {resolved_model} ready in {elapsed:.1f}s.")
+        return transcriber
+
+
+def clear_batch_transcriber_cache() -> None:
+    """Clear cached upload transcribers for isolated tests or explicit reconfiguration."""
+    with _BATCH_TRANSCRIBER_CACHE_LOCK:
+        _BATCH_TRANSCRIBER_CACHE.clear()
+
+
+def _build_batch_transcriber(sample_rate: int) -> DirectWhisperTranscriber:
+    """Backward-compatible wrapper around the cached upload factory."""
+    return get_batch_transcriber(sample_rate=sample_rate)
+
+
+def _append_chunk_acoustic_events(
+    events: list[TimestampedTranscript],
+    chunk: TranscriptionAudioChunk,
+    baseline_rms: float,
+) -> None:
+    """Reuse decoded ASR PCM for acoustic-only events and merge boundaries."""
+    local_events = _acoustic_only_events(chunk.samples, chunk.sample_rate, baseline_rms)
+    for event in local_events:
+        absolute = TimestampedTranscript(
+            round(event.start + chunk.input_start, 3), round(event.end + chunk.input_start, 3), "", None, event.acoustic,
+        )
+        if absolute.end <= chunk.primary_start or absolute.start >= chunk.primary_end:
+            continue
+        absolute = replace(absolute, start=max(absolute.start, chunk.primary_start), end=min(absolute.end, chunk.primary_end))
+        if events and absolute.start <= events[-1].end:
+            previous = events[-1]
+            events[-1] = TimestampedTranscript(previous.start, max(previous.end, absolute.end), "", None, absolute.acoustic)
+        else:
+            events.append(absolute)
 
 
 def _normalise_segments(

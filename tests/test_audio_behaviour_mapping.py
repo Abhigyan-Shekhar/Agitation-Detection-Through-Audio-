@@ -21,6 +21,7 @@ def test_supported_audio_behaviours_have_expected_canonical_labels():
         "AUDIO_NEGATIVISM",
         "AUDIO_CONSTANT_REQUEST",
         "AUDIO_URGENT_DISTRESS",
+        "AUDIO_VOCAL_AGITATION",
     }
 
 

@@ -67,15 +67,15 @@ def test_screaming_requires_temporal_persistence_and_recovers_with_hysteresis():
     classifier = BehaviourClassifier()
     base_t = 1_000.0
 
-    # A single loud/spiky window is suppressed even though the instantaneous
-    # acoustic evidence is high.
-    first = classifier.classify(_result(_window(base_t, 0.30, 0.80), 0.95, 0.9, 0.5))
+    # Moderate acoustic scream evidence still requires persistence. Extreme
+    # evidence has a separate intentional immediate-event path.
+    first = classifier.classify(_result(_window(base_t, 0.10, 0.30), 0.85, 0.10, 0.08))
     assert "Screaming" not in first.behaviours
 
-    second = classifier.classify(_result(_window(base_t + 0.5, 0.31, 0.82), 0.95, 0.9, 0.5))
+    second = classifier.classify(_result(_window(base_t + 0.5, 0.10, 0.30), 0.85, 0.10, 0.08))
     assert "Screaming" not in second.behaviours
 
-    third = classifier.classify(_result(_window(base_t + 2.0, 0.32, 0.85), 0.95, 0.9, 0.5))
+    third = classifier.classify(_result(_window(base_t + 2.0, 0.10, 0.30), 0.85, 0.10, 0.08))
     assert "Screaming" in third.behaviours
 
     # Scores between OFF and ON hold the active state (hysteresis), then two

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 import pytest
 
 from person2_module import (
@@ -184,6 +186,29 @@ def test_sentence_transformer_provider_reuses_loaded_model_and_returns_384_dimen
     assert len(first) == 384
     assert len(second) == 384
     assert model.calls == 2
+
+
+def test_sentence_transformer_constructor_runs_once_across_providers(monkeypatch):
+    model_name = "test/reusable-minilm"
+    created = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, name):
+            created.append(name)
+
+        def encode(self, texts, normalize_embeddings=True):
+            return [[1.0, 0.0] for _ in texts]
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = FakeSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+    SentenceTransformerEmbeddingProvider._MODEL_CACHE.pop(model_name, None)
+
+    first = SentenceTransformerEmbeddingProvider(model_name)
+    second = SentenceTransformerEmbeddingProvider(model_name)
+    assert first.embed("first") == [1.0, 0.0]
+    assert second.embed("second") == [1.0, 0.0]
+    assert created == [model_name]
 
 
 def test_embedding_service_caches_duplicate_chunk_text():

@@ -7,9 +7,14 @@ import wave
 import numpy as np
 import pytest
 
+import batch_transcription
+import config
 from batch_transcription import (
     AudioValidationError,
+    BatchTranscriberLoadError,
     _normalise_segments,
+    clear_batch_transcriber_cache,
+    get_batch_transcriber,
     inspect_upload,
     iter_transcription_chunks,
     preprocess_upload,
@@ -30,6 +35,13 @@ def _wav_bytes(*, seconds: float = 0.25, sample_rate: int = 8_000, channels: int
         wav.setframerate(sample_rate)
         wav.writeframes(interleaved.tobytes())
     return output.getvalue()
+
+
+@pytest.fixture
+def isolated_batch_transcriber_cache():
+    clear_batch_transcriber_cache()
+    yield
+    clear_batch_transcriber_cache()
 
 
 @pytest.mark.parametrize("name", ["recording.txt", "recording", "recording.exe"])
@@ -63,6 +75,14 @@ def test_inspect_upload_reports_duration_without_full_preprocess():
     assert metadata.filename == "recording.wav"
     assert metadata.duration == pytest.approx(1.25, abs=0.02)
     assert metadata.source_bytes > 0
+
+
+def test_batch_upload_defaults_use_small_cpu_model_and_two_minute_chunks():
+    assert config.BATCH_WHISPER_CPU_MODEL == "small"
+    assert config.BATCH_WHISPER_GPU_MODEL == "large-v3"
+    assert config.BATCH_TRANSCRIPTION_CHUNK_SECONDS == 120
+    assert config.BATCH_WHISPER_BEAM_SIZE == 5
+    assert config.BATCH_WHISPER_WORD_TIMESTAMPS is True
 
 
 def test_iter_transcription_chunks_covers_audio_with_overlap_and_final_partial():
@@ -174,3 +194,107 @@ def test_word_timestamps_split_oversized_whisper_segment_into_evidence_units():
 
 def test_acoustic_only_persistence_rejects_silence():
     assert _acoustic_only_events(np.zeros(16_000, dtype=np.float32), 16_000, 0.01) == []
+
+
+def test_cached_batch_transcriber_reuses_identical_configuration_and_separates_models(monkeypatch, isolated_batch_transcriber_cache):
+    created = []
+
+    class FakeDirectWhisperTranscriber:
+        @staticmethod
+        def _cuda_available():
+            return False
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            created.append(kwargs)
+
+    monkeypatch.setattr(batch_transcription, "DirectWhisperTranscriber", FakeDirectWhisperTranscriber)
+    first = get_batch_transcriber(model_size="small", device="cpu", compute_type="int8")
+    second = get_batch_transcriber(model_size="small", device="cpu", compute_type="int8")
+    different = get_batch_transcriber(model_size="medium", device="cpu", compute_type="int8")
+
+    assert first is second
+    assert different is not first
+    assert len(created) == 2
+    assert first.beam_size == 5
+    assert first.word_timestamps is True
+
+
+def test_batch_transcriber_load_failure_has_actionable_context(monkeypatch, isolated_batch_transcriber_cache):
+    class FailingTranscriber:
+        @staticmethod
+        def _cuda_available():
+            return False
+
+        def __init__(self, **kwargs):
+            raise MemoryError("not enough RAM")
+
+    monkeypatch.setattr(batch_transcription, "DirectWhisperTranscriber", FailingTranscriber)
+    with pytest.raises(BatchTranscriberLoadError, match="small.*CPU.*not enough RAM"):
+        get_batch_transcriber(model_size="small", device="cpu")
+
+
+def test_transcription_progress_starts_without_full_recording_rms_prepass(monkeypatch):
+    class FakeTranscriber:
+        model_size = "test-model"
+
+        def transcribe(self, samples):
+            return "hello", [SimpleNamespace(text="hello", start=0.0, end=0.1)], 0.9
+
+    monkeypatch.setattr(
+        batch_transcription,
+        "_recording_baseline_rms_streaming",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full-file RMS pre-pass used")),
+    )
+    updates = []
+    result = transcribe_upload(
+        _wav_bytes(seconds=0.25), "progress.wav", transcriber=FakeTranscriber(),
+        progress_callback=lambda *args: updates.append(args),
+    )
+
+    assert result.segments
+    messages = [item[3] for item in updates]
+    assert messages[0] == "Validating audio..."
+    assert "Preparing transcription..." in messages
+    assert any(message.startswith("Transcribing chunk 1/1") for message in messages)
+
+
+def test_model_progress_reports_real_load_then_reuse(monkeypatch, isolated_batch_transcriber_cache):
+    class FakeDirectWhisperTranscriber:
+        @staticmethod
+        def _cuda_available():
+            return False
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(batch_transcription, "DirectWhisperTranscriber", FakeDirectWhisperTranscriber)
+    first_updates = []
+    second_updates = []
+    get_batch_transcriber(model_size="small", device="cpu", progress_callback=lambda *args: first_updates.append(args))
+    get_batch_transcriber(model_size="small", device="cpu", progress_callback=lambda *args: second_updates.append(args))
+
+    assert first_updates[0][0] == "loading_model"
+    assert "Loading Whisper small on CPU" in first_updates[0][3]
+    assert "ready" in first_updates[-1][3]
+    assert "Reusing Whisper small on CPU" in second_updates[-1][3]
+
+
+def test_gpu_batch_default_selects_large_v3_without_changing_quality_settings(monkeypatch, isolated_batch_transcriber_cache):
+    class FakeDirectWhisperTranscriber:
+        @staticmethod
+        def _cuda_available():
+            return True
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(batch_transcription, "DirectWhisperTranscriber", FakeDirectWhisperTranscriber)
+    monkeypatch.setattr(config, "USE_GPU_IF_AVAILABLE", True)
+    engine = get_batch_transcriber()
+
+    assert engine.model_size == "large-v3"
+    assert engine.device == "cuda"
+    assert engine.compute_type == "float16"
+    assert engine.beam_size == 5
+    assert engine.word_timestamps is True

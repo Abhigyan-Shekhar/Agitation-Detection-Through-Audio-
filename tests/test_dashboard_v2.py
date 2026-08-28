@@ -33,10 +33,13 @@ def _install_dashboard_import_stubs():
     streamlit = types.ModuleType("streamlit")
     batch = types.ModuleType("batch_transcription")
     batch.SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav"})
+    batch.inspect_upload = lambda *_args, **_kwargs: None
+    batch.iter_transcription_chunks = lambda *_args, **_kwargs: iter(())
     batch.preprocess_upload = lambda *_args, **_kwargs: None
     batch.transcribe_upload = lambda *_args, **_kwargs: None
     person2 = types.ModuleType("person2_module")
     person2.analyze_person1_transcript = lambda *_args, **_kwargs: None
+    person2.prepare_embedding_provider = lambda *_args, **_kwargs: None
     sys.modules.setdefault("pandas", pandas)
     sys.modules.setdefault("streamlit", streamlit)
     sys.modules.setdefault("batch_transcription", batch)

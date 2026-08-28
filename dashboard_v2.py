@@ -17,7 +17,7 @@ import numpy as np
 
 import config
 from batch_transcription import SUPPORTED_AUDIO_EXTENSIONS, inspect_upload, iter_transcription_chunks, transcribe_upload
-from person2_module import analyze_person1_transcript
+from person2_module import analyze_person1_transcript, prepare_embedding_provider
 from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_behaviours
 
 
@@ -126,7 +126,7 @@ def run_pipeline(data: bytes, filename: str, *, progress_callback: Any | None = 
     started = time.monotonic()
     LOGGER.info("MVP pipeline started filename=%s bytes=%d", filename, len(data))
     if progress_callback is not None:
-        progress_callback("preparing", 0, 1, "Preparing audio")
+        progress_callback("preparing", 0, 1, "Validating audio...")
     person1 = transcribe_upload(data, filename, progress_callback=progress_callback)
     LOGGER.info(
         "Person 1 complete filename=%s duration=%.3fs transcript_segments=%d elapsed=%.2fs",
@@ -136,19 +136,27 @@ def run_pipeline(data: bytes, filename: str, *, progress_callback: Any | None = 
         time.monotonic() - started,
     )
     transcript_contract = person1.transcript_contract()
+    person2_started = time.monotonic()
     if progress_callback is not None:
         progress_callback("person2", 0, 1, "Analyzing behaviour evidence")
-    person2 = analyze_person1_transcript(person1.person2_contract())
+    embedding_provider = prepare_embedding_provider(
+        progress_callback=(
+            (lambda message: progress_callback("person2", 0, 1, message))
+            if progress_callback is not None else None
+        )
+    )
+    person2 = analyze_person1_transcript(person1.person2_contract(), embedding_provider=embedding_provider)
     LOGGER.info(
         "Person 2 complete filename=%s chunks=%d behaviours=%d elapsed=%.2fs",
         filename,
         len(person2.chunks),
         len(person2.behaviours),
-        time.monotonic() - started,
+        time.monotonic() - person2_started,
     )
     behaviour_contract = person2.behaviour_contract()
     if progress_callback is not None:
-        progress_callback("person3", 0, max(1, len(behaviour_contract)), "Validating Person 2 results")
+        progress_callback("person3", 0, max(1, len(behaviour_contract)), "Validating candidates with Qwen...")
+    person3_started = time.monotonic()
     def person3_progress(completed: int, total: int, record: dict[str, Any]) -> None:
         if progress_callback is not None:
             progress_callback(
@@ -162,7 +170,13 @@ def run_pipeline(data: bytes, filename: str, *, progress_callback: Any | None = 
     if progress_callback is not None:
         progress_callback("person3", len(behaviour_contract), max(1, len(behaviour_contract)), "Validation complete")
     LOGGER.info(
-        "MVP pipeline complete filename=%s final_results=%d elapsed=%.2fs",
+        "Person 3 complete filename=%s final_results=%d elapsed=%.2fs",
+        filename,
+        len(final_results),
+        time.monotonic() - person3_started,
+    )
+    LOGGER.info(
+        "MVP pipeline complete filename=%s final_results=%d total_elapsed=%.2fs",
         filename,
         len(final_results),
         time.monotonic() - started,
@@ -220,7 +234,8 @@ def main() -> None:
                 def update_progress(stage: str, completed: int, total: int, message: str) -> None:
                     stage_weights = {
                         "preparing": (0.00, 0.05),
-                        "transcribing": (0.05, 0.70),
+                        "loading_model": (0.05, 0.08),
+                        "transcribing": (0.13, 0.62),
                         "person2": (0.70, 0.15),
                         "person3": (0.85, 0.15),
                     }

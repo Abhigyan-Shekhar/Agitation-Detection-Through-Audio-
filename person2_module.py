@@ -8,14 +8,19 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import hashlib
+import logging
 import math
 import re
-from typing import Any, Protocol
+import threading
+import time
+from typing import Any, Callable, Protocol
 
 import config
 from audio_behaviour_taxonomy import get_supported_behaviours, map_observed_behaviour
 from event_models import CommittedLine, Utterance
 from linguistic_features import LinguisticAnalyzer, _fuzzy_similarity, _is_question, _is_request, _normalize
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -198,6 +203,7 @@ class SentenceTransformerEmbeddingProvider:
     """Optional sentence-transformers backend, loaded only when configured."""
 
     _MODEL_CACHE: dict[str, Any] = {}
+    _MODEL_CACHE_LOCK = threading.Lock()
 
     def __init__(self, model_name: str, model: Any | None = None) -> None:
         self.model_name = model_name
@@ -209,13 +215,27 @@ class SentenceTransformerEmbeddingProvider:
         model = self._MODEL_CACHE.get(self.model_name)
         if model is not None:
             return model
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError("sentence-transformers is not installed") from exc
-        model = SentenceTransformer(self.model_name)
-        self._MODEL_CACHE[self.model_name] = model
-        return model
+        with self._MODEL_CACHE_LOCK:
+            model = self._MODEL_CACHE.get(self.model_name)
+            if model is not None:
+                return model
+            started = time.monotonic()
+            LOGGER.info("Loading semantic embedding model model=%s", self.model_name)
+            try:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("sentence-transformers is not installed") from exc
+            model = SentenceTransformer(self.model_name)
+            self._MODEL_CACHE[self.model_name] = model
+            LOGGER.info("Semantic embedding model ready model=%s elapsed=%.2fs", self.model_name, time.monotonic() - started)
+            return model
+
+    @classmethod
+    def is_model_cached(cls, model_name: str) -> bool:
+        return model_name in cls._MODEL_CACHE
+
+    def ensure_model_loaded(self) -> None:
+        _ = self._model
 
     def embed(self, text: str) -> list[float]:
         embedding = self._model.encode([text], normalize_embeddings=True)[0]
@@ -284,6 +304,26 @@ def build_default_embedding_provider(settings: Person2Config | None = None) -> T
     if settings.embedding_backend != "hashing":
         raise ValueError(f"Unsupported Person 2 embedding backend: {settings.embedding_backend!r}")
     return HashingTextEmbeddingProvider(dimension=settings.embedding_dimension, model_name=settings.embedding_model)
+
+
+def prepare_embedding_provider(
+    settings: Person2Config | None = None,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+) -> TextEmbeddingProvider:
+    """Build the configured provider and visibly perform any one-time model load."""
+    provider = build_default_embedding_provider(settings)
+    if isinstance(provider, SentenceTransformerEmbeddingProvider):
+        if provider.is_model_cached(provider.model_name):
+            if progress_callback is not None:
+                progress_callback("Reusing semantic embedding model.")
+        else:
+            if progress_callback is not None:
+                progress_callback("Loading semantic embedding model...")
+            provider.ensure_model_loaded()
+            if progress_callback is not None:
+                progress_callback("Semantic embedding model ready.")
+    return provider
 
 
 def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict[str, Any] | Any]) -> list[Person1TranscriptSegment]:

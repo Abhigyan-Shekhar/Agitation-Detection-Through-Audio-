@@ -72,6 +72,8 @@ class DirectWhisperTranscriber:
         word_timestamps: bool = False,
         vad_parameters: dict[str, Any] | None = None,
         model: Any | None = None,
+        device: str | None = None,
+        compute_type: str | None = None,
     ) -> None:
         if model_size not in _ALLOWED_MODELS:
             raise ValueError(f"Unsupported Whisper model {model_size!r}; expected one of {sorted(_ALLOWED_MODELS)}")
@@ -82,17 +84,19 @@ class DirectWhisperTranscriber:
         self.beam_size = beam_size
         self.word_timestamps = word_timestamps
         self.vad_parameters = vad_parameters
+        self.device = device
+        self.compute_type = compute_type
         self.model = model if model is not None else self._load_model()
 
     def _load_model(self) -> Any:
         logger.info("Loading Whisper model... model=%s", self.model_size)
         from faster_whisper import WhisperModel
 
-        device = "cpu"
-        compute_type = "int8"
-        if self.use_gpu_if_available and self._cuda_available():
+        device = self.device or "cpu"
+        compute_type = self.compute_type or "int8"
+        if self.device is None and self.use_gpu_if_available and self._cuda_available():
             device = "cuda"
-            compute_type = "float16"
+            compute_type = self.compute_type or "float16"
         model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
         logger.info("Model loaded. device=%s compute_type=%s", device, compute_type)
         return model
