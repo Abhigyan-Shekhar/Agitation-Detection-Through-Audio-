@@ -51,6 +51,80 @@ class SpeechBrainECAPABackend:
         return embedding.detach().cpu().numpy().reshape(-1).astype(np.float32)
 
 
+@dataclass(frozen=True)
+class PatientSpeakerMatch:
+    """Binary upload-time match against the enrolled patient voiceprint."""
+
+    label: str
+    is_patient: bool
+    similarity: float
+
+
+class EnrolledPatientSpeakerIdentifier:
+    """Enroll the first patient-audio minute and verify later speech against it.
+
+    The enrollment embedding is held in memory for the lifetime of this object.
+    It is deliberately not written to disk: callers can decide whether their
+    consent and retention policy permits persistent biometric storage.
+    """
+
+    def __init__(
+        self,
+        backend: SpeakerEmbeddingBackend | None = None,
+        *,
+        similarity_threshold: float = config.DIARIZATION_SIMILARITY_THRESHOLD,
+        min_segment_seconds: float = config.DIARIZATION_MIN_SEGMENT_SECONDS,
+    ) -> None:
+        self._backend = backend or SpeechBrainECAPABackend()
+        self._threshold = float(similarity_threshold)
+        self._min_seconds = float(min_segment_seconds)
+        self._patient_embedding: np.ndarray | None = None
+
+    @property
+    def enrolled(self) -> bool:
+        return self._patient_embedding is not None
+
+    @property
+    def enrollment_embedding(self) -> np.ndarray | None:
+        """Return a defensive copy for an explicitly authorized persistence layer."""
+        if self._patient_embedding is None:
+            return None
+        return self._patient_embedding.copy()
+
+    def enroll(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if samples.size < int(self._min_seconds * sample_rate):
+            raise ValueError("Patient enrollment audio is too short for speaker embedding")
+        vector = self._normalise(self._backend.embed(samples, sample_rate))
+        if not np.any(vector):
+            raise ValueError("Patient enrollment produced an empty speaker embedding")
+        self._patient_embedding = vector
+        return vector.copy()
+
+    def identify(self, audio: np.ndarray, sample_rate: int) -> PatientSpeakerMatch | None:
+        if self._patient_embedding is None:
+            raise RuntimeError("Patient speaker has not been enrolled")
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if samples.size < int(self._min_seconds * sample_rate):
+            return None
+        vector = self._normalise(self._backend.embed(samples, sample_rate))
+        if not np.any(vector):
+            return None
+        similarity = float(np.dot(vector, self._patient_embedding))
+        is_patient = similarity >= self._threshold
+        return PatientSpeakerMatch(
+            label="Patient" if is_patient else "Other speaker",
+            is_patient=is_patient,
+            similarity=similarity,
+        )
+
+    @staticmethod
+    def _normalise(vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 1e-8 else np.zeros_like(vector)
+
+
 @dataclass
 class _SpeakerCentroid:
     vector: np.ndarray

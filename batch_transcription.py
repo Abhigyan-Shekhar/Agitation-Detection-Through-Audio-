@@ -21,6 +21,7 @@ import numpy as np
 
 import config
 from transcriber import DirectWhisperTranscriber, TranscriptSegment, TranscriptWord
+from speaker_diarization import EnrolledPatientSpeakerIdentifier
 
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".flac", ".ogg", ".oga", ".webm"})
@@ -85,6 +86,9 @@ class TimestampedTranscript:
     acoustic: dict[str, float | bool] | None = None
     id: str | None = None
     source_segment_ids: list[str] | None = None
+    speaker_label: str | None = None
+    is_patient: bool | None = None
+    speaker_similarity: float | None = None
 
     def as_dict(self, *, include_acoustic: bool = True, include_source_metadata: bool = True) -> dict[str, Any]:
         payload = asdict(self)
@@ -95,6 +99,9 @@ class TimestampedTranscript:
             payload.pop("source_segment_ids", None)
         elif payload.get("source_segment_ids") is None and payload.get("id"):
             payload["source_segment_ids"] = [payload["id"]]
+        for key in ("speaker_label", "is_patient", "speaker_similarity"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
         return payload
 
 
@@ -108,6 +115,9 @@ class BatchTranscriptionResult:
     sample_rate: int
     model: str
     acoustic_events: list[TimestampedTranscript] | None = None
+    patient_speaker_enrolled: bool = False
+    speaker_enrollment_seconds: float = 0.0
+    speaker_identification_error: str | None = None
 
     def transcript_contract(self) -> list[dict[str, Any]]:
         """Return the JSON-ready payload consumed by Person 2."""
@@ -372,6 +382,9 @@ def transcribe_upload(
     progress_callback: Callable[[str, int, int, str], None] | None = None,
     chunk_seconds: float = config.BATCH_TRANSCRIPTION_CHUNK_SECONDS,
     overlap_seconds: float = config.BATCH_TRANSCRIPTION_OVERLAP_SECONDS,
+    speaker_identifier: EnrolledPatientSpeakerIdentifier | Any | None = None,
+    enable_speaker_identification: bool | None = None,
+    speaker_enrollment_seconds: float = config.BATCH_SPEAKER_ENROLLMENT_SECONDS,
 ) -> BatchTranscriptionResult:
     """Process one uploaded file into the Person 1 timestamped contract."""
     started = time.monotonic()
@@ -387,6 +400,18 @@ def transcribe_upload(
     segments: list[TimestampedTranscript] = []
     acoustic_events: list[TimestampedTranscript] = []
     baseline_history: collections.deque[float] = collections.deque(maxlen=60)
+    if enable_speaker_identification is None:
+        enable_speaker_identification = config.ENABLE_BATCH_SPEAKER_IDENTIFICATION
+    identifier = speaker_identifier
+    if enable_speaker_identification and identifier is None:
+        identifier = EnrolledPatientSpeakerIdentifier(
+            similarity_threshold=config.BATCH_SPEAKER_SIMILARITY_THRESHOLD,
+        )
+    enrollment_target_seconds = min(float(metadata.duration), max(0.0, float(speaker_enrollment_seconds)))
+    enrollment_target_samples = int(round(enrollment_target_seconds * sample_rate))
+    enrollment_parts: list[np.ndarray] = []
+    enrollment_samples = 0
+    speaker_error: str | None = None
     transcription_started = time.monotonic()
     chunks_processed = 0
     for chunk in iter_transcription_chunks(
@@ -399,6 +424,25 @@ def transcribe_upload(
     ):
         chunks_processed += 1
         chunk_started = time.monotonic()
+        if identifier is not None and not getattr(identifier, "enrolled", False) and speaker_error is None:
+            primary_offset = max(0, int(round((chunk.primary_start - chunk.input_start) * sample_rate)))
+            primary_count = max(0, int(round((chunk.primary_end - chunk.primary_start) * sample_rate)))
+            needed = max(0, enrollment_target_samples - enrollment_samples)
+            take = min(needed, primary_count)
+            if take:
+                enrollment_parts.append(chunk.samples[primary_offset:primary_offset + take])
+                enrollment_samples += take
+            if enrollment_target_samples > 0 and enrollment_samples >= enrollment_target_samples:
+                if progress_callback is not None:
+                    progress_callback("speaker_identification", 0, 1, "Enrolling patient voiceprint...")
+                try:
+                    identifier.enroll(np.concatenate(enrollment_parts), sample_rate)
+                    LOGGER.info("Patient speaker enrolled from %.1fs of upload audio", enrollment_target_seconds)
+                    if progress_callback is not None:
+                        progress_callback("speaker_identification", 1, 1, "Patient voiceprint enrolled.")
+                except Exception as exc:  # noqa: BLE001
+                    speaker_error = f"{type(exc).__name__}: {exc}"
+                    LOGGER.warning("Upload speaker identification unavailable: %s", speaker_error)
         chunk_baseline = _recording_baseline_rms(chunk.samples, chunk.sample_rate)
         baseline_history.append(chunk_baseline)
         baseline_rms = float(np.median(baseline_history))
@@ -417,8 +461,32 @@ def transcribe_upload(
             include_start=chunk.primary_start,
             include_end=chunk.primary_end,
         ):
-            segments.append(_with_acoustic(segment, chunk.samples, chunk.sample_rate, baseline_rms, audio_start=chunk.input_start))
-        _append_chunk_acoustic_events(acoustic_events, chunk, baseline_rms)
+            enriched = _with_acoustic(segment, chunk.samples, chunk.sample_rate, baseline_rms, audio_start=chunk.input_start)
+            if identifier is not None and getattr(identifier, "enrolled", False) and speaker_error is None:
+                try:
+                    enriched = _with_speaker_identity(
+                        enriched,
+                        chunk.samples,
+                        chunk.sample_rate,
+                        identifier,
+                        enrollment_target_seconds,
+                        audio_start=chunk.input_start,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    speaker_error = f"{type(exc).__name__}: {exc}"
+                    LOGGER.warning("Upload speaker matching unavailable: %s", speaker_error)
+            segments.append(enriched)
+        try:
+            _append_chunk_acoustic_events(
+                acoustic_events,
+                chunk,
+                baseline_rms,
+                identifier=identifier if speaker_error is None else None,
+                enrollment_end=enrollment_target_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            speaker_error = f"{type(exc).__name__}: {exc}"
+            LOGGER.warning("Upload acoustic-event speaker matching unavailable: %s", speaker_error)
         chunk_elapsed = time.monotonic() - chunk_started
         LOGGER.info("Transcription chunk %d/%d complete source=%.1f-%.1fs elapsed=%.2fs", chunk.index + 1, chunk.total, chunk.primary_start, chunk.primary_end, chunk_elapsed)
         if progress_callback is not None:
@@ -441,6 +509,34 @@ def transcribe_upload(
         sample_rate=sample_rate,
         model=model_name,
         acoustic_events=acoustic_events,
+        patient_speaker_enrolled=bool(identifier is not None and getattr(identifier, "enrolled", False)),
+        speaker_enrollment_seconds=enrollment_target_seconds if identifier is not None else 0.0,
+        speaker_identification_error=speaker_error,
+    )
+
+
+def _with_speaker_identity(
+    segment: TimestampedTranscript,
+    samples: np.ndarray,
+    sample_rate: int,
+    identifier: EnrolledPatientSpeakerIdentifier | Any,
+    enrollment_end: float,
+    *,
+    audio_start: float,
+) -> TimestampedTranscript:
+    """Attach patient/other identity while keeping uncertain short turns unlabeled."""
+    if segment.end <= enrollment_end:
+        return replace(segment, speaker_label="Patient", is_patient=True, speaker_similarity=1.0)
+    start = max(0, int(round((segment.start - audio_start) * sample_rate)))
+    end = min(samples.size, max(start, int(round((segment.end - audio_start) * sample_rate))))
+    match = identifier.identify(samples[start:end], sample_rate)
+    if match is None:
+        return segment
+    return replace(
+        segment,
+        speaker_label=match.label,
+        is_patient=match.is_patient,
+        speaker_similarity=round(float(match.similarity), 4),
     )
 
 
@@ -519,6 +615,9 @@ def _append_chunk_acoustic_events(
     events: list[TimestampedTranscript],
     chunk: TranscriptionAudioChunk,
     baseline_rms: float,
+    *,
+    identifier: EnrolledPatientSpeakerIdentifier | Any | None = None,
+    enrollment_end: float = 0.0,
 ) -> None:
     """Reuse decoded ASR PCM for acoustic-only events and merge boundaries."""
     local_events = _acoustic_only_events(chunk.samples, chunk.sample_rate, baseline_rms)
@@ -529,9 +628,18 @@ def _append_chunk_acoustic_events(
         if absolute.end <= chunk.primary_start or absolute.start >= chunk.primary_end:
             continue
         absolute = replace(absolute, start=max(absolute.start, chunk.primary_start), end=min(absolute.end, chunk.primary_end))
-        if events and absolute.start <= events[-1].end:
+        if identifier is not None and getattr(identifier, "enrolled", False):
+            absolute = _with_speaker_identity(
+                absolute,
+                chunk.samples,
+                chunk.sample_rate,
+                identifier,
+                enrollment_end,
+                audio_start=chunk.input_start,
+            )
+        if events and absolute.start <= events[-1].end and absolute.is_patient == events[-1].is_patient:
             previous = events[-1]
-            events[-1] = TimestampedTranscript(previous.start, max(previous.end, absolute.end), "", None, absolute.acoustic)
+            events[-1] = replace(previous, end=max(previous.end, absolute.end), acoustic=absolute.acoustic)
         else:
             events.append(absolute)
 

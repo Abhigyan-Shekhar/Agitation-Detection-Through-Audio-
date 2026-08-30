@@ -44,6 +44,13 @@ if uploaded is not None:
         else:
             payload = result.transcript_contract()
             st.success(f"Created {len(payload)} timestamped segments from {result.duration:.1f} seconds of audio.")
+            if result.speaker_identification_error:
+                st.warning(f"Speaker identification unavailable: {result.speaker_identification_error}")
+            elif result.patient_speaker_enrolled:
+                st.info(
+                    f"Patient voice enrolled from the first {result.speaker_enrollment_seconds:.1f} seconds; "
+                    "later segments were matched as Patient or Other speaker."
+                )
             st.dataframe(payload, use_container_width=True, hide_index=True)
             st.download_button(
                 "Download transcript JSON",

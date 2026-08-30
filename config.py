@@ -48,6 +48,17 @@ DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "speechbrain/spkrec-ecap
 DIARIZATION_SIMILARITY_THRESHOLD: float = float(os.getenv("DIARIZATION_SIMILARITY_THRESHOLD", "0.22"))
 DIARIZATION_MIN_SEGMENT_SECONDS: float = float(os.getenv("DIARIZATION_MIN_SEGMENT_SECONDS", "1.0"))
 DIARIZATION_MAX_SPEAKERS: int = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "6"))
+# Upload recordings use the first minute as a known-patient enrollment sample,
+# then verify subsequent ASR segments against that in-memory voiceprint.
+ENABLE_BATCH_SPEAKER_IDENTIFICATION: bool = os.getenv(
+    "ENABLE_BATCH_SPEAKER_IDENTIFICATION", "true"
+).lower() == "true"
+BATCH_SPEAKER_ENROLLMENT_SECONDS: float = float(
+    os.getenv("BATCH_SPEAKER_ENROLLMENT_SECONDS", "60")
+)
+BATCH_SPEAKER_SIMILARITY_THRESHOLD: float = float(
+    os.getenv("BATCH_SPEAKER_SIMILARITY_THRESHOLD", str(DIARIZATION_SIMILARITY_THRESHOLD))
+)
 
 # ---------------------------------------------------------------------------
 # Utterance aggregator

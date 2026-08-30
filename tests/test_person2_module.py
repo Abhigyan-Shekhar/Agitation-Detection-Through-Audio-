@@ -342,6 +342,27 @@ def test_person2_detects_other_transcript_supported_cmai_behaviours():
     assert "Distressed/urgent verbalization" in labels
 
 
+def test_confirmed_other_speaker_does_not_create_patient_behaviour_evidence():
+    result = analyze_person1_transcript(
+        [
+            {
+                "id": "patient-1", "start": 61.0, "end": 62.0,
+                "text": "I am feeling fine.", "speaker_label": "Patient",
+                "is_patient": True, "speaker_similarity": 0.91,
+            },
+            {
+                "id": "clinician-1", "start": 63.0, "end": 64.0,
+                "text": "What the fuck is going on?", "speaker_label": "Other speaker",
+                "is_patient": False, "speaker_similarity": 0.02,
+            },
+        ],
+        embedding_provider=CountingEmbeddingProvider(),
+    )
+
+    assert all(segment.is_patient is not False for chunk in result.chunks for segment in chunk.segments)
+    assert "Cursing / verbal aggression" not in {item.behaviour for item in result.behaviours}
+
+
 def test_person2_linguistic_behaviour_uses_evidence_segment_not_context_span():
     result = analyze_person1_transcript(
         [

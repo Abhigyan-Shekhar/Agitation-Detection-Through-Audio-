@@ -10,7 +10,7 @@ from baseline_manager import BaselineManager
 from behaviour_classifier import BehaviourClassifier
 from event_models import CommittedLine, LinguisticFeatures, Utterance
 from linguistic_features import LinguisticAnalyzer
-from speaker_diarization import OnlineSpeakerDiarizer
+from speaker_diarization import EnrolledPatientSpeakerIdentifier, OnlineSpeakerDiarizer
 from score_fusion import ScoreFusion
 from transcriber import DirectWhisperTranscriber, TranscriptionWorker
 from utterance_aggregator import UtteranceAggregator
@@ -77,6 +77,29 @@ def test_short_audio_is_not_given_a_fabricated_speaker():
         backend=SequenceEmbeddingBackend([[1, 0]]), min_segment_seconds=1.0
     )
     assert diarizer.identify(np.ones(100), 16_000) == (None, None)
+
+
+def test_patient_enrollment_matches_patient_and_labels_a_different_voice():
+    backend = SequenceEmbeddingBackend([[1, 0], [0.98, 0.02], [0, 1]])
+    identifier = EnrolledPatientSpeakerIdentifier(
+        backend=backend,
+        min_segment_seconds=0,
+        similarity_threshold=0.8,
+    )
+    audio = np.ones(100, dtype=np.float32)
+
+    saved = identifier.enroll(audio, 16_000)
+    patient = identifier.identify(audio, 16_000)
+    other = identifier.identify(audio, 16_000)
+
+    assert saved.tolist() == [1.0, 0.0]
+    assert identifier.enrolled is True
+    assert patient is not None and (patient.label, patient.is_patient) == ("Patient", True)
+    assert other is not None and (other.label, other.is_patient) == ("Other speaker", False)
+    copy = identifier.enrollment_embedding
+    assert copy is not None
+    copy[:] = 0
+    assert identifier.enrollment_embedding.tolist() == [1.0, 0.0]
 
 
 class TwoSegmentModel:

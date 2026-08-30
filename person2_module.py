@@ -34,6 +34,9 @@ class Person1TranscriptSegment:
     acoustic: dict[str, Any] | None = None
     id: str | None = None
     source_segment_ids: list[str] | None = None
+    speaker_label: str | None = None
+    is_patient: bool | None = None
+    speaker_similarity: float | None = None
 
 
 @dataclass(frozen=True)
@@ -341,6 +344,9 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 acoustic=_coerce_acoustic(item.get("acoustic")),
                 id=str(item["id"]) if item.get("id") is not None else None,
                 source_segment_ids=_coerce_source_segment_ids(item.get("source_segment_ids")),
+                speaker_label=str(item["speaker_label"]) if item.get("speaker_label") is not None else None,
+                is_patient=bool(item["is_patient"]) if item.get("is_patient") is not None else None,
+                speaker_similarity=float(item["speaker_similarity"]) if item.get("speaker_similarity") is not None else None,
             )
         else:
             segment = Person1TranscriptSegment(
@@ -351,13 +357,20 @@ def coerce_person1_transcript(raw_segments: list[Person1TranscriptSegment | dict
                 acoustic=_coerce_acoustic(getattr(item, "acoustic", None)),
                 id=str(getattr(item, "id")) if getattr(item, "id", None) is not None else None,
                 source_segment_ids=_coerce_source_segment_ids(getattr(item, "source_segment_ids", None)),
+                speaker_label=getattr(item, "speaker_label", None),
+                is_patient=getattr(item, "is_patient", None),
+                speaker_similarity=getattr(item, "speaker_similarity", None),
             )
         if segment.start < 0 or segment.end < segment.start:
             raise ValueError("Person 1 transcript segments must have non-negative ordered timestamps")
         if segment.text or segment.acoustic is not None:
             segment_id = segment.id or f"seg-{len(segments):06d}"
             source_ids = segment.source_segment_ids or [segment_id]
-            segments.append(Person1TranscriptSegment(segment.start, segment.end, segment.text, segment.confidence, segment.acoustic, segment_id, source_ids))
+            segments.append(Person1TranscriptSegment(
+                segment.start, segment.end, segment.text, segment.confidence,
+                segment.acoustic, segment_id, source_ids, segment.speaker_label,
+                segment.is_patient, segment.speaker_similarity,
+            ))
     return segments
 
 
@@ -684,7 +697,12 @@ def analyze_person1_transcript(
 ) -> Person2AnalysisResult:
     """Run the full Person 2 pipeline from Person 1 transcript to evidence."""
     settings = settings or Person2Config()
-    chunks = contextual_chunk_transcript(raw_segments, settings)
+    normalized = coerce_person1_transcript(raw_segments)
+    # Once patient verification is available, clinician/caregiver speech must
+    # not create patient behaviour evidence. Unknown legacy/unattributed
+    # segments remain analyzable for backward compatibility.
+    patient_segments = [segment for segment in normalized if segment.is_patient is not False]
+    chunks = contextual_chunk_transcript(patient_segments, settings)
     provider = embedding_provider or build_default_embedding_provider(settings)
     repetitions = {
         chunk.chunk_id: (
@@ -885,6 +903,9 @@ def _segment_payload(segment: Person1TranscriptSegment) -> dict[str, Any]:
         "start": segment.start,
         "end": segment.end,
         "text": segment.text,
+        "speaker_label": segment.speaker_label,
+        "is_patient": segment.is_patient,
+        "speaker_similarity": segment.speaker_similarity,
     }
 
 

@@ -9,6 +9,7 @@ import pytest
 
 import batch_transcription
 import config
+from speaker_diarization import EnrolledPatientSpeakerIdentifier
 from batch_transcription import (
     AudioValidationError,
     BatchTranscriberLoadError,
@@ -42,6 +43,12 @@ def isolated_batch_transcriber_cache():
     clear_batch_transcriber_cache()
     yield
     clear_batch_transcriber_cache()
+
+
+@pytest.fixture(autouse=True)
+def disable_real_speaker_model(monkeypatch):
+    """Unit tests opt in with an injected backend instead of downloading ECAPA."""
+    monkeypatch.setattr(config, "ENABLE_BATCH_SPEAKER_IDENTIFICATION", False)
 
 
 @pytest.mark.parametrize("name", ["recording.txt", "recording", "recording.exe"])
@@ -163,6 +170,44 @@ def test_transcribe_upload_offsets_chunk_timestamps_without_duplicating_overlap(
         ("second", 1.1, 1.4),
         ("third", 2.05, 2.25),
     ]
+
+
+def test_upload_enrolls_first_interval_and_labels_later_other_speaker():
+    class FakeTranscriber:
+        model_size = "test-model"
+
+        def transcribe(self, samples):
+            return "patient clinician", [
+                SimpleNamespace(text="patient", start=0.1, end=0.8, confidence=0.9),
+                SimpleNamespace(text="clinician", start=1.1, end=2.4, confidence=0.9),
+            ], 0.9
+
+    class SequenceBackend:
+        def __init__(self):
+            self.vectors = iter(([1.0, 0.0], [0.0, 1.0]))
+
+        def embed(self, audio, sample_rate):
+            return np.asarray(next(self.vectors), dtype=np.float32)
+
+    identifier = EnrolledPatientSpeakerIdentifier(
+        backend=SequenceBackend(), min_segment_seconds=0, similarity_threshold=0.8,
+    )
+    result = transcribe_upload(
+        _wav_bytes(seconds=2.5),
+        "conversation.wav",
+        transcriber=FakeTranscriber(),
+        speaker_identifier=identifier,
+        speaker_enrollment_seconds=1.0,
+    )
+
+    assert result.patient_speaker_enrolled is True
+    assert result.speaker_enrollment_seconds == 1.0
+    assert result.speaker_identification_error is None
+    assert [(item.speaker_label, item.is_patient) for item in result.segments] == [
+        ("Patient", True),
+        ("Other speaker", False),
+    ]
+    assert result.transcript_contract()[1]["speaker_similarity"] == 0.0
 
 
 def test_word_timestamps_split_oversized_whisper_segment_into_evidence_units():

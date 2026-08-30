@@ -63,7 +63,10 @@ Its downloaded JSON is the Person 1 → Person 2 integration contract:
     "start": 10.2,
     "end": 15.4,
     "text": "Where is my daughter?",
-    "confidence": 0.91
+    "confidence": 0.91,
+    "speaker_label": "Patient",
+    "is_patient": true,
+    "speaker_similarity": 0.86
   }
 ]
 ```
@@ -72,6 +75,26 @@ Its downloaded JSON is the Person 1 → Person 2 integration contract:
 Python callers. Processing is local, so there is no network upload to compress;
 the chunked mono 16 kHz representation keeps model inputs bounded while avoiding
 lossy re-encoding.
+
+### Patient speaker identification for uploads
+
+When `ENABLE_BATCH_SPEAKER_IDENTIFICATION=true` (the default), the first 60
+seconds of the upload are treated as known patient audio and embedded once with
+the local SpeechBrain ECAPA model. The embedding is retained in memory for that
+analysis. Every sufficiently long later transcript segment is embedded and
+cosine-matched against the enrolled voiceprint, producing `Patient` or
+`Other speaker` labels. Person 2 excludes confirmed other-speaker segments from
+patient behaviour evidence while retaining them in the displayed/downloaded
+transcript. Install `requirements-diarization.txt`; if the optional
+model is unavailable, transcription and behaviour analysis continue with an
+explicit dashboard warning and no fabricated speaker labels.
+
+Tune enrollment and matching with
+`BATCH_SPEAKER_ENROLLMENT_SECONDS` (default `60`) and
+`BATCH_SPEAKER_SIMILARITY_THRESHOLD` (default `0.22`). Because a voiceprint is
+biometric data, this implementation does not persist it to disk. Add an
+authorized encrypted storage layer only when consent and retention requirements
+are defined.
 
 ## Person 2 transcript evidence layer
 

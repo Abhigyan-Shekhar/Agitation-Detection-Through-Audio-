@@ -50,6 +50,7 @@ def transcript_rows(transcript_contract: list[dict[str, Any]]) -> list[dict[str,
     return [
         {
             "Timestamp": f"{format_timestamp(float(segment['start']))} – {format_timestamp(float(segment['end']))}",
+            "Speaker": str(segment.get("speaker_label", "Unknown")),
             "Text": str(segment.get("text", "")),
         }
         for segment in transcript_contract
@@ -238,6 +239,7 @@ def main() -> None:
                         "transcribing": (0.13, 0.62),
                         "person2": (0.70, 0.15),
                         "person3": (0.85, 0.15),
+                        "speaker_identification": (0.62, 0.08),
                     }
                     base, span = stage_weights.get(stage, (0.0, 1.0))
                     fraction = 1.0 if total <= 0 else min(1.0, max(0.0, completed / total))
@@ -264,6 +266,14 @@ def main() -> None:
     final_results = pipeline["final_results"]
 
     st.subheader("2. Transcript")
+    person1 = pipeline["person1"]
+    if person1.speaker_identification_error:
+        st.warning(f"Speaker identification unavailable: {person1.speaker_identification_error}")
+    elif person1.patient_speaker_enrolled:
+        st.caption(
+            f"Patient voice enrolled from the first {person1.speaker_enrollment_seconds:.1f}s; "
+            "later speech is labeled by speaker-embedding similarity."
+        )
     st.dataframe(pd.DataFrame(transcript_rows(transcript)), use_container_width=True, hide_index=True)
 
     st.subheader("3. Initial Behaviour Detection")
