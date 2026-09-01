@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from hashlib import sha256
+from html import escape
 from io import BytesIO
 import logging
 from pathlib import Path
@@ -23,6 +24,8 @@ from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_beh
 
 ANALYSIS_RESULT_STATE_KEY = "mvp_analysis_result"
 ANALYSIS_UPLOAD_STATE_KEY = "mvp_analysis_upload_key"
+SELECTED_EVENT_STATE_KEY = "mvp_selected_behaviour_event"
+BEHAVIOUR_SELECT_STATE_KEY = "mvp_behaviour_select"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -86,6 +89,122 @@ def timeline_table(results: list[FinalBehaviourResult]) -> pd.DataFrame:
             for result in results
         ]
     )
+
+
+def validation_status(result: FinalBehaviourResult) -> str:
+    """Return the dashboard label for Person 3's validation decision."""
+    if result.validated:
+        return "Supported"
+    if result.severity == "Insufficient":
+        return "Insufficient"
+    return "Not supported"
+
+
+def relevant_transcript_segments(
+    result: FinalBehaviourResult,
+    person2_behaviours: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return this result's source transcript units in audio-time order.
+
+    Person 3 retains the source IDs selected from Person 2.  Resolving those
+    IDs here keeps the dashboard grounded in the pipeline evidence without
+    changing either upstream contract.
+    """
+    selected_ids = set(result.evidence_segment_ids or [])
+    segments: dict[str, dict[str, Any]] = {}
+    for behaviour in person2_behaviours:
+        for segment in behaviour.get("evidence_segments", []) or []:
+            if not isinstance(segment, dict):
+                continue
+            segment_id = str(segment.get("id", ""))
+            if selected_ids and segment_id not in selected_ids:
+                continue
+            if not selected_ids:
+                if result.chunk_id and behaviour.get("chunk_id") != result.chunk_id:
+                    continue
+                if behaviour.get("behaviour") != result.initial_behaviour:
+                    continue
+            if segment_id:
+                segments.setdefault(segment_id, {
+                    "id": segment_id,
+                    "start": float(segment["start"]),
+                    "end": float(segment["end"]),
+                    "text": str(segment.get("text", "")),
+                })
+    if segments:
+        return sorted(segments.values(), key=lambda segment: (segment["start"], segment["end"], segment["id"]))
+    # This fallback is still pipeline-produced text; it supports legacy final
+    # results that predate evidence-segment IDs.
+    return [{"id": "result-transcript", "start": result.start, "end": result.end, "text": result.transcript}] if result.transcript else []
+
+
+def timeline_events(
+    results: list[FinalBehaviourResult], person2_behaviours: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build one independently selectable timeline event per final result."""
+    events = []
+    for event_id, result in enumerate(results):
+        segments = relevant_transcript_segments(result, person2_behaviours)
+        events.append({
+            "event_id": event_id,
+            "result": result,
+            "start": float(result.start),
+            "end": float(result.end),
+            "transcript_segments": segments,
+        })
+    return events
+
+
+def selected_timeline_event(events: list[dict[str, Any]], event_id: int) -> dict[str, Any]:
+    """Resolve a click/dropdown event identity without conflating overlaps."""
+    for event in events:
+        if event["event_id"] == event_id:
+            return event
+    raise ValueError(f"Unknown timeline event: {event_id}")
+
+
+def audio_segment_bounds(event: dict[str, Any]) -> tuple[float, float]:
+    """Return the exact original-audio bounds shared by both selection paths."""
+    return float(event["start"]), float(event["end"])
+
+
+def _event_hover_text(event: dict[str, Any]) -> str:
+    """Create Plotly hover content from actual final and source evidence."""
+    result = event["result"]
+    transcript = "<br>".join(
+        f"{escape(segment['id'])} {escape(format_timestamp(segment['start']))}–{escape(format_timestamp(segment['end']))}: &quot;{escape(segment['text'])}&quot;"
+        for segment in event["transcript_segments"]
+    ) or "No source transcript available"
+    return (
+        f"<b>{escape(result.behaviour)}</b><br>{escape(result_timestamp(result))}<br>"
+        f"Confidence: {result.confidence:.2f}<br>Severity: {escape(result.severity)}<br>"
+        f"Status: {validation_status(result)}<br><br><b>Transcript</b><br>{transcript}<br><br>"
+        f"<b>Evidence</b><br>{escape(result.evidence or result.person2_evidence)}<extra></extra>"
+    )
+
+
+def interactive_timeline_figure(events: list[dict[str, Any]], selected_event_id: int | None):
+    """Build a clickable Plotly timeline while preserving one bar per event."""
+    import plotly.graph_objects as go
+
+    figure = go.Figure()
+    for event in events:
+        result = event["result"]
+        selected = event["event_id"] == selected_event_id
+        figure.add_trace(go.Bar(
+            x=[max(0.05, event["end"] - event["start"])], base=[event["start"]],
+            y=[f"{result.behaviour} #{event['event_id'] + 1}"], orientation="h",
+            name=result.behaviour, customdata=[event["event_id"]],
+            marker={"line": {"color": "#111827" if selected else "#ffffff", "width": 3 if selected else 1}},
+            hovertemplate=_event_hover_text(event), showlegend=False,
+        ))
+    figure.update_layout(
+        barmode="overlay", height=max(300, 54 * len(events) + 100),
+        xaxis_title="Audio-relative time (seconds)", yaxis_title="Behaviour event",
+        margin={"l": 180, "r": 30, "t": 25, "b": 55},
+        clickmode="event+select",
+    )
+    return figure
 
 
 def extract_audio_segment_wav(data: bytes, filename: str, start: float, end: float) -> bytes:
@@ -284,28 +403,73 @@ def main() -> None:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
     st.subheader("6. Behaviour Timeline")
-    timeline = timeline_table(final_results)
-    if not timeline.empty:
-        st.bar_chart(timeline, x="start_sec", y="duration_sec", color="behaviour")
-    else:
+    events = timeline_events(final_results, person2_behaviours)
+    if not events:
         st.info("No final behaviours were detected.")
+        return
+    selected_event_id = st.session_state.get(SELECTED_EVENT_STATE_KEY, 0)
+    if not any(event["event_id"] == selected_event_id for event in events):
+        selected_event_id = 0
+        st.session_state[SELECTED_EVENT_STATE_KEY] = selected_event_id
+
+    # A key that changes after each selection clears Plotly's old selection on
+    # the next rerun, so a later dropdown change is not mistaken for a click.
+    chart_state = st.plotly_chart(
+        interactive_timeline_figure(events, selected_event_id),
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="points",
+        key=f"behaviour_timeline_{selected_event_id}",
+    )
+    selection = getattr(chart_state, "selection", None)
+    points = selection.get("points", []) if isinstance(selection, dict) else getattr(selection, "points", [])
+    if points:
+        clicked_event_id = int(points[0]["customdata"])
+        if clicked_event_id != selected_event_id:
+            selected_event_id = clicked_event_id
+            st.session_state[SELECTED_EVENT_STATE_KEY] = selected_event_id
+            st.session_state[BEHAVIOUR_SELECT_STATE_KEY] = selected_event_id
+            st.rerun()
+
+    st.caption("Hover for evidence and transcript context. Click or tap a bar to select its exact audio segment.")
 
     st.subheader("5. Evidence / Explanation and 7. Audio Segment Playback")
-    if not final_results:
-        return
     choice = st.selectbox(
         "Select behaviour",
-        options=list(range(len(final_results))),
-        format_func=lambda idx: f"{final_results[idx].behaviour} ({result_timestamp(final_results[idx])})",
+        options=[event["event_id"] for event in events],
+        index=selected_event_id,
+        format_func=lambda event_id: (
+            f"{selected_timeline_event(events, event_id)['result'].behaviour} "
+            f"({result_timestamp(selected_timeline_event(events, event_id)['result'])})"
+        ),
+        key=BEHAVIOUR_SELECT_STATE_KEY,
     )
-    selected = final_results[int(choice)]
+    if int(choice) != selected_event_id:
+        selected_event_id = int(choice)
+        st.session_state[SELECTED_EVENT_STATE_KEY] = selected_event_id
+        st.rerun()
+
+    selected_event = selected_timeline_event(events, selected_event_id)
+    selected = selected_event["result"]
+    start, end = audio_segment_bounds(selected_event)
+    st.markdown("#### Selected behaviour")
+    st.write(f"**{selected.behaviour}**  ")
+    st.write(f"**{result_timestamp(selected)}**")
+    st.write(f"Confidence: **{selected.confidence:.0%}** | Severity: **{selected.severity}** | Validation: **{validation_status(selected)}**")
+    st.markdown("**Relevant transcript**")
+    if selected_event["transcript_segments"]:
+        for segment in selected_event["transcript_segments"]:
+            st.write(f"`{segment['id']}` {format_timestamp(segment['start'])}–{format_timestamp(segment['end'])}: “{segment['text']}”")
+    else:
+        st.caption("No source transcript is available for this event.")
+    st.markdown("**Supporting evidence**")
+    st.write(selected.evidence or selected.person2_evidence)
     st.json(asdict(selected))
     st.write(f"**Person 2 evidence:** {selected.person2_evidence}")
     st.write(f"**Qwen explanation:** {selected.explanation}")
-    st.write(f"**Relevant transcript:** {selected.transcript}")
-    st.write(f"Start: {selected.start:.1f} sec | End: {selected.end:.1f} sec")
+    st.write(f"Start: {start:.2f} sec | End: {end:.2f} sec")
     try:
-        st.audio(extract_audio_segment_wav(data, filename, selected.start, selected.end), format="audio/wav")
+        st.audio(extract_audio_segment_wav(data, filename, start, end), format="audio/wav")
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Could not extract playback segment: {exc}")
 
