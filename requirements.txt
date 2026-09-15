@@ -22,3 +22,5 @@ python-dotenv>=1.0.0
 
 # Person 3 Qwen analysis via Groq
 groq>=0.9.0
+# Optional persistence layer used when SUPABASE_URL/SUPABASE_KEY are set.
+supabase>=2.0.0

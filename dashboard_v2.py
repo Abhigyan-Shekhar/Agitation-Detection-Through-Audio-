@@ -10,6 +10,7 @@ from pathlib import Path
 import time
 from typing import Any
 import wave
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -20,6 +21,7 @@ import config
 from batch_transcription import SUPPORTED_AUDIO_EXTENSIONS, inspect_upload, iter_transcription_chunks, transcribe_upload
 from person2_module import analyze_person1_transcript, prepare_embedding_provider
 from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_behaviours
+from supabase_event_store import BehaviourEventMetadata, SupabaseEventStore, SupabaseEventStoreError
 
 
 ANALYSIS_RESULT_STATE_KEY = "mvp_analysis_result"
@@ -27,6 +29,30 @@ ANALYSIS_UPLOAD_STATE_KEY = "mvp_analysis_upload_key"
 SELECTED_EVENT_STATE_KEY = "mvp_selected_behaviour_event"
 BEHAVIOUR_SELECT_STATE_KEY = "mvp_behaviour_select"
 LOGGER = logging.getLogger(__name__)
+
+
+def audio_timestamp_label(start: float, end: float) -> str:
+    """Return the audio-relative location without storing audio or evidence."""
+    start_label = format_timestamp(start)
+    end_label = format_timestamp(end)
+    return start_label if abs(float(end) - float(start)) < 0.05 else f"{start_label} – {end_label}"
+
+
+def persist_validated_results(results: list[FinalBehaviourResult], *, store: SupabaseEventStore | None = None, recorded_at: datetime | None = None) -> tuple[int, str | None]:
+    """Persist only supported final results; return count and optional error."""
+    store = store or SupabaseEventStore()
+    event_time = recorded_at or datetime.now(timezone.utc)
+    events = [
+        BehaviourEventMetadata(event_time, audio_timestamp_label(result.start, result.end), result.behaviour)
+        for result in results if result.validated
+    ]
+    if not events:
+        return 0, None
+    try:
+        store.insert_events(events)
+    except (SupabaseEventStoreError, ValueError) as exc:
+        return 0, str(exc)
+    return len(events), None
 
 
 def upload_cache_key(data: bytes, filename: str) -> str:
@@ -295,6 +321,7 @@ def run_pipeline(data: bytes, filename: str, *, progress_callback: Any | None = 
         len(final_results),
         time.monotonic() - person3_started,
     )
+    persisted_count, persistence_error = persist_validated_results(final_results)
     LOGGER.info(
         "MVP pipeline complete filename=%s final_results=%d total_elapsed=%.2fs",
         filename,
@@ -307,6 +334,8 @@ def run_pipeline(data: bytes, filename: str, *, progress_callback: Any | None = 
         "person2": person2,
         "person2_behaviours": behaviour_contract,
         "final_results": final_results,
+        "persisted_event_count": persisted_count,
+        "persistence_error": persistence_error,
     }
 
 
@@ -383,6 +412,10 @@ def main() -> None:
     transcript = pipeline["transcript"]
     person2_behaviours = pipeline["person2_behaviours"]
     final_results = pipeline["final_results"]
+    if pipeline.get("persistence_error"):
+        st.warning(f"Behaviour detection succeeded, but database persistence failed: {pipeline['persistence_error']}")
+    elif pipeline.get("persisted_event_count"):
+        st.caption(f"Persisted {pipeline['persisted_event_count']} validated behaviour event(s) to Supabase.")
 
     st.subheader("2. Transcript")
     person1 = pipeline["person1"]

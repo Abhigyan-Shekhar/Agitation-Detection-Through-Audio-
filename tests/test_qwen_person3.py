@@ -96,7 +96,7 @@ def valid_response(**overrides) -> str:
 def test_valid_qwen_response(record):
     result = validate_qwen_response(valid_response(), record)
 
-    assert result.behaviour == "Repetitive Questioning"
+    assert result.behaviour == "Repetitive sentences or questions"
     assert result.validated is True
     assert result.severity == "Moderate"
     assert result.confidence == 0.94
@@ -104,6 +104,11 @@ def test_valid_qwen_response(record):
     assert result.start == 10.2
     assert result.end == 27.5
     assert result.evidence_segment_ids == ["seg-104", "seg-105"]
+
+
+def test_qwen_rejects_physical_behaviour_label(record):
+    with pytest.raises(QwenResponseValidationError, match="Unsupported audio behaviour"):
+        validate_qwen_response(valid_response(behaviour="pacing"), record)
 
 
 def test_qwen_call_uses_qwen_json_object_mode_and_strict_prompt(record):
@@ -127,11 +132,11 @@ def test_qwen_call_disables_reasoning_and_parses_normal_json(record):
 
     result = analyzer.analyze_record(record)
 
-    assert result.behaviour == "Repetitive Questioning"
+    assert result.behaviour == "Repetitive sentences or questions"
     assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
     assert completions.kwargs[0]["reasoning_effort"] == QWEN_REASONING_EFFORT == "none"
     assert completions.kwargs[0]["reasoning_format"] == QWEN_REASONING_FORMAT == "hidden"
-    assert completions.kwargs[0]["max_completion_tokens"] == 1024
+    assert completions.kwargs[0]["max_completion_tokens"] == 800
     assert "max_tokens" not in completions.kwargs[0]
 
 
@@ -149,7 +154,7 @@ def test_json_inside_markdown_fence(record):
 
     result = validate_qwen_response(fenced, record)
 
-    assert result.behaviour == "Repetitive Questioning"
+    assert result.behaviour == "Repetitive sentences or questions"
     assert result.start == record["start"]
     assert result.end == record["end"]
 

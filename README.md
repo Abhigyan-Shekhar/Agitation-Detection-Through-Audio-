@@ -221,3 +221,26 @@ Run the new dashboard with:
 ```bash
 streamlit run dashboard_v2.py
 ```
+
+## Supabase behaviour-event persistence
+
+The MVP dashboard optionally persists only validated final behaviour metadata
+after Person 3 completes. It stores `recorded_at` (UTC), the audio-relative
+`audio_timestamp`, and `behaviour`; audio, transcripts, prompts, embeddings,
+filenames, and speaker/patient identifiers are never sent to Supabase.
+
+Apply `supabase/migrations/20260915000000_create_behaviour_events.sql` in the
+Supabase SQL editor, copy `.env.example` to your local environment, and set
+`SUPABASE_URL` and the server-side `SUPABASE_KEY`. The key is used only by the
+Streamlit backend process. Row Level Security is enabled and no public/anon
+policy is created, so frontend clients cannot access the table directly.
+
+Install the optional client and run the dashboard as usual:
+
+```bash
+pip install -r requirements.txt
+streamlit run dashboard_v2.py
+```
+
+If Supabase is unavailable or credentials are missing, analysis still shows
+the final behaviour result and reports that persistence failed.

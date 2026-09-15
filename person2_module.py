@@ -742,6 +742,17 @@ def supported_person2_behaviours() -> dict[str, str]:
     }
 
 
+def canonicalize_person2_behaviour(raw_behaviour: str) -> str:
+    """Return a canonical audio label or reject unsupported model output."""
+    if not isinstance(raw_behaviour, str) or not raw_behaviour.strip():
+        raise ValueError("Behaviour label must be a non-empty string.")
+    mapped = map_observed_behaviour(raw_behaviour)
+    canonical_labels = supported_person2_behaviours()
+    if mapped.mapping_status != "mapped" or mapped.canonical_label not in canonical_labels:
+        raise ValueError(f"Unsupported audio behaviour {raw_behaviour!r}.")
+    return mapped.canonical_label
+
+
 def transcript_only_excluded_behaviours() -> dict[str, str]:
     """Describe labels unavailable to legacy records that omit acoustic data."""
     return {

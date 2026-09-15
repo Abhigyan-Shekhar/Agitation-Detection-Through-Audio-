@@ -18,6 +18,7 @@ import re
 from typing import Any, Callable, Iterable
 
 import config
+from person2_module import canonicalize_person2_behaviour
 
 
 DEFAULT_QWEN_MODEL = "qwen/qwen3.6-27b"
@@ -33,7 +34,8 @@ REQUIRED_RESPONSE_FIELDS = {
 }
 VALID_SUPPORT = {"supported", "unsupported", "insufficient"}
 QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
-QWEN_MAX_COMPLETION_TOKENS = 1024
+# Keep the requested output below the current Groq organization OTPM limit.
+QWEN_MAX_COMPLETION_TOKENS = 800
 QWEN_REASONING_EFFORT = "none"
 QWEN_REASONING_FORMAT = "hidden"
 RAW_RESPONSE_LOG_CHARS = 2000
@@ -276,8 +278,13 @@ def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_reco
     if severity not in VALID_SEVERITIES:
         raise QwenResponseValidationError(f"Qwen severity must be one of: {', '.join(sorted(VALID_SEVERITIES))}.")
 
+    try:
+        canonical_behaviour = canonicalize_person2_behaviour(str(data["behaviour"]).strip())
+    except ValueError as exc:
+        raise QwenResponseValidationError(str(exc)) from exc
+
     return FinalBehaviourResult(
-        behaviour=str(data["behaviour"]).strip() or str(source_record.get("behaviour", "Unknown behaviour")),
+        behaviour=canonical_behaviour,
         start=start,
         end=end,
         validated=support == "supported",
