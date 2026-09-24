@@ -19,7 +19,11 @@ import numpy as np
 
 import config
 from batch_transcription import SUPPORTED_AUDIO_EXTENSIONS, inspect_upload, iter_transcription_chunks, transcribe_upload
-from person2_module import analyze_person1_transcript, prepare_embedding_provider
+from person2_module import (
+    analyze_person1_transcript,
+    canonicalize_person2_behaviour,
+    prepare_embedding_provider,
+)
 from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_behaviours
 from supabase_event_store import BehaviourEventMetadata, SupabaseEventStore, SupabaseEventStoreError
 
@@ -99,6 +103,84 @@ def final_results_table(results: list[FinalBehaviourResult]) -> pd.DataFrame:
             }
             for result in results
         ]
+    )
+
+
+def calculate_behaviour_frequencies(
+    final_results: list[FinalBehaviourResult],
+) -> dict[str, int]:
+    """Count occurrences in the final, validated Person 3 results only.
+
+    The result labels are canonicalized through the same validation helper used
+    by Person 2 and Qwen.  Invalid labels are ignored defensively so this
+    visualization cannot surface an unsupported behaviour if a legacy or
+    externally constructed result reaches the dashboard.
+    """
+    frequencies: dict[str, int] = {}
+    for result in final_results:
+        if not result.validated:
+            continue
+        try:
+            behaviour = canonicalize_person2_behaviour(result.behaviour)
+        except (TypeError, ValueError):
+            continue
+        frequencies[behaviour] = frequencies.get(behaviour, 0) + 1
+    return dict(sorted(frequencies.items(), key=lambda item: (-item[1], item[0])))
+
+
+def behaviour_frequency_figure(frequencies: dict[str, int]):
+    """Build the horizontal frequency chart, highlighting the top bar(s)."""
+    import plotly.graph_objects as go
+
+    labels = list(frequencies)
+    counts = list(frequencies.values())
+    highest = max(counts)
+    figure = go.Figure(
+        go.Bar(
+            x=counts,
+            y=labels,
+            orientation="h",
+            text=counts,
+            textposition="outside",
+            marker_color=["#2563eb" if count == highest else "#93c5fd" for count in counts],
+            hovertemplate="%{y}<br>Validated detections: %{x}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        height=max(250, 48 * len(labels) + 90),
+        xaxis_title="Validated detections",
+        yaxis_title="Behaviour",
+        yaxis={"categoryorder": "array", "categoryarray": labels[::-1]},
+        margin={"l": 260, "r": 45, "t": 20, "b": 55},
+        showlegend=False,
+    )
+    return figure
+
+
+def render_behaviour_frequency(final_results: list[FinalBehaviourResult]) -> None:
+    """Render the validated-result frequency summary and chart."""
+    st.subheader("5. Behaviour Frequency")
+    frequencies = calculate_behaviour_frequencies(final_results)
+    if not frequencies:
+        st.info("No validated behaviours detected in this recording.")
+        return
+
+    highest = max(frequencies.values())
+    top_behaviours = [behaviour for behaviour, count in frequencies.items() if count == highest]
+    total_detections = sum(frequencies.values())
+    summary_columns = st.columns(3)
+    summary_columns[0].metric("Validated detections", total_detections)
+    summary_columns[1].metric("Behaviour types", len(frequencies))
+    summary_columns[2].metric("Highest frequency", highest)
+    if len(top_behaviours) == 1:
+        st.markdown(f"**Most frequent behaviour:** {top_behaviours[0]} — {highest} occurrence{'s' if highest != 1 else ''}")
+    else:
+        tied = " • ".join(top_behaviours)
+        st.markdown(f"**Most frequent behaviours:** {tied} — {highest} occurrences each")
+    st.plotly_chart(
+        behaviour_frequency_figure(frequencies),
+        use_container_width=True,
+        config={"displayModeBar": False},
     )
 
 
@@ -435,6 +517,8 @@ def main() -> None:
     table = final_results_table(final_results)
     st.dataframe(table, use_container_width=True, hide_index=True)
 
+    render_behaviour_frequency(final_results)
+
     st.subheader("6. Behaviour Timeline")
     events = timeline_events(final_results, person2_behaviours)
     if not events:
@@ -466,7 +550,7 @@ def main() -> None:
 
     st.caption("Hover for evidence and transcript context. Click or tap a bar to select its exact audio segment.")
 
-    st.subheader("5. Evidence / Explanation and 7. Audio Segment Playback")
+    st.subheader("7. Evidence / Explanation and Audio Segment Playback")
     choice = st.selectbox(
         "Select behaviour",
         options=[event["event_id"] for event in events],
