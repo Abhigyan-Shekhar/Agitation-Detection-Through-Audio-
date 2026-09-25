@@ -26,12 +26,14 @@ from person2_module import (
 )
 from qwen_person3 import FinalBehaviourResult, Person3Error, analyze_person2_behaviours
 from supabase_event_store import BehaviourEventMetadata, SupabaseEventStore, SupabaseEventStoreError
+from agitation_heatmap import HeatmapInterval, build_agitation_heatmap_intervals
 
 
 ANALYSIS_RESULT_STATE_KEY = "mvp_analysis_result"
 ANALYSIS_UPLOAD_STATE_KEY = "mvp_analysis_upload_key"
 SELECTED_EVENT_STATE_KEY = "mvp_selected_behaviour_event"
 BEHAVIOUR_SELECT_STATE_KEY = "mvp_behaviour_select"
+SELECTED_HEATMAP_INTERVAL_STATE_KEY = "mvp_selected_heatmap_interval"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -315,6 +317,44 @@ def interactive_timeline_figure(events: list[dict[str, Any]], selected_event_id:
     return figure
 
 
+def _heatmap_hover_text(interval: HeatmapInterval) -> str:
+    """Create user-facing, evidence-only hover content for one heatmap cell."""
+    behaviours = "<br>".join(f"• {escape(behaviour)}" for behaviour in interval.behaviours) or "No agitation-related evidence"
+    transcript = "<br>".join(f"“{escape(text)}”" for text in interval.transcripts) or "No source transcript available"
+    return (
+        "<b>Agitation Evidence</b><br>"
+        f"Time: {format_timestamp(interval.start)}–{format_timestamp(interval.end)}<br>"
+        f"Score: {interval.score:.2f}<br><br><b>Behaviours</b><br>{behaviours}"
+        f"<br><br><b>Transcript / evidence</b><br>{transcript}<extra></extra>"
+    )
+
+
+def agitation_heatmap_figure(intervals: list[HeatmapInterval], selected_interval_id: int | None):
+    """Build a full-duration, selectable red intensity timeline with a color scale."""
+    import plotly.graph_objects as go
+
+    figure = go.Figure(go.Bar(
+        x=[interval.end - interval.start for interval in intervals],
+        base=[interval.start for interval in intervals],
+        y=["Agitation evidence"] * len(intervals), orientation="h",
+        customdata=list(range(len(intervals))),
+        marker={
+            "color": [interval.score for interval in intervals],
+            "colorscale": [[0, "#fff5f5"], [0.45, "#fca5a5"], [1, "#991b1b"]],
+            "cmin": 0, "cmax": 1,
+            "colorbar": {"title": "Agitation<br>Evidence Score", "tickvals": [0, 0.5, 1]},
+            "line": {"color": ["#111827" if index == selected_interval_id else "#ffffff" for index in range(len(intervals))], "width": [2 if index == selected_interval_id else 0 for index in range(len(intervals))]},
+        },
+        hovertemplate=[_heatmap_hover_text(interval) for interval in intervals],
+        showlegend=False,
+    ))
+    figure.update_layout(
+        height=210, xaxis_title="Audio-relative time (seconds)", yaxis={"visible": False},
+        margin={"l": 20, "r": 95, "t": 15, "b": 55}, clickmode="event+select",
+    )
+    return figure
+
+
 def extract_audio_segment_wav(data: bytes, filename: str, start: float, end: float) -> bytes:
     """Return a WAV segment aligned to original audio-relative timestamps."""
     sample_rate = config.SAMPLE_RATE
@@ -443,6 +483,7 @@ def main() -> None:
         # interactions with the same file (such as timestamp selection) keep it.
         st.session_state[ANALYSIS_UPLOAD_STATE_KEY] = current_upload_key
         st.session_state.pop(ANALYSIS_RESULT_STATE_KEY, None)
+        st.session_state.pop(SELECTED_HEATMAP_INTERVAL_STATE_KEY, None)
 
     st.subheader("1. Audio Upload")
     try:
@@ -519,7 +560,36 @@ def main() -> None:
 
     render_behaviour_frequency(final_results)
 
-    st.subheader("6. Behaviour Timeline")
+    st.subheader("6. Agitation Heatmap")
+    st.caption(
+        "Red intensity represents aggregated agitation-related evidence over time. "
+        "This is an evidence visualization, not a clinically validated probability."
+    )
+    heatmap_intervals = build_agitation_heatmap_intervals(final_results, metadata.duration)
+    has_agitation_evidence = any(interval.score > 0 for interval in heatmap_intervals)
+    if not has_agitation_evidence:
+        st.info("No agitation-related evidence detected in this recording.")
+    elif heatmap_intervals:
+        selected_heatmap_interval_id = st.session_state.get(SELECTED_HEATMAP_INTERVAL_STATE_KEY)
+        if not isinstance(selected_heatmap_interval_id, int) or not 0 <= selected_heatmap_interval_id < len(heatmap_intervals):
+            selected_heatmap_interval_id = None
+        heatmap_state = st.plotly_chart(
+            agitation_heatmap_figure(heatmap_intervals, selected_heatmap_interval_id),
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="points",
+            key=f"agitation_heatmap_{selected_heatmap_interval_id}",
+        )
+        heatmap_selection = getattr(heatmap_state, "selection", None)
+        heatmap_points = heatmap_selection.get("points", []) if isinstance(heatmap_selection, dict) else getattr(heatmap_selection, "points", [])
+        if heatmap_points:
+            clicked_interval_id = int(heatmap_points[0]["customdata"])
+            if clicked_interval_id != selected_heatmap_interval_id:
+                st.session_state[SELECTED_HEATMAP_INTERVAL_STATE_KEY] = clicked_interval_id
+                st.rerun()
+        st.caption("Hover for contributing evidence. Click a highlighted region to play that audio interval below.")
+
+    st.subheader("7. Behaviour Timeline")
     events = timeline_events(final_results, person2_behaviours)
     if not events:
         st.info("No final behaviours were detected.")
@@ -546,11 +616,12 @@ def main() -> None:
             selected_event_id = clicked_event_id
             st.session_state[SELECTED_EVENT_STATE_KEY] = selected_event_id
             st.session_state[BEHAVIOUR_SELECT_STATE_KEY] = selected_event_id
+            st.session_state.pop(SELECTED_HEATMAP_INTERVAL_STATE_KEY, None)
             st.rerun()
 
     st.caption("Hover for evidence and transcript context. Click or tap a bar to select its exact audio segment.")
 
-    st.subheader("7. Evidence / Explanation and Audio Segment Playback")
+    st.subheader("8. Evidence / Explanation and Audio Segment Playback")
     choice = st.selectbox(
         "Select behaviour",
         options=[event["event_id"] for event in events],
@@ -564,11 +635,24 @@ def main() -> None:
     if int(choice) != selected_event_id:
         selected_event_id = int(choice)
         st.session_state[SELECTED_EVENT_STATE_KEY] = selected_event_id
+        st.session_state.pop(SELECTED_HEATMAP_INTERVAL_STATE_KEY, None)
         st.rerun()
 
     selected_event = selected_timeline_event(events, selected_event_id)
     selected = selected_event["result"]
     start, end = audio_segment_bounds(selected_event)
+    selected_heatmap_interval_id = st.session_state.get(SELECTED_HEATMAP_INTERVAL_STATE_KEY)
+    selected_heatmap_interval = (
+        heatmap_intervals[selected_heatmap_interval_id]
+        if isinstance(selected_heatmap_interval_id, int) and 0 <= selected_heatmap_interval_id < len(heatmap_intervals)
+        else None
+    )
+    if selected_heatmap_interval is not None:
+        start, end = selected_heatmap_interval.start, selected_heatmap_interval.end
+        st.caption(
+            f"Audio playback is selected from the heatmap region "
+            f"{format_timestamp(start)}–{format_timestamp(end)}."
+        )
     st.markdown("#### Selected behaviour")
     st.write(f"**{selected.behaviour}**  ")
     st.write(f"**{result_timestamp(selected)}**")
