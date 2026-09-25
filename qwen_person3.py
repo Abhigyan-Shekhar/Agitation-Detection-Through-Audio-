@@ -36,6 +36,12 @@ VALID_SUPPORT = {"supported", "unsupported", "insufficient"}
 QWEN_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 # Keep the requested output below the current Groq organization OTPM limit.
 QWEN_MAX_COMPLETION_TOKENS = 800
+# Leave room for the system prompt and completion when sending evidence to the
+# model. The character budget is deliberately conservative because this module
+# does not require a model-specific tokenizer at runtime.
+QWEN_MAX_PROMPT_TOKENS = 6000
+QWEN_APPROX_CHARS_PER_TOKEN = 3
+QWEN_MAX_PROMPT_CHARS = QWEN_MAX_PROMPT_TOKENS * QWEN_APPROX_CHARS_PER_TOKEN
 QWEN_REASONING_EFFORT = "none"
 QWEN_REASONING_FORMAT = "hidden"
 RAW_RESPONSE_LOG_CHARS = 2000
@@ -212,8 +218,52 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         "repetition": record.get("repetition"),
         "acoustic_evidence": record.get("acoustic"),
     }
+    prompt = _render_qwen_prompt(payload, source_units)
+    if len(prompt) <= QWEN_MAX_PROMPT_CHARS:
+        return prompt
+
+    # Large context windows can contain repeated transcript text, repetition
+    # metadata, and many source units. Preserve the candidate and timestamped
+    # evidence first, then progressively reduce duplicated context until the
+    # request stays below a safe input budget.
+    compact_payload = dict(payload)
+    compact_payload["person2_evidence"] = _truncate_text(str(payload.get("person2_evidence") or ""), 1600)
+    compact_payload["transcript_context"] = _truncate_text(str(payload.get("transcript_context") or ""), 2400)
+    compact_payload["repetition"] = _compact_json_value(payload.get("repetition"), 1200)
+    compact_payload["acoustic_evidence"] = _compact_json_value(payload.get("acoustic_evidence"), 1200)
+    compact_units = _compact_source_units(source_units, record, max_units=32, text_chars=320)
+    compact_payload["evidence_source_segment_ids"] = [unit["id"] for unit in compact_units]
+    prompt = _render_qwen_prompt(compact_payload, compact_units)
+    if len(prompt) <= QWEN_MAX_PROMPT_CHARS:
+        return prompt
+
+    compact_payload["person2_evidence"] = _truncate_text(str(payload.get("person2_evidence") or ""), 800)
+    compact_payload["transcript_context"] = ""
+    compact_payload["repetition"] = None
+    compact_payload["acoustic_evidence"] = _compact_json_value(payload.get("acoustic_evidence"), 600)
+    compact_units = _compact_source_units(source_units, record, max_units=16, text_chars=160)
+    compact_payload["evidence_source_segment_ids"] = [unit["id"] for unit in compact_units]
+    prompt = _render_qwen_prompt(compact_payload, compact_units)
+    if len(prompt) <= QWEN_MAX_PROMPT_CHARS:
+        return prompt
+
+    # This final pass bounds every free-form field while retaining the source
+    # unit IDs and timestamps needed for response validation.
+    compact_payload["initial_behaviour"] = _truncate_text(str(payload.get("initial_behaviour") or ""), 160)
+    compact_payload["person2_evidence"] = _truncate_text(str(payload.get("person2_evidence") or ""), 400)
+    compact_payload["score_type"] = _truncate_text(str(payload.get("score_type") or ""), 80)
+    compact_payload["chunk_id"] = _truncate_text(str(payload.get("chunk_id") or ""), 80)
+    compact_units = _compact_source_units(source_units, record, max_units=8, text_chars=80)
+    compact_payload["evidence_source_segment_ids"] = [unit["id"] for unit in compact_units]
+    return _render_qwen_prompt(compact_payload, compact_units)
+
+
+def _render_qwen_prompt(payload: dict[str, Any], source_units: list[dict[str, Any]]) -> str:
+    """Render one prompt from already selected evidence payloads."""
+    render_payload = dict(payload)
+    render_payload["source_transcript_units"] = source_units
     example = {
-        "behaviour": payload["initial_behaviour"] or "Unknown behaviour",
+        "behaviour": render_payload["initial_behaviour"] or "Unknown behaviour",
         "support": "supported",
         "evidence_segment_ids": [source_units[0]["id"]] if source_units else [],
         "severity": "Moderate",
@@ -234,8 +284,61 @@ def build_qwen_prompt(record: dict[str, Any]) -> str:
         f"Allowed support values: {', '.join(sorted(VALID_SUPPORT))}. "
         f"Allowed severity values: {', '.join(sorted(VALID_SEVERITIES))}.\n\n"
         f"Required JSON shape example:\n{json.dumps(example, separators=(',', ':'))}\n\n"
-        f"Person 2 evidence JSON:\n{json.dumps(payload, indent=2, sort_keys=True)}"
+        f"Person 2 evidence JSON:\n{json.dumps(render_payload, separators=(',', ':'), sort_keys=True, ensure_ascii=False)}"
     )
+
+
+def _compact_source_units(
+    source_units: list[dict[str, Any]],
+    record: dict[str, Any],
+    *,
+    max_units: int,
+    text_chars: int,
+) -> list[dict[str, Any]]:
+    """Keep candidate source units first and bound each transcript excerpt."""
+    raw_preferred_ids = record.get("source_segment_ids") or []
+    if isinstance(raw_preferred_ids, str):
+        raw_preferred_ids = [raw_preferred_ids]
+    preferred_ids = {str(value) for value in raw_preferred_ids}
+    preferred = [unit for unit in source_units if str(unit.get("id")) in preferred_ids]
+    remaining = [unit for unit in source_units if str(unit.get("id")) not in preferred_ids]
+    selected = [*preferred, *remaining][:max_units]
+    return [
+        {
+            "id": str(unit.get("id", "")),
+            "start": unit.get("start"),
+            "end": unit.get("end"),
+            "text": _truncate_text(str(unit.get("text", "")), text_chars),
+        }
+        for unit in selected
+    ]
+
+
+def _compact_json_value(value: Any, max_chars: int) -> Any:
+    """Represent oversized metadata compactly without expanding the prompt."""
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        encoded = str(value)
+    if len(encoded) <= max_chars:
+        return value
+    return _truncate_text(encoded, max_chars)
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    """Bound text while retaining both its beginning and end."""
+    if max_chars <= 0 or not value:
+        return ""
+    if len(value) <= max_chars:
+        return value
+    marker = " … [truncated] … "
+    if max_chars <= len(marker):
+        return value[:max_chars]
+    head_chars = (max_chars - len(marker) + 1) // 2
+    tail_chars = max_chars - len(marker) - head_chars
+    return f"{value[:head_chars]}{marker}{value[-tail_chars:]}"
 
 
 def validate_qwen_response(raw_content: str | dict[str, Any] | None, source_record: dict[str, Any]) -> FinalBehaviourResult:

@@ -10,6 +10,7 @@ from qwen_person3 import (
     Person3Error,
     QWEN_JSON_RESPONSE_FORMAT,
     QWEN_MAX_COMPLETION_TOKENS,
+    QWEN_MAX_PROMPT_CHARS,
     QWEN_REASONING_EFFORT,
     QWEN_REASONING_FORMAT,
     QwenPerson3Analyzer,
@@ -147,6 +148,25 @@ def test_prompt_contains_no_think_json_example_and_allowed_schema(record):
     assert "Required JSON shape example" in prompt
     assert "behaviour,support,evidence_segment_ids,severity,confidence,evidence,explanation" in prompt.replace(" ", "")
     assert "Do not invent, modify, or return timestamps" in prompt
+
+
+def test_oversized_prompt_is_compacted_with_candidate_evidence_preserved(record):
+    oversized = dict(record)
+    oversized["evidence"] = "evidence " * 5000
+    oversized["text"] = "transcript " * 10000
+    oversized["repetition"] = {"occurrences": [{"text": "word " * 100} for _ in range(1000)]}
+    oversized["evidence_segments"] = [
+        {"id": f"seg-{index:04d}", "start": index, "end": index + 0.5, "text": "segment " * 500}
+        for index in range(100)
+    ]
+    oversized["source_segment_ids"] = ["seg-0000", "seg-0099"]
+
+    prompt = build_qwen_prompt(oversized)
+
+    assert len(prompt) <= QWEN_MAX_PROMPT_CHARS
+    assert '"id":"seg-0000"' in prompt
+    assert '"id":"seg-0099"' in prompt
+    assert "[truncated]" in prompt
 
 
 def test_json_inside_markdown_fence(record):
