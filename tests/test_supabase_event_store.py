@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+import config
 from supabase_event_store import MissingSupabaseCredentialsError, SupabaseEventStore, SupabaseEventStoreError, validate_event
 
 
@@ -25,6 +26,36 @@ class _Table:
 class _Client:
     def __init__(self): self.table_instance = _Table([])
     def table(self, _name): return self.table_instance
+
+
+def test_environment_loader_uses_python_dotenv(monkeypatch):
+    loaded = []
+    monkeypatch.setattr(config, "load_dotenv", lambda: loaded.append(True))
+
+    config.load_environment()
+
+    assert loaded == [True]
+
+
+def test_store_reads_supabase_credentials_from_environment(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "test-key")
+
+    store = SupabaseEventStore()
+
+    assert store.url == "https://example.supabase.co"
+    assert store.key == "test-key"
+    assert store.configured is True
+
+
+def test_explicit_credentials_override_environment(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://environment.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "environment-key")
+
+    store = SupabaseEventStore(url="https://explicit.supabase.co", key="explicit-key")
+
+    assert store.url == "https://explicit.supabase.co"
+    assert store.key == "explicit-key"
 
 
 def test_insert_and_retrieve_are_allowlisted_metadata_only():

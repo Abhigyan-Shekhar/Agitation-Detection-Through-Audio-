@@ -7,3 +7,4 @@ __pycache__/
 .playwright-mcp/
 .streamlit/
 .odu_personal_baseline.json
+.env

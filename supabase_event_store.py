@@ -7,6 +7,7 @@ import importlib.util
 import os
 from typing import Any, Iterable
 
+import config  # noqa: F401  # Load the shared project environment on direct imports.
 from person2_module import canonicalize_person2_behaviour
 
 

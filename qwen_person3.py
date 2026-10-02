@@ -21,7 +21,7 @@ import config
 from person2_module import canonicalize_person2_behaviour
 
 
-DEFAULT_QWEN_MODEL = "qwen/qwen3.6-27b"
+DEFAULT_QWEN_MODEL = "qwen/qwen3.8-27b"
 VALID_SEVERITIES = {"Insufficient", "Low", "Mild", "Moderate", "High", "Severe"}
 REQUIRED_RESPONSE_FIELDS = {
     "behaviour",

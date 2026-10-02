@@ -7,6 +7,16 @@ from __future__ import annotations
 
 import os
 
+from dotenv import load_dotenv
+
+
+def load_environment() -> None:
+    """Load the project-root environment file without overriding real env vars."""
+    load_dotenv()
+
+
+load_environment()
+
 # ---------------------------------------------------------------------------
 # Audio capture
 # ---------------------------------------------------------------------------

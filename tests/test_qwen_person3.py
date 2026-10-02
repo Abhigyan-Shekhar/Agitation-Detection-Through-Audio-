@@ -114,12 +114,12 @@ def test_qwen_rejects_physical_behaviour_label(record):
 
 def test_qwen_call_uses_qwen_json_object_mode_and_strict_prompt(record):
     completions = _Completions([valid_response()])
-    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test", model="qwen/qwen3.6-27b"), client=_Client(completions))
+    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test", model="qwen/qwen3.8-27b"), client=_Client(completions))
 
     result = analyzer.analyze_record(record)
 
     assert result.validated is True
-    assert completions.kwargs[0]["model"] == "qwen/qwen3.6-27b"
+    assert completions.kwargs[0]["model"] == "qwen/qwen3.8-27b"
     assert completions.kwargs[0]["response_format"] == QWEN_JSON_RESPONSE_FORMAT
     assert completions.kwargs[0]["max_completion_tokens"] == QWEN_MAX_COMPLETION_TOKENS
     assert "max_tokens" not in completions.kwargs[0]
@@ -129,7 +129,7 @@ def test_qwen_call_uses_qwen_json_object_mode_and_strict_prompt(record):
 
 def test_qwen_call_disables_reasoning_and_parses_normal_json(record):
     completions = _Completions([valid_response()])
-    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test", model="qwen/qwen3.6-27b"), client=_Client(completions))
+    analyzer = QwenPerson3Analyzer(config=Person3Config(api_key="test", model="qwen/qwen3.8-27b"), client=_Client(completions))
 
     result = analyzer.analyze_record(record)
 
