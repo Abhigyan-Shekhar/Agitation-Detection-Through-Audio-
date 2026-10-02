@@ -44,6 +44,14 @@ class MappedBehaviour:
 
 SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
     BehaviourTaxonomyEntry(
+        internal_code="AUDIO_VOCAL_AGITATION",
+        canonical_label="Vocal agitation",
+        cmai_category="Verbally agitated: activated vocal delivery",
+        modality="audio",
+        description="Acoustically activated, distressed, or aggressive vocal delivery without requiring profanity or screaming.",
+        aliases=("vocal agitation", "acoustic agitation", "agitated vocal delivery"),
+    ),
+    BehaviourTaxonomyEntry(
         internal_code="AUDIO_SCREAMING",
         canonical_label="Screaming",
         cmai_category="Verbally agitated: screaming/shouting",
@@ -77,6 +85,24 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "hostile language",
             "insult",
             "insulting",
+        ),
+    ),
+    BehaviourTaxonomyEntry(
+        internal_code="AUDIO_VERBAL_SEXUAL_ADVANCES",
+        canonical_label="Making verbal sexual advances",
+        cmai_category="Verbally agitated: verbal sexual advances",
+        modality="audio",
+        description="Sexualized verbal comments, propositions, or advances.",
+        aliases=(
+            "making verbal sexual advances",
+            "verbal sexual advances",
+            "sexual advances",
+            "sexual advance",
+            "sexual comments",
+            "sexual propositions",
+            "sexual remarks",
+            "sexually inappropriate comments",
+            "sexually inappropriate remarks",
         ),
     ),
     BehaviourTaxonomyEntry(
@@ -117,9 +143,31 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "unusual vocalisation",
             "non speech vocalization",
             "non speech vocalisation",
+            "nonverbal vocalization",
+            "nonverbal vocalisation",
             "grunting",
             "groaning",
             "moaning",
+            "weird laughter",
+            "odd laughter",
+            "unusual laughter",
+            "crying",
+            "sobbing",
+            "weeping",
+            "sighing",
+            "panting",
+            "yawning",
+            "throat clearing",
+            "coughing",
+            "sneezing",
+            "sniffing",
+            "breathing",
+            "teeth chattering",
+            "teeth grinding",
+            "tongue clicking",
+            "nose blowing",
+            "lip popping",
+            "lip smacking",
         ),
     ),
     BehaviourTaxonomyEntry(
@@ -165,6 +213,21 @@ SUPPORTED_AUDIO_BEHAVIOURS: tuple[BehaviourTaxonomyEntry, ...] = (
             "repeated request",
             "requests for attention",
             "attention requests",
+        ),
+    ),
+    BehaviourTaxonomyEntry(
+        internal_code="AUDIO_URGENT_DISTRESS",
+        canonical_label="Distressed/urgent verbalization",
+        cmai_category="Verbally non-aggressive: urgent distress/help seeking",
+        modality="audio",
+        description="Urgent verbal distress, help-seeking, or immediate refusal cues detected from speech.",
+        aliases=(
+            "distressed urgent verbalization",
+            "distressed verbalization",
+            "urgent verbalization",
+            "urgent distress",
+            "help seeking",
+            "help-seeking",
         ),
     ),
 )
@@ -215,6 +278,14 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
             ),
         )
 
+    if entry.internal_code == "AUDIO_VERBAL_SEXUAL_ADVANCES":
+        has_sexual = _contains_any(normalized, ("sexual", "sexually"))
+        has_verbal_advance = _contains_any(
+            normalized,
+            ("advance", "advances", "comment", "comments", "proposition", "propositions", "remark", "remarks"),
+        )
+        return has_sexual and has_verbal_advance
+
     if entry.internal_code == "AUDIO_REPETITIVE":
         has_repeat = _contains_any(normalized, ("repetitive", "repeated", "repetition"))
         has_question_or_verbal = _contains_any(
@@ -226,7 +297,32 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
     if entry.internal_code == "AUDIO_STRANGE_NOISE":
         has_noise = _contains_any(normalized, ("noise", "noises"))
         has_strange = _contains_any(normalized, ("strange", "weird"))
-        has_vocal = _contains_any(normalized, ("groan", "grunt", "moan"))
+        has_vocal = _contains_any(
+            normalized,
+            (
+                "groan",
+                "grunt",
+                "moan",
+                "laugh",
+                "cry",
+                "sob",
+                "weep",
+                "sigh",
+                "pant",
+                "yawn",
+                "throat clearing",
+                "cough",
+                "sneeze",
+                "sniff",
+                "breathing",
+                "teeth chattering",
+                "teeth grinding",
+                "tongue clicking",
+                "nose blowing",
+                "lip popping",
+                "lip smacking",
+            ),
+        )
         return (has_noise and has_strange) or has_vocal
 
     if entry.internal_code == "AUDIO_COMPLAINING":
@@ -239,6 +335,11 @@ def _matches_entry(text: str, entry: BehaviourTaxonomyEntry) -> bool:
         has_request = _contains_any(normalized, ("request", "requests", "help", "attention"))
         has_repeat_or_constant = _contains_any(normalized, ("constant", "repeated", "repeatedly", "repetition"))
         return has_request and has_repeat_or_constant
+
+    if entry.internal_code == "AUDIO_URGENT_DISTRESS":
+        has_distress = _contains_any(normalized, ("distress", "distressed", "urgent", "help seeking"))
+        has_verbal = _contains_any(normalized, ("verbalization", "verbalisation", "speech", "help", "plea"))
+        return has_distress and has_verbal
 
     return False
 
@@ -338,6 +439,8 @@ def build_behaviour_event(
     raw_behaviour: str | None,
     *,
     person: str | None = None,
+    speaker_id: int | str | None = None,
+    speaker_label: str | None = None,
     timestamp: Any = None,
     location: str | None = None,
     severity: str | None = None,
@@ -357,6 +460,8 @@ def build_behaviour_event(
         canonical_label=mapping.canonical_label,
         cmai_category=mapping.cmai_category,
         person=person,
+        speaker_id=speaker_id,
+        speaker_label=speaker_label,
         timestamp=timestamp,
         location=location,
         severity=severity,

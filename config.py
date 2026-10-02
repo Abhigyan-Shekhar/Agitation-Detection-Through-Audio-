@@ -7,6 +7,16 @@ from __future__ import annotations
 
 import os
 
+from dotenv import load_dotenv
+
+
+def load_environment() -> None:
+    """Load the project-root environment file without overriding real env vars."""
+    load_dotenv()
+
+
+load_environment()
+
 # ---------------------------------------------------------------------------
 # Audio capture
 # ---------------------------------------------------------------------------
@@ -14,21 +24,51 @@ SAMPLE_RATE: int = 16_000        # Hz — Whisper and Silero both want 16 kHz
 FRAME_SIZE: int = 512            # samples per sounddevice callback (~32 ms)
 CHANNELS: int = 1
 DTYPE: str = "float32"
+AUDIO_INPUT_DEVICE: str | int | None = os.getenv("AUDIO_INPUT_DEVICE") or None
 
 # ---------------------------------------------------------------------------
-# WhisperLiveKit server
+# Local transcription
 # ---------------------------------------------------------------------------
-WLK_HOST: str = os.getenv("WLK_HOST", "127.0.0.1")
-WLK_PORT: int = int(os.getenv("WLK_PORT", "8000"))
-WLK_URL: str = f"ws://{WLK_HOST}:{WLK_PORT}"
+TRANSCRIPTION_ENGINE: str = os.getenv("TRANSCRIPTION_ENGINE", "faster-whisper")
+WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+WHISPER_LANGUAGE: str | None = os.getenv("WHISPER_LANGUAGE", "en") or None
+TRANSCRIPTION_WINDOW_SECONDS: float = float(os.getenv("TRANSCRIPTION_WINDOW_SECONDS", "5"))
+TRANSCRIPTION_INTERVAL_SECONDS: float = float(os.getenv("TRANSCRIPTION_INTERVAL_SECONDS", "1"))
+TRANSCRIPTION_STOP_TIMEOUT_SECONDS: float = float(os.getenv("TRANSCRIPTION_STOP_TIMEOUT_SECONDS", "30"))
+USE_GPU_IF_AVAILABLE: bool = os.getenv("USE_GPU_IF_AVAILABLE", "true").lower() == "true"
+BATCH_TRANSCRIPTION_CHUNK_SECONDS: float = float(os.getenv("BATCH_TRANSCRIPTION_CHUNK_SECONDS", "120"))
+BATCH_TRANSCRIPTION_OVERLAP_SECONDS: float = float(os.getenv("BATCH_TRANSCRIPTION_OVERLAP_SECONDS", "5"))
+BATCH_WHISPER_GPU_MODEL: str = os.getenv("BATCH_WHISPER_GPU_MODEL", "large-v3")
+BATCH_WHISPER_CPU_MODEL: str = os.getenv("BATCH_WHISPER_CPU_MODEL", "small")
+BATCH_WHISPER_LANGUAGE: str | None = os.getenv("BATCH_WHISPER_LANGUAGE", os.getenv("WHISPER_LANGUAGE", "")) or None
+BATCH_WHISPER_BEAM_SIZE: int = int(os.getenv("BATCH_WHISPER_BEAM_SIZE", "5"))
+BATCH_WHISPER_WORD_TIMESTAMPS: bool = os.getenv("BATCH_WHISPER_WORD_TIMESTAMPS", "true").lower() == "true"
+BATCH_WHISPER_VAD_MIN_SILENCE_MS: int = int(os.getenv("BATCH_WHISPER_VAD_MIN_SILENCE_MS", "350"))
+BATCH_WHISPER_VAD_SPEECH_PAD_MS: int = int(os.getenv("BATCH_WHISPER_VAD_SPEECH_PAD_MS", "120"))
+BATCH_TRANSCRIPT_SENTENCE_GAP_SEC: float = float(os.getenv("BATCH_TRANSCRIPT_SENTENCE_GAP_SEC", "0.55"))
+BATCH_TRANSCRIPT_MAX_UTTERANCE_SEC: float = float(os.getenv("BATCH_TRANSCRIPT_MAX_UTTERANCE_SEC", "8.0"))
 
-# WLK model settings (used when auto-launching the server)
-WLK_MODEL: str = os.getenv("WLK_MODEL", "small")
-WLK_LANGUAGE: str = os.getenv("WLK_LANGUAGE", "auto")
-# "mlx-whisper" on Apple Silicon, "faster-whisper" otherwise
-WLK_BACKEND: str = os.getenv("WLK_BACKEND", "mlx-whisper")
-# If True, dashboard.py will spawn wlk as a subprocess automatically
-WLK_AUTO_LAUNCH: bool = os.getenv("WLK_AUTO_LAUNCH", "true").lower() == "true"
+# Local speaker diarization. The ECAPA model is loaded lazily on the
+# transcription worker, never in the sounddevice callback or Streamlit loop.
+ENABLE_SPEAKER_DIARIZATION: bool = os.getenv("ENABLE_SPEAKER_DIARIZATION", "true").lower() == "true"
+DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "speechbrain-ecapa")
+DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+# SpeechBrain SpeakerRecognition uses 0.25 for ECAPA verification. Keep a
+# small margin for short, live microphone segments while remaining tunable.
+DIARIZATION_SIMILARITY_THRESHOLD: float = float(os.getenv("DIARIZATION_SIMILARITY_THRESHOLD", "0.22"))
+DIARIZATION_MIN_SEGMENT_SECONDS: float = float(os.getenv("DIARIZATION_MIN_SEGMENT_SECONDS", "1.0"))
+DIARIZATION_MAX_SPEAKERS: int = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "6"))
+# Upload recordings use the first minute as a known-patient enrollment sample,
+# then verify subsequent ASR segments against that in-memory voiceprint.
+ENABLE_BATCH_SPEAKER_IDENTIFICATION: bool = os.getenv(
+    "ENABLE_BATCH_SPEAKER_IDENTIFICATION", "true"
+).lower() == "true"
+BATCH_SPEAKER_ENROLLMENT_SECONDS: float = float(
+    os.getenv("BATCH_SPEAKER_ENROLLMENT_SECONDS", "60")
+)
+BATCH_SPEAKER_SIMILARITY_THRESHOLD: float = float(
+    os.getenv("BATCH_SPEAKER_SIMILARITY_THRESHOLD", str(DIARIZATION_SIMILARITY_THRESHOLD))
+)
 
 # ---------------------------------------------------------------------------
 # Utterance aggregator
@@ -49,6 +89,17 @@ VAD_THRESHOLD: float = 0.5           # Silero speech-probability cut-off
 # ---------------------------------------------------------------------------
 BASELINE_COLLECT_MIN: float = 2.0    # minimum calm recording needed (minutes)
 BASELINE_ROLLING_MIN: float = 5.0    # rolling fallback window (minutes)
+# Robust baseline normalization: use median/percentile spread plus minimum
+# tolerances so calm calibration does not create hair-trigger z-scores.
+BASELINE_STD_REL_FLOOR: float = float(os.getenv("BASELINE_STD_REL_FLOOR", "0.35"))
+BASELINE_RMS_STD_FLOOR: float = float(os.getenv("BASELINE_RMS_STD_FLOOR", "0.015"))
+BASELINE_PEAK_STD_FLOOR: float = float(os.getenv("BASELINE_PEAK_STD_FLOOR", "0.04"))
+BASELINE_PITCH_STD_FLOOR: float = float(os.getenv("BASELINE_PITCH_STD_FLOOR", "35"))
+BASELINE_ZCR_STD_FLOOR: float = float(os.getenv("BASELINE_ZCR_STD_FLOOR", "0.015"))
+BASELINE_CENTROID_STD_FLOOR: float = float(os.getenv("BASELINE_CENTROID_STD_FLOOR", "250"))
+# The dashboard has no resident identifier yet, so this is intentionally a
+# local per-deployment file. Set BASELINE_STORAGE_PATH per resident/device.
+BASELINE_STORAGE_PATH: str = os.getenv("BASELINE_STORAGE_PATH", ".odu_personal_baseline.json")
 
 # ---------------------------------------------------------------------------
 # Score fusion
@@ -56,6 +107,13 @@ BASELINE_ROLLING_MIN: float = 5.0    # rolling fallback window (minutes)
 Z_CLIP: float = 3.0                  # clamp Z-scores to ±3 before fusion
 EMA_ALPHA_UP: float = 0.55           # fast escalation
 EMA_ALPHA_DOWN: float = 0.20         # slow de-escalation
+
+# Acoustic sigmoid bias (see score_fusion.py module docstring).
+# Subtract this from the weighted Z-sum before passing through sigmoid so that
+# all-zero Z-scores (no personal baseline) map to ~0.047 instead of 0.5.
+# Increase to suppress the acoustic branch further; decrease toward 0 to
+# revert to the pre-bias behaviour (set to 0 to disable).
+ACOUSTIC_SIGMOID_BIAS: float = float(os.getenv("ACOUSTIC_SIGMOID_BIAS", "3.0"))
 
 # Acoustic branch weights (must sum to 1.0)
 ACOUSTIC_WEIGHTS: dict[str, float] = {
@@ -69,12 +127,14 @@ ACOUSTIC_WEIGHTS: dict[str, float] = {
 
 # Linguistic branch weights (must sum to 1.0)
 LINGUISTIC_WEIGHTS: dict[str, float] = {
-    "repetition_score":          0.30,
-    "question_repetition_score": 0.20,
+    "repetition_score":          0.24,
+    "question_repetition_score": 0.18,
     "negative_sentiment":        0.15,
     "urgency_score":             0.15,
     "threat_score":              0.15,
     "profanity_score":           0.05,
+    "sexual_advance_score":      0.04,
+    "strange_noise_score":       0.04,
 }
 
 # Final fusion
@@ -85,13 +145,36 @@ LINGUISTIC_FUSION_WEIGHT: float = 0.40
 BEHAVIOUR_REPETITION_THRESHOLD: float = 0.65
 BEHAVIOUR_Q_REP_THRESHOLD: float = 0.70
 BEHAVIOUR_REQUEST_REP_THRESHOLD: float = 0.65
-BEHAVIOUR_ENERGY_Z_SHOUT: float = 2.0
-BEHAVIOUR_ENERGY_BURST_SHOUT: float = 0.70
+BEHAVIOUR_ENERGY_Z_SHOUT: float = float(os.getenv("BEHAVIOUR_ENERGY_Z_SHOUT", "2.5"))
+BEHAVIOUR_ENERGY_BURST_SHOUT: float = float(os.getenv("BEHAVIOUR_ENERGY_BURST_SHOUT", "1.8"))
+SCREAM_ON_SCORE_THRESHOLD: float = float(os.getenv("SCREAM_ON_SCORE_THRESHOLD", "0.72"))
+SCREAM_OFF_SCORE_THRESHOLD: float = float(os.getenv("SCREAM_OFF_SCORE_THRESHOLD", "0.45"))
+SCREAM_MIN_CONSECUTIVE_WINDOWS: int = int(os.getenv("SCREAM_MIN_CONSECUTIVE_WINDOWS", "3"))
+SCREAM_RECOVERY_CONSECUTIVE_WINDOWS: int = int(os.getenv("SCREAM_RECOVERY_CONSECUTIVE_WINDOWS", "2"))
+SCREAM_MIN_DURATION_SEC: float = float(os.getenv("SCREAM_MIN_DURATION_SEC", "1.0"))
+# Three 0.5-second-hop windows span one second (0.0, 0.5, 1.0), not 1.5
+# seconds.  Keep the duration requirement consistent with that persistence
+# count and provide a separately conservative route for unmistakable bursts.
+SCREAM_EXTREME_SCORE_THRESHOLD: float = float(os.getenv("SCREAM_EXTREME_SCORE_THRESHOLD", "0.90"))
+BEHAVIOUR_ABSOLUTE_RMS_SHOUT: float = float(os.getenv("BEHAVIOUR_ABSOLUTE_RMS_SHOUT", "0.18"))
+BEHAVIOUR_ABSOLUTE_PEAK_SHOUT: float = float(os.getenv("BEHAVIOUR_ABSOLUTE_PEAK_SHOUT", "0.65"))
+BEHAVIOUR_CLIPPING_SHOUT: float = float(os.getenv("BEHAVIOUR_CLIPPING_SHOUT", "0.02"))
 BEHAVIOUR_VERBAL_AGGR_ACOUSTIC: float = 0.65
 BEHAVIOUR_VERBAL_AGGR_SENTIMENT: float = 0.50
 BEHAVIOUR_VERBAL_AGGR_THREAT: float = 0.45
 BEHAVIOUR_URGENCY_THRESHOLD: float = 0.60
 BEHAVIOUR_URGENCY_ACOUSTIC: float = 0.50
+BEHAVIOUR_URGENCY_MIN_TRANSCRIPT_CONFIDENCE: float = float(os.getenv("BEHAVIOUR_URGENCY_MIN_TRANSCRIPT_CONFIDENCE", "0.45"))
+BEHAVIOUR_COMPLAINT_THRESHOLD: float = 0.55
+BEHAVIOUR_NEGATIVISM_THRESHOLD: float = 0.55
+BEHAVIOUR_STRANGE_NOISE_THRESHOLD: float = 0.60
+ACOUSTIC_VOCALIZATION_MIN_RMS: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MIN_RMS", "0.025"))
+ACOUSTIC_VOCALIZATION_MIN_PEAK: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MIN_PEAK", "0.06"))
+ACOUSTIC_VOCALIZATION_MIN_PITCH_COVERAGE: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MIN_PITCH_COVERAGE", "0.35"))
+ACOUSTIC_VOCALIZATION_MAX_PITCH_RANGE: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MAX_PITCH_RANGE", "120"))
+ACOUSTIC_VOCALIZATION_MAX_ZCR: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MAX_ZCR", "0.12"))
+ACOUSTIC_VOCALIZATION_MAX_CENTROID: float = float(os.getenv("ACOUSTIC_VOCALIZATION_MAX_CENTROID", "1800"))
+ACOUSTIC_VOCALIZATION_GROAN_MAX_HZ: float = float(os.getenv("ACOUSTIC_VOCALIZATION_GROAN_MAX_HZ", "170"))
 
 # Severity thresholds
 SEVERITY_LOW_MAX: float = 0.35
@@ -111,9 +194,39 @@ RELIABILITY_MISSING_BASELINE_PENALTY: float = 0.15
 TRANSCRIPT_HISTORY_SEC: float = 60.0   # rolling window for linguistic analysis
 
 # ---------------------------------------------------------------------------
+# Person 2 batch transcript evidence layer
+# ---------------------------------------------------------------------------
+PERSON2_MAX_CHUNK_DURATION_SECONDS: float = float(os.getenv("PERSON2_MAX_CHUNK_DURATION_SECONDS", "20"))
+PERSON2_CHUNK_MAX_DURATION_SEC: float = float(
+    os.getenv("PERSON2_CHUNK_MAX_DURATION_SEC", str(PERSON2_MAX_CHUNK_DURATION_SECONDS))
+)
+PERSON2_CHUNK_MAX_SEGMENTS: int = int(os.getenv("PERSON2_CHUNK_MAX_SEGMENTS", "8"))
+PERSON2_CHUNK_OVERLAP_SEGMENTS: int = int(os.getenv("PERSON2_CHUNK_OVERLAP_SEGMENTS", "1"))
+PERSON2_REPETITION_MIN_OCCURRENCES: int = int(os.getenv("PERSON2_REPETITION_MIN_OCCURRENCES", "2"))
+PERSON2_REPETITION_SIMILARITY_THRESHOLD: float = float(os.getenv("PERSON2_REPETITION_SIMILARITY_THRESHOLD", "0.90"))
+PERSON2_SEMANTIC_SIMILARITY_THRESHOLD: float = float(os.getenv("PERSON2_SEMANTIC_SIMILARITY_THRESHOLD", "0.70"))
+PERSON2_PROTOTYPE_SIMILARITY_THRESHOLD: float = float(os.getenv("PERSON2_PROTOTYPE_SIMILARITY_THRESHOLD", "0.58"))
+PERSON2_EMBEDDING_BACKEND: str = os.getenv("PERSON2_EMBEDDING_BACKEND", "sentence-transformers")
+PERSON2_EMBEDDING_MODEL: str = os.getenv("PERSON2_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+PERSON2_EMBEDDING_DIMENSION: int = int(os.getenv("PERSON2_EMBEDDING_DIMENSION", "384"))
+PERSON2_ACOUSTIC_AGITATION_THRESHOLD: float = float(os.getenv("PERSON2_ACOUSTIC_AGITATION_THRESHOLD", "0.72"))
+PERSON2_ACOUSTIC_COMBINED_THRESHOLD: float = float(os.getenv("PERSON2_ACOUSTIC_COMBINED_THRESHOLD", "0.48"))
+PERSON2_ACOUSTIC_SCREAM_THRESHOLD: float = float(os.getenv("PERSON2_ACOUSTIC_SCREAM_THRESHOLD", "0.72"))
+PERSON2_DEDUPE_IOU_THRESHOLD: float = float(os.getenv("PERSON2_DEDUPE_IOU_THRESHOLD", "0.70"))
+
+# ---------------------------------------------------------------------------
 # Analysis mode
 # ---------------------------------------------------------------------------
 ANALYSIS_MODE: str = os.getenv("ANALYSIS_MODE", "rule_based")
 ENABLE_GEMINI_COMPARISON: bool = (
     os.getenv("ENABLE_GEMINI_COMPARISON", "false").lower() == "true"
 )
+
+# ---------------------------------------------------------------------------
+# Debug / diagnostic logging
+# ---------------------------------------------------------------------------
+# When true, the score_fusion and behaviour_classifier loggers are set to
+# DEBUG so that every intermediate value (baseline stats, z-scores, acoustic
+# score, scream gate flags, final label) is emitted to the log.
+# Enable via env var: DEBUG_TRACE_LOGGING=true
+DEBUG_TRACE_LOGGING: bool = os.getenv("DEBUG_TRACE_LOGGING", "false").lower() == "true"

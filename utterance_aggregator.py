@@ -17,7 +17,7 @@ Design notes
 ------------
 * Runs in a dedicated background thread (``start()`` / ``stop()``).
 * Does not call any ML model — purely time-based heuristics.
-* Duplicate committed lines (same text emitted twice by WLK) are
+* Duplicate committed lines (same text emitted twice by transcriber) are
   de-duplicated via a simple last-line equality check.
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ class UtteranceAggregator:
     Parameters
     ----------
     committed_queue:
-        Source of ``CommittedLine`` objects (from WhisperLiveKitClient).
+        Source of ``CommittedLine`` objects (from TranscriptionWorker).
     utterance_queue:
         Destination for completed ``Utterance`` objects (to fusion pipeline).
     silence_sec:
@@ -71,8 +71,13 @@ class UtteranceAggregator:
         # In-progress accumulation state
         self._lines: list[CommittedLine] = []
         self._utterance_start: float | None = None
+        self._utterance_started_at: float | None = None
         self._last_line_time: float | None = None
         self._last_line_text: str = ""   # for de-duplication
+        self._last_line_speaker: int | str | None = None
+        self._last_line_source_time: float | None = None
+        self._current_speaker_id: int | str | None = None
+        self._current_speaker_label: str | None = None
 
         self._emitted_count: int = 0
 
@@ -94,7 +99,7 @@ class UtteranceAggregator:
     def stop(self) -> None:
         """Flush any pending lines and stop the thread."""
         self._stop_event.set()
-        # Emit whatever is buffered on shutdown
+        self._drain_committed_queue()
         self.flush()
         if self._thread:
             self._thread.join(timeout=3.0)
@@ -125,7 +130,7 @@ class UtteranceAggregator:
             if self._lines and self._last_line_time is not None:
                 now = time.time()
                 elapsed_since_last = now - self._last_line_time
-                utterance_age = now - (self._utterance_start or now)
+                utterance_age = now - (self._utterance_started_at or now)
 
                 # Condition 1: silence timeout
                 if elapsed_since_last >= self._silence_sec:
@@ -168,18 +173,46 @@ class UtteranceAggregator:
             except queue.Empty:
                 return
 
-            # De-duplicate: WLK sometimes re-emits the same line
-            if line.text.strip() == self._last_line_text:
+            clean_text = line.text.strip()
+            source_time = line.end_time or line.timestamp
+            # Suppress immediate snapshot duplicates while allowing another
+            # speaker (or a later genuine repetition) to say the same words.
+            if (
+                clean_text == self._last_line_text
+                and line.speaker_id == self._last_line_speaker
+                and self._last_line_source_time is not None
+                and abs(source_time - self._last_line_source_time) < 0.05
+            ):
                 logger.debug("Duplicate committed line ignored: %r", line.text)
                 continue
 
-            self._last_line_text = line.text.strip()
+            if (
+                self._lines
+                and self._current_speaker_id is not None
+                and line.speaker_id is not None
+                and line.speaker_id != self._current_speaker_id
+            ):
+                logger.info("SPEAKER_CHANGE from=%s to=%s", self._current_speaker_id, line.speaker_id)
+                self._emit()
+
+            self._last_line_text = clean_text
+            self._last_line_speaker = line.speaker_id
+            self._last_line_source_time = source_time
 
             if not self._lines:
-                self._utterance_start = line.timestamp
+                self._utterance_start = line.start_time or line.timestamp
+                self._utterance_started_at = time.time()
+                self._current_speaker_id = line.speaker_id
+                self._current_speaker_label = line.speaker_label
 
             self._lines.append(line)
-            self._last_line_time = line.timestamp
+            self._last_line_time = time.time()
+            logger.info(
+                "BEHAVIOUR_TRACE aggregator_received transcript=%r line_count=%d timestamp=%.3f",
+                line.text,
+                len(self._lines),
+                line.timestamp,
+            )
             logger.debug("Accumulated committed line: %r", line.text)
 
     def _emit(self) -> None:
@@ -187,23 +220,40 @@ class UtteranceAggregator:
         if not self._lines:
             return
 
+        trace = self._lines[-1].latency_trace
         utterance = Utterance(
             lines=list(self._lines),
             start_time=self._utterance_start or self._lines[0].timestamp,
-            end_time=self._lines[-1].timestamp,
+            end_time=self._lines[-1].end_time or self._lines[-1].timestamp,
+            latency_trace=trace,
+            speaker_id=self._current_speaker_id,
+            speaker_label=self._current_speaker_label,
         )
         self._lines.clear()
         self._utterance_start = None
+        self._utterance_started_at = None
         self._last_line_time = None
         self._last_line_text = ""
+        self._last_line_speaker = None
+        self._last_line_source_time = None
+        self._current_speaker_id = None
+        self._current_speaker_label = None
 
         try:
             self._utterance_queue.put_nowait(utterance)
             self._emitted_count += 1
             logger.info(
-                "Utterance emitted — text=%r duration=%.2fs",
+                "Utterance emitted — text=%r duration=%.2fs latency=%s",
                 utterance.full_text[:60],
                 utterance.duration(),
+                trace.durations_ms() if trace else {},
+            )
+            logger.info(
+                "BEHAVIOUR_TRACE aggregator_emitted transcript=%r start=%.3f end=%.3f utterance_q=%d",
+                utterance.full_text,
+                utterance.start_time,
+                utterance.end_time,
+                self._utterance_queue.qsize(),
             )
         except queue.Full:
             logger.warning("utterance_queue full — utterance dropped")

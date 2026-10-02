@@ -15,12 +15,15 @@ Responsibilities
 Design notes
 ------------
 * Thread-safe: all mutable state is protected by a ``threading.Lock``.
-* Persists nothing to disk in this version (future: JSON sidecar).
+* Persists validated personal-baseline statistics to a local JSON sidecar so a
+  completed calibration survives a dashboard restart.
 """
 from __future__ import annotations
 
 import logging
 import math
+import json
+from pathlib import Path
 import threading
 import time
 from collections import deque
@@ -62,12 +65,19 @@ class BaselineManager:
         Duration of the rolling fallback baseline in minutes.
     """
 
-    def __init__(self, rolling_window_min: float = config.BASELINE_ROLLING_MIN) -> None:
+    def __init__(
+        self,
+        rolling_window_min: float = config.BASELINE_ROLLING_MIN,
+        storage_path: str | Path | None = config.BASELINE_STORAGE_PATH,
+    ) -> None:
         self._lock = threading.Lock()
 
         # Personal baseline (set during explicit calibration)
         self._personal_mean: dict[str, float] | None = None
         self._personal_std: dict[str, float] | None = None
+        self._personal_median: dict[str, float] | None = None
+        self._personal_p10: dict[str, float] | None = None
+        self._personal_p90: dict[str, float] | None = None
         self._personal_n: int = 0
 
         # Calibration mode
@@ -78,6 +88,8 @@ class BaselineManager:
         # Rolling fallback: bounded deque keyed on timestamp
         max_rolling = int((rolling_window_min * 60) / config.ACOUSTIC_HOP_SEC) + 1
         self._rolling: Deque[AcousticFeatureWindow] = deque(maxlen=max_rolling)
+        self._storage_path = Path(storage_path) if storage_path else None
+        self._load_persisted_baseline()
 
     # ------------------------------------------------------------------
     # Calibration API (called from dashboard)
@@ -110,11 +122,15 @@ class BaselineManager:
             )
             return False
 
-        mean, std = self._compute_stats(samples)
+        mean, std, median, p10, p90 = self._compute_stats(samples)
         with self._lock:
             self._personal_mean = mean
             self._personal_std = std
+            self._personal_median = median
+            self._personal_p10 = p10
+            self._personal_p90 = p90
             self._personal_n = len(samples)
+        self._persist_baseline()
 
         logger.info(
             "Baseline calibration complete — %d windows, personal baseline set",
@@ -127,8 +143,16 @@ class BaselineManager:
         with self._lock:
             self._personal_mean = None
             self._personal_std = None
+            self._personal_median = None
+            self._personal_p10 = None
+            self._personal_p90 = None
             self._personal_n = 0
             self._calibration_samples.clear()
+        if self._storage_path is not None:
+            try:
+                self._storage_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove persisted personal baseline: %s", exc)
         logger.info("Personal baseline reset")
 
     @property
@@ -147,6 +171,44 @@ class BaselineManager:
             return len(self._calibration_samples)
 
     @property
+    def minimum_windows_for_personal(self) -> int:
+        return _MIN_WINDOWS_FOR_PERSONAL
+
+    @property
+    def feature_names(self) -> tuple[str, ...]:
+        return _FEATURE_NAMES
+
+    def personal_baseline_stats(self) -> dict[str, tuple[float, float]]:
+        """Return a thread-safe copy of personal baseline mean/std values."""
+        with self._lock:
+            if self._personal_mean is None or self._personal_std is None:
+                return {}
+            return {
+                feat: (
+                    self._personal_mean.get(feat, 0.0),
+                    self._personal_std.get(feat, 0.0),
+                )
+                for feat in _FEATURE_NAMES
+            }
+
+
+    def personal_baseline_summary(self) -> dict[str, dict[str, float]]:
+        """Return robust personal baseline distribution statistics for debugging."""
+        with self._lock:
+            if not all((self._personal_mean, self._personal_std, self._personal_median, self._personal_p10, self._personal_p90)):
+                return {}
+            return {
+                feat: {
+                    "mean": self._personal_mean.get(feat, 0.0),
+                    "std": self._personal_std.get(feat, 0.0),
+                    "median": self._personal_median.get(feat, 0.0),
+                    "p10": self._personal_p10.get(feat, 0.0),
+                    "p90": self._personal_p90.get(feat, 0.0),
+                }
+                for feat in _FEATURE_NAMES
+            }
+
+    @property
     def calibration_progress(self) -> float:
         """Returns 0.0 – 1.0 progress toward minimum required windows."""
         with self._lock:
@@ -162,6 +224,17 @@ class BaselineManager:
             self._rolling.append(window)
             if self._calibrating:
                 self._calibration_samples.append(window)
+                count = len(self._calibration_samples)
+            else:
+                count = 0
+        if count and (count == 1 or count % 10 == 0 or count >= _MIN_WINDOWS_FOR_PERSONAL):
+            logger.info(
+                "BaselineManager.feed collected calibration window %d/%d "
+                "(manager_id=%s)",
+                count,
+                _MIN_WINDOWS_FOR_PERSONAL,
+                id(self),
+            )
 
     # ------------------------------------------------------------------
     # Z-score API (called by score_fusion.py)
@@ -173,10 +246,10 @@ class BaselineManager:
         Clips to ±``config.Z_CLIP`` before returning.
         Falls back to 0.0 if standard deviation is zero or data is unavailable.
         """
-        mean, std = self._active_baseline(feature_name)
-        if mean is None or std is None or std < 1e-9:
+        center, std = self._active_baseline(feature_name)
+        if center is None or std is None or std < 1e-9:
             return 0.0
-        z = (value - mean) / std
+        z = (value - center) / std
         return float(np.clip(z, -config.Z_CLIP, config.Z_CLIP))
 
     def missing_baseline_penalty(self) -> float:
@@ -190,8 +263,9 @@ class BaselineManager:
     def _active_baseline(self, feature_name: str) -> tuple[float | None, float | None]:
         with self._lock:
             if self._personal_mean and feature_name in self._personal_mean:
+                center = (self._personal_median or self._personal_mean).get(feature_name, self._personal_mean[feature_name])
                 return (
-                    self._personal_mean[feature_name],
+                    center,
                     self._personal_std.get(feature_name),  # type: ignore[union-attr]
                 )
             # Rolling fallback
@@ -204,14 +278,64 @@ class BaselineManager:
         values = [v for v in values if v is not None and math.isfinite(v)]
         if len(values) < 3:
             return None, None
-        return float(np.mean(values)), float(np.std(values))
+        return float(np.median(values)), self._robust_std(feature_name, values)
+
+    def _load_persisted_baseline(self) -> None:
+        """Load a validated local calibration, never failing dashboard startup."""
+        if self._storage_path is None or not self._storage_path.exists():
+            return
+        try:
+            payload = json.loads(self._storage_path.read_text(encoding="utf-8"))
+            if payload.get("version") != 1:
+                raise ValueError("unsupported baseline format")
+            stats = {key: payload[key] for key in ("mean", "std", "median", "p10", "p90")}
+            if not all(isinstance(values, dict) and all(
+                math.isfinite(float(values.get(feature, float("nan"))))
+                for feature in _FEATURE_NAMES
+            ) for values in stats.values()):
+                raise ValueError("missing or non-finite feature statistics")
+            self._personal_mean = {feature: float(stats["mean"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_std = {feature: max(float(stats["std"][feature]), 1e-9) for feature in _FEATURE_NAMES}
+            self._personal_median = {feature: float(stats["median"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_p10 = {feature: float(stats["p10"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_p90 = {feature: float(stats["p90"][feature]) for feature in _FEATURE_NAMES}
+            self._personal_n = max(0, int(payload.get("n", 0)))
+            logger.info("Loaded persisted personal baseline (%d windows)", self._personal_n)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring invalid persisted personal baseline %s: %s", self._storage_path, exc)
+
+    def _persist_baseline(self) -> None:
+        if self._storage_path is None:
+            return
+        with self._lock:
+            if not all((self._personal_mean, self._personal_std, self._personal_median, self._personal_p10, self._personal_p90)):
+                return
+            payload = {
+                "version": 1,
+                "n": self._personal_n,
+                "mean": self._personal_mean,
+                "std": self._personal_std,
+                "median": self._personal_median,
+                "p10": self._personal_p10,
+                "p90": self._personal_p90,
+            }
+        try:
+            self._storage_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._storage_path.with_suffix(self._storage_path.suffix + ".tmp")
+            temp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            temp_path.replace(self._storage_path)
+        except OSError as exc:
+            logger.warning("Could not persist personal baseline: %s", exc)
 
     @staticmethod
     def _compute_stats(
         samples: list[AcousticFeatureWindow],
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
         mean: dict[str, float] = {}
         std: dict[str, float] = {}
+        median: dict[str, float] = {}
+        p10: dict[str, float] = {}
+        p90: dict[str, float] = {}
         for feat in _FEATURE_NAMES:
             values = [
                 getattr(s, feat)
@@ -221,8 +345,40 @@ class BaselineManager:
             ]
             if values:
                 mean[feat] = float(np.mean(values))
-                std[feat] = float(np.std(values)) if len(values) > 1 else 1.0
+                median[feat] = float(np.median(values))
+                p10[feat] = float(np.percentile(values, 10))
+                p90[feat] = float(np.percentile(values, 90))
+                std[feat] = BaselineManager._robust_std(feat, values)
             else:
                 mean[feat] = 0.0
+                median[feat] = 0.0
+                p10[feat] = 0.0
+                p90[feat] = 0.0
                 std[feat] = 1.0
-        return mean, std
+        return mean, std, median, p10, p90
+
+    @staticmethod
+    def _robust_std(feature_name: str, values: list[float]) -> float:
+        """Estimate spread from percentiles and enforce feature-specific tolerance floors.
+
+        Calm calibration can be very consistent; using its tiny raw standard
+        deviation makes ordinary speech variation look like an extreme event.
+        This keeps the personal baseline, but treats it as a normal range rather
+        than a single narrow boundary.
+        """
+        arr = np.asarray(values, dtype=float)
+        raw_std = float(np.std(arr)) if arr.size > 1 else 0.0
+        iqr_std = float((np.percentile(arr, 75) - np.percentile(arr, 25)) / 1.349) if arr.size > 1 else 0.0
+        p80_std = float((np.percentile(arr, 90) - np.percentile(arr, 10)) / 2.563) if arr.size > 1 else 0.0
+        center = abs(float(np.median(arr))) if arr.size else 0.0
+        rel_floor = center * config.BASELINE_STD_REL_FLOOR
+        absolute_floors = {
+            "rms_mean": config.BASELINE_RMS_STD_FLOOR,
+            "rms_max": config.BASELINE_PEAK_STD_FLOOR,
+            "pitch_median": config.BASELINE_PITCH_STD_FLOOR,
+            "pitch_range": config.BASELINE_PITCH_STD_FLOOR,
+            "pitch_variance": config.BASELINE_PITCH_STD_FLOOR ** 2,
+            "zcr_mean": config.BASELINE_ZCR_STD_FLOOR,
+            "spectral_centroid": config.BASELINE_CENTROID_STD_FLOOR,
+        }
+        return max(raw_std, iqr_std, p80_std, rel_floor, absolute_floors.get(feature_name, 1e-3))

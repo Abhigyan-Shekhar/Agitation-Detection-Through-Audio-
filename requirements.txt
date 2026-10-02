@@ -4,17 +4,23 @@ torch==2.3.1
 torchaudio==2.3.1
 scipy==1.13.1
 librosa==0.10.2
-# ASR — WhisperLiveKit pulls faster-whisper as a dep; mlx-whisper for Apple Silicon
-whisperlivekit>=0.1.0
-mlx-whisper
-# WebSocket client for WLK streaming
-websockets>=12.0
+# ASR — local direct transcription
+faster-whisper>=1.0.0
+# Explicit audio container decoding/resampling for uploaded batch files
+av>=12.0.0
 # Linguistic analysis
 vaderSentiment>=3.3.2
 rapidfuzz>=3.9.0
+sentence-transformers>=2.7.0,<4.0.0
 # Gemini (optional ablation — disabled by default)
 google-genai>=1.0.0
 # Dashboard
 streamlit>=1.38.0
+plotly>=5.0.0
 pandas
 python-dotenv>=1.0.0
+
+# Person 3 Qwen analysis via Groq
+groq>=0.9.0
+# Optional persistence layer used when SUPABASE_URL/SUPABASE_KEY are set.
+supabase>=2.0.0

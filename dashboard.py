@@ -1,30 +1,25 @@
-"""Audio + Linguistic Agitation Dashboard — WhisperLiveKit edition.
+"""Audio + Linguistic Agitation Dashboard with local faster-whisper transcription.
 
 Architecture overview
 ---------------------
 Microphone (sounddevice)
     │
-    ├─► wlk_queue ──► WhisperLiveKitClient ──► partial_queue  ─► live caption
-    │                                      └──► committed_queue ─► UtteranceAggregator
-    │                                                                     │
-    └─► acoustic_queue ──► AcousticWorker                                 ▼
-                               (rolling ring buffer)            completed utterance_queue
-                                     │                                    │
-                                     └─────────► ScoreFusion ◄────────────┘
-                                                     │
-                                              BehaviourClassifier
-                                                     │
-                                              Streamlit Dashboard
-
-WLK server is launched as a subprocess if WLK_AUTO_LAUNCH=true (default).
+    ├─► transcription_queue ──► TranscriptionWorker ──► partial_queue  ─► live caption
+    │                                               └──► committed_queue ─► UtteranceAggregator
+    │                                                                          │
+    └─► acoustic_queue ──► AcousticWorker                                      ▼
+                               (rolling ring buffer)                 completed utterance_queue
+                                     │                                         │
+                                     └──────────────► ScoreFusion ◄────────────┘
+                                                        │
+                                                 BehaviourClassifier
+                                                        │
+                                                 Streamlit Dashboard
 """
 from __future__ import annotations
 
 import logging
-import os
 import queue
-import subprocess
-import sys
 import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any
@@ -33,16 +28,22 @@ import pandas as pd
 import streamlit as st
 
 import config
-from audio_pipeline import AudioPipeline
-from whisperlivekit_client import WhisperLiveKitClient
-from utterance_aggregator import UtteranceAggregator
-from acoustic_features import AcousticWorker
+from behaviour_history import (
+    DEFAULT_WINDOW_MINUTES,
+    append_unique_event,
+    build_behaviour_timeline,
+    count_behaviours,
+    get_most_common_behaviour,
+    get_recent_events,
+)
+from dashboard_manager import DashboardManager
 from baseline_manager import BaselineManager
 from linguistic_features import LinguisticAnalyzer
 from score_fusion import ScoreFusion
 from behaviour_classifier import BehaviourClassifier
 from audio_behaviour_taxonomy import get_supported_behaviours
-from event_models import BehaviourEvent, FusedResult, Utterance
+from audio_pipeline import LoudnessSnapshot
+from event_models import AcousticFeatureWindow, BehaviourEvent, FusedResult, LinguisticFeatures, Utterance
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,31 +53,37 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Agitation Dashboard", layout="wide")
 
+# Minimal role options for dashboard role selectors. No shared USER_ROLES
+# definition exists elsewhere in this project.
+USER_ROLES: tuple[str, ...] = (
+    "Care staff",
+    "Clinician",
+    "Administrator",
+)
+
 # ---------------------------------------------------------------------------
 # Session state helpers
 # ---------------------------------------------------------------------------
 
 def _init() -> None:
     defaults: dict[str, Any] = {
-        "pipeline": None,
-        "wlk_client": None,
-        "utterance_aggregator": None,
-        "acoustic_worker": None,
+        "manager": None,
         "baseline_manager": None,
         "linguistic_analyzer": None,
         "score_fusion": None,
         "behaviour_classifier": None,
-        "wlk_proc": None,
         # Queues
         "partial_queue": queue.Queue(maxsize=5),
         "committed_queue": queue.Queue(maxsize=100),
         "utterance_queue": queue.Queue(maxsize=50),
         # Display state
         "partial_caption": "",
+        "transcription_metadata": {},
         "committed_lines": [],      # list[str]
         "timeline": [],             # list[dict]
         "behaviour_log": [],        # list[dict]
         "latest_result": None,      # FusedResult | None
+        "last_acoustic_scream_ts": 0.0,
         "error": None,
         # Calibration
         "calibrating": False,
@@ -102,127 +109,75 @@ def _ensure_services() -> None:
         st.session_state.behaviour_classifier = BehaviourClassifier()
 
 
-def _start_wlk_server() -> subprocess.Popen | None:
-    """Launch WhisperLiveKit server as a subprocess if auto-launch is enabled."""
-    if not config.WLK_AUTO_LAUNCH:
-        return None
-    cmd = [
-        sys.executable, "-m", "whisperlivekit.server",
-        "--backend", config.WLK_BACKEND,
-        "--model", config.WLK_MODEL,
-        "--lan", config.WLK_LANGUAGE,
-        "--pcm-input",
-        "--host", config.WLK_HOST,
-        "--port", str(config.WLK_PORT),
-    ]
-    logger.info("Launching WLK server: %s", " ".join(cmd))
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+def _get_manager() -> DashboardManager:
+    """Return the single runtime manager stored in Streamlit session state."""
+    manager = st.session_state.get("manager")
+    if manager is None:
+        manager = DashboardManager(
+            partial_queue=st.session_state.partial_queue,
+            committed_queue=st.session_state.committed_queue,
+            utterance_queue=st.session_state.utterance_queue,
+            baseline_manager=st.session_state.baseline_manager,
         )
-        time.sleep(2.5)     # give the server a moment to start
-        return proc
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not auto-launch WLK: %s", exc)
-        st.session_state.error = (
-            f"Could not auto-launch WhisperLiveKit: {exc}\n"
-            f"Start it manually: wlk --backend {config.WLK_BACKEND} "
-            f"--model {config.WLK_MODEL} --lan {config.WLK_LANGUAGE} --pcm-input"
+        st.session_state.manager = manager
+    return manager
+
+
+def _pipeline_running() -> bool:
+    """Return True when the live runtime manager has active microphone capture."""
+    manager = st.session_state.get("manager")
+    return bool(manager and manager.is_running)
+
+
+@st.fragment(run_every=1.0)
+def _render_baseline_calibration_panel() -> None:
+    """Render auto-refreshing calibration controls and progress."""
+    st.subheader("📐 Baseline Calibration")
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    if bm is None:
+        st.warning("Baseline manager is not initialised yet.")
+        return
+
+    pipeline_running = _pipeline_running()
+    if bm.has_personal_baseline:
+        st.success(f"Personal baseline set ({bm._personal_n} windows)")
+        if st.button("Reset baseline"):
+            bm.reset_calibration()
+    elif bm.is_calibrating:
+        progress = bm.calibration_progress
+        st.progress(
+            progress,
+            text=(
+                f"Calibrating… {int(progress * 100)}% "
+                f"({bm.calibration_window_count}/{bm.minimum_windows_for_personal} windows)"
+            ),
         )
-        return None
+        if st.button("Stop calibration"):
+            ok = bm.stop_calibration()
+            st.session_state.calibrating = False
+            if ok:
+                st.success("Baseline saved!")
+            else:
+                st.warning("Not enough data — keep recording and try again")
+    else:
+        st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
+        if st.button("Start calibration", disabled=not pipeline_running):
+            bm.start_calibration()
+            st.session_state.calibrating = True
 
 
 def _start_pipeline() -> None:
-    _ensure_services()
-
-    # 1. WLK server
-    if st.session_state.wlk_proc is None:
-        st.session_state.wlk_proc = _start_wlk_server()
-
-    # 2. Audio pipeline (fan-out)
-    pipeline = AudioPipeline()
-
-    # 3. WLK client
-    wlk_client = WhisperLiveKitClient(
-        wlk_queue=pipeline.wlk_queue,
-        partial_queue=st.session_state.partial_queue,
-        committed_queue=st.session_state.committed_queue,
-    )
-
-    # 4. Utterance aggregator
-    aggregator = UtteranceAggregator(
-        committed_queue=st.session_state.committed_queue,
-        utterance_queue=st.session_state.utterance_queue,
-    )
-
-    # 5. Acoustic worker
-    acoustic_worker = AcousticWorker(acoustic_queue=pipeline.acoustic_queue)
-    # Feed new windows into baseline manager automatically
-    _original_run = acoustic_worker._run
-
-    def _patched_run():
-        import time as _t
-        bm: BaselineManager = st.session_state.baseline_manager
-        while not acoustic_worker._stop_event.is_set():
-            acoustic_worker._drain_queue()
-            now = _t.time()
-            if now - acoustic_worker._last_extraction_time >= acoustic_worker._hop_sec:
-                records = acoustic_worker._ring.latest_window(acoustic_worker._window_sec)
-                if records:
-                    import time as tt
-                    window_end = now
-                    window_start = window_end - acoustic_worker._window_sec
-                    feat = acoustic_worker._extractor.extract(records, window_start, window_end)
-                    with acoustic_worker._lock:
-                        acoustic_worker._windows.append(feat)
-                    acoustic_worker._last_extraction_time = now
-                    acoustic_worker._windows_extracted += 1
-                    bm.feed(feat)
-            _t.sleep(0.010)
-
-    import threading
-    acoustic_worker._thread = threading.Thread(
-        target=_patched_run, name="acoustic-worker", daemon=True
-    )
-
-    # Start everything
-    pipeline.start()
-    wlk_client.start()
-    aggregator.start()
-    acoustic_worker._stop_event.clear()
-    acoustic_worker._thread.start()
-
-    st.session_state.pipeline = pipeline
-    st.session_state.wlk_client = wlk_client
-    st.session_state.utterance_aggregator = aggregator
-    st.session_state.acoustic_worker = acoustic_worker
-    st.session_state.score_fusion.reset()
-    logger.info("All pipeline components started")
+    st.session_state.error = None
+    st.session_state.partial_caption = ""
+    _get_manager().start()
 
 
 def _stop_pipeline() -> None:
-    for key, attr in [
-        ("utterance_aggregator", "stop"),
-        ("wlk_client", "stop"),
-        ("pipeline", "stop"),
-        ("acoustic_worker", "stop"),
-    ]:
-        obj = st.session_state.get(key)
-        if obj is not None:
-            try:
-                getattr(obj, attr)()
-            except Exception:  # noqa: BLE001
-                pass
-            st.session_state[key] = None
+    manager = st.session_state.get("manager")
+    if manager is not None:
+        manager.stop()
+    st.session_state.manager = None
 
-    proc = st.session_state.get("wlk_proc")
-    if proc is not None:
-        proc.terminate()
-        st.session_state.wlk_proc = None
-
-    logger.info("All pipeline components stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -239,19 +194,12 @@ def _consume() -> None:
     except queue.Empty:
         pass
 
-    # Committed lines (for the committed transcript display)
-    try:
-        while True:
-            from event_models import CommittedLine
-            line: CommittedLine = st.session_state.committed_queue.get_nowait()
-            st.session_state.committed_lines.append(line.text)
-            if len(st.session_state.committed_lines) > 50:
-                st.session_state.committed_lines.pop(0)
-    except queue.Empty:
-        pass
+    # Do not drain committed_queue here: the UtteranceAggregator owns it.
+    # Committed transcript display is updated from completed utterances below.
 
     # Completed utterances → full analysis pipeline
-    acoustic_worker: AcousticWorker | None = st.session_state.acoustic_worker
+    manager = st.session_state.get("manager")
+    acoustic_worker = manager.acoustic_worker if manager is not None else None
     analyzer: LinguisticAnalyzer = st.session_state.linguistic_analyzer
     fusion: ScoreFusion = st.session_state.score_fusion
     classifier: BehaviourClassifier = st.session_state.behaviour_classifier
@@ -260,6 +208,15 @@ def _consume() -> None:
         while True:
             utterance: Utterance = st.session_state.utterance_queue.get_nowait()
             logger.info("Processing utterance: %r", utterance.full_text[:60])
+            logger.info(
+                "BEHAVIOUR_TRACE dashboard_received_utterance transcript=%r start=%.3f end=%.3f utterance_q=%d",
+                utterance.full_text,
+                utterance.start_time,
+                utterance.end_time,
+                st.session_state.utterance_queue.qsize(),
+            )
+
+            trace = utterance.latency_trace
 
             # Aggregate acoustic features for this utterance's time span
             acoustic = None
@@ -267,9 +224,17 @@ def _consume() -> None:
                 acoustic = acoustic_worker.aggregate(
                     utterance.start_time, utterance.end_time
                 )
+            if trace is not None:
+                trace.feature_extraction_ts = time.monotonic()
 
             # Linguistic features
             linguistic = analyzer.analyze(utterance)
+            logger.info(
+                "BEHAVIOUR_TRACE dashboard_classifier_input transcript=%r acoustic_available=%s linguistic=%s",
+                utterance.full_text,
+                acoustic is not None,
+                linguistic,
+            )
 
             # Fusion
             result = fusion.fuse(utterance, acoustic, linguistic)
@@ -277,10 +242,25 @@ def _consume() -> None:
 
             # Behaviour classification
             result = classifier.classify(result)
+            logger.info(
+                "BEHAVIOUR_TRACE dashboard_classifier_output transcript=%r behaviours=%s event_labels=%s severity=%s",
+                utterance.full_text,
+                result.behaviours,
+                [event.canonical_label for event in result.behaviour_events],
+                result.severity,
+            )
 
+            if result.latency_trace is not None:
+                result.latency_trace.dashboard_render_ts = time.monotonic()
+                logger.info("Dashboard latency diagnostics: %s", result.latency_trace.durations_ms())
             st.session_state.latest_result = result
+            for line in utterance.lines:
+                prefix = f"{line.speaker_label}: " if line.speaker_label else ""
+                st.session_state.committed_lines.append(f"{prefix}{line.text}")
+            if len(st.session_state.committed_lines) > 50:
+                st.session_state.committed_lines = st.session_state.committed_lines[-50:]
             for event in result.behaviour_events:
-                st.session_state.behaviour_log.append(_event_to_record(event, result))
+                append_unique_event(st.session_state.behaviour_log, _event_to_record(event, result))
             st.session_state.timeline.append({
                 "time": time.strftime("%H:%M:%S"),
                 "timestamp": datetime.now(),
@@ -304,6 +284,170 @@ def _consume() -> None:
 
     except queue.Empty:
         pass
+
+    pipeline = manager.pipeline if manager is not None else None
+    # Use the completed two-second acoustic window for screaming. Raw callback
+    # loudness is retained for diagnostics only: one loud knock or word must
+    # not bypass persistence and be presented as a behavioural event.
+    _consume_acoustic_only_screaming(acoustic_worker, classifier)
+    _consume_acoustic_only_strange_noise(acoustic_worker, classifier)
+
+
+def _acoustic_scream_score(acoustic: AcousticFeatureWindow | None) -> float:
+    if acoustic is None:
+        return 0.0
+    energy_score = min(1.0, acoustic.rms_mean / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6))
+    peak_score = min(1.0, acoustic.rms_max / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6))
+    clipping_score = min(1.0, acoustic.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
+    if clipping_score > 0 and energy_score >= 0.65:
+        return max(energy_score, peak_score, clipping_score)
+    if energy_score >= 1.0 and peak_score >= 1.0:
+        return max(energy_score, peak_score)
+    return 0.0
+
+
+def _loudness_scream_score(loudness: LoudnessSnapshot | None) -> float:
+    if loudness is None:
+        return 0.0
+    age = time.time() - loudness.timestamp
+    if age > 1.0:
+        return 0.0
+    rms_score = min(1.0, loudness.rms / max(config.BEHAVIOUR_ABSOLUTE_RMS_SHOUT, 1e-6))
+    peak_score = min(1.0, loudness.peak / max(config.BEHAVIOUR_ABSOLUTE_PEAK_SHOUT, 1e-6))
+    clipping_score = min(1.0, loudness.clipping_ratio / max(config.BEHAVIOUR_CLIPPING_SHOUT, 1e-6))
+    if rms_score >= 1.0 and peak_score >= 0.75:
+        return max(rms_score, peak_score)
+    if clipping_score > 0 and rms_score >= 0.50:
+        return max(rms_score, peak_score, clipping_score)
+    return 0.0
+
+
+def _consume_acoustic_only_screaming(
+    acoustic_worker: Any,
+    classifier: BehaviourClassifier,
+    loudness: LoudnessSnapshot | None = None,
+) -> None:
+    acoustic = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    acoustic_score = _acoustic_scream_score(acoustic)
+    scream_score = acoustic_score
+    if scream_score < 0.65:
+        return
+
+    now = time.time()
+    last_ts = float(st.session_state.get("last_acoustic_scream_ts", 0.0) or 0.0)
+    if now - last_ts < 2.0:
+        return
+
+    severity = "High" if scream_score >= 0.85 else "Moderate"
+    acoustic_for_result = acoustic or AcousticFeatureWindow(
+        start_time=now,
+        end_time=now,
+    )
+    result = FusedResult(
+        acoustic_score=round(scream_score, 4),
+        linguistic_score=0.0,
+        raw_final_score=round(scream_score, 4),
+        smoothed_score=round(scream_score, 4),
+        severity=severity,
+        reliability=max(0.0, 1.0 - (0.25 if acoustic_for_result.clipping_ratio > 0.10 else 0.0)),
+        utterance=None,
+        acoustic_features=acoustic_for_result,
+        linguistic_features=LinguisticFeatures(),
+        acoustic_contributions={
+            "absolute_rms": round(acoustic.rms_mean if acoustic else 0.0, 4),
+            "absolute_peak": round(acoustic.rms_max if acoustic else 0.0, 4),
+            "clipping": round(acoustic.clipping_ratio if acoustic else 0.0, 4),
+        },
+        linguistic_contributions={},
+    )
+    result = classifier.classify(result)
+    if "Screaming" not in result.behaviours:
+        return
+
+    logger.info(
+        "BEHAVIOUR_TRACE acoustic_only_screaming raw_rms=%.3f raw_peak=%.3f raw_clipping=%.3f window_rms=%.3f window_peak=%.3f window_clipping=%.3f labels=%s severity=%s",
+        0.0,
+        0.0,
+        0.0,
+        acoustic.rms_mean if acoustic else 0.0,
+        acoustic.rms_max if acoustic else 0.0,
+        acoustic.clipping_ratio if acoustic else 0.0,
+        result.behaviours,
+        result.severity,
+    )
+    st.session_state.last_acoustic_scream_ts = now
+    st.session_state.latest_result = result
+    for event in result.behaviour_events:
+        append_unique_event(st.session_state.behaviour_log, _event_to_record(event, result))
+    st.session_state.timeline.append({
+        "time": time.strftime("%H:%M:%S"),
+        "timestamp": datetime.now(),
+        "acoustic_score": result.acoustic_score,
+        "linguistic_score": result.linguistic_score,
+        "smoothed_score": result.smoothed_score,
+        "severity": result.severity,
+    })
+
+
+def _consume_acoustic_only_strange_noise(
+    acoustic_worker: Any,
+    classifier: BehaviourClassifier,
+) -> None:
+    acoustic = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    if acoustic is None:
+        return
+
+    score = acoustic.non_speech_vocalization_score
+    if score < config.BEHAVIOUR_STRANGE_NOISE_THRESHOLD:
+        return
+
+    now = time.time()
+    last_ts = float(st.session_state.get("last_acoustic_strange_noise_ts", 0.0) or 0.0)
+    if now - last_ts < 2.0:
+        return
+
+    severity = "Moderate" if score >= 0.80 else "Mild"
+    result = FusedResult(
+        acoustic_score=round(score, 4),
+        linguistic_score=0.0,
+        raw_final_score=round(score, 4),
+        smoothed_score=round(score, 4),
+        severity=severity,
+        reliability=0.85,
+        utterance=None,
+        acoustic_features=acoustic,
+        linguistic_features=LinguisticFeatures(),
+        acoustic_contributions={
+            "non_speech_vocalization": round(score, 4),
+            "rms": round(acoustic.rms_mean, 4),
+            "peak": round(acoustic.rms_max, 4),
+        },
+        linguistic_contributions={},
+    )
+    result = classifier.classify(result)
+    if "Making strange noises" not in result.behaviours:
+        return
+
+    logger.info(
+        "BEHAVIOUR_TRACE acoustic_only_strange_noise score=%.3f label=%s evidence=%s labels=%s severity=%s",
+        score,
+        acoustic.non_speech_vocalization_label,
+        acoustic.non_speech_vocalization_evidence,
+        result.behaviours,
+        result.severity,
+    )
+    st.session_state.last_acoustic_strange_noise_ts = now
+    st.session_state.latest_result = result
+    for event in result.behaviour_events:
+        append_unique_event(st.session_state.behaviour_log, _event_to_record(event, result))
+    st.session_state.timeline.append({
+        "time": time.strftime("%H:%M:%S"),
+        "timestamp": datetime.now(),
+        "acoustic_score": result.acoustic_score,
+        "linguistic_score": result.linguistic_score,
+        "smoothed_score": result.smoothed_score,
+        "severity": result.severity,
+    })
 
 
 def _taxonomy_labels() -> list[str]:
@@ -363,24 +507,38 @@ def _records_dataframe(records: list[dict[str, Any]] | None = None) -> pd.DataFr
 
 def _sidebar_filters(df: pd.DataFrame) -> dict[str, Any]:
     """Render interactive filters and return selected values."""
-    st.sidebar.subheader("🔎 Filters")
+    st.subheader("🔎 Filters")
     residents = sorted(df["resident"].dropna().unique().tolist()) if not df.empty else []
     behaviours = sorted(set(_taxonomy_labels()) | set(df["behaviour"].dropna().unique().tolist())) if not df.empty else _taxonomy_labels()
     severities = sorted(df["severity"].dropna().unique().tolist()) if not df.empty else _severity_options()
     locations = sorted(df["location"].dropna().unique().tolist()) if not df.empty else []
     today = date.today()
     return {
-        "residents": st.sidebar.multiselect("Resident", residents, default=residents, help="Limit dashboard cards, charts, and tables to selected residents."),
-        "behaviours": st.sidebar.multiselect("Behaviour", behaviours, default=behaviours),
-        "severities": st.sidebar.multiselect("Severity", severities, default=severities),
-        "locations": st.sidebar.multiselect("Location", locations, default=locations),
-        "date_range": st.sidebar.date_input("Date range", value=(today - timedelta(days=7), today)),
-        "time_range": st.sidebar.slider(
+        "residents": st.multiselect("Resident", residents, default=residents, help="Limit dashboard cards, charts, and tables to selected residents."),
+        "behaviours": st.multiselect("Behaviour", behaviours, default=behaviours),
+        "severities": st.multiselect("Severity", severities, default=severities),
+        "locations": st.multiselect("Location", locations, default=locations),
+        "date_range": st.date_input("Date range", value=(today - timedelta(days=7), today)),
+        "time_range": st.slider(
             "Time range",
             value=(datetime_time(0, 0), datetime_time(23, 59)),
             help="Filters events by local event time.",
         ),
-        "search": st.sidebar.text_input("Search notes/outcomes", placeholder="Type to search…"),
+        "search": st.text_input("Search notes/outcomes", placeholder="Type to search…"),
+    }
+
+
+def _default_filters(df: pd.DataFrame) -> dict[str, Any]:
+    """Return safe filter defaults when the sidebar has not rendered yet."""
+    today = date.today()
+    return {
+        "residents": sorted(df["resident"].dropna().unique().tolist()) if not df.empty else [],
+        "behaviours": sorted(set(_taxonomy_labels()) | set(df["behaviour"].dropna().unique().tolist())) if not df.empty else _taxonomy_labels(),
+        "severities": sorted(df["severity"].dropna().unique().tolist()) if not df.empty else _severity_options(),
+        "locations": sorted(df["location"].dropna().unique().tolist()) if not df.empty else [],
+        "date_range": (today - timedelta(days=7), today),
+        "time_range": (datetime_time(0, 0), datetime_time(23, 59)),
+        "search": "",
     }
 
 
@@ -419,6 +577,126 @@ def _apply_filters(df: pd.DataFrame, filters: dict[str, Any]) -> pd.DataFrame:
     return filtered
 
 
+_BASELINE_DEBUG_FEATURES: tuple[str, ...] = (
+    "rms_mean",
+    "rms_max",
+    "rms_slope",
+    "pitch_median",
+    "pitch_range",
+    "pitch_variance",
+    "zcr_mean",
+    "spectral_centroid",
+    "voiced_ratio",
+    "pause_ratio",
+)
+
+
+def _render_acoustic_baseline_debug() -> None:
+    """Render live acoustic baseline diagnostics without changing scoring."""
+    st.subheader("Acoustic Baseline Debug")
+    manager = st.session_state.get("manager")
+    acoustic_worker = manager.acoustic_worker if manager is not None else None
+    bm: BaselineManager | None = st.session_state.baseline_manager
+    fusion: ScoreFusion | None = st.session_state.score_fusion
+    latest = acoustic_worker.latest_window() if acoustic_worker is not None else None
+    result: FusedResult | None = st.session_state.latest_result
+
+    if bm is None:
+        st.warning("Baseline manager is not initialised.")
+        return
+    if latest is None:
+        st.info("No acoustic feature window has been extracted yet.")
+        return
+
+    st.caption(
+        "Live diagnostics for the latest acoustic window. Values are read-only "
+        "and do not alter scoring, thresholds, or calibration."
+    )
+    status_cols = st.columns(4)
+    status_cols[0].metric("Personal baseline", "Active" if bm.has_personal_baseline else "Rolling fallback")
+    status_cols[1].metric("Calibration windows", bm.calibration_window_count)
+    status_cols[2].metric("Latest window age", f"{(time.time() - latest.end_time):.2f}s")
+    if acoustic_worker is not None:
+        status_cols[3].metric("Pending extractions", acoustic_worker.pending_extractions)
+
+    raw_rows = [
+        {"feature": feat, "raw": round(float(getattr(latest, feat, 0.0)), 6)}
+        for feat in _BASELINE_DEBUG_FEATURES
+    ]
+    st.markdown("**A. Raw acoustic features**")
+    st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
+
+    personal_stats = bm.personal_baseline_stats()
+    personal_summary = bm.personal_baseline_summary()
+    baseline_rows = []
+    for feat in _BASELINE_DEBUG_FEATURES:
+        mean, std = personal_stats.get(feat, (None, None))
+        summary = personal_summary.get(feat, {})
+        baseline_rows.append({
+            "feature": feat,
+            "personal_mean": None if mean is None else round(float(mean), 6),
+            "personal_median": None if not summary else round(float(summary.get("median", 0.0)), 6),
+            "personal_p10": None if not summary else round(float(summary.get("p10", 0.0)), 6),
+            "personal_p90": None if not summary else round(float(summary.get("p90", 0.0)), 6),
+            "personal_std_or_tolerance": None if std is None else round(float(std), 6),
+            "current_deviation": None if not summary else round(float(getattr(latest, feat, 0.0)) - float(summary.get("median", 0.0)), 6),
+        })
+    st.markdown("**B. Personal baseline**")
+    if personal_stats:
+        st.dataframe(pd.DataFrame(baseline_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No personal baseline is active yet; z-scores currently use the rolling fallback when enough rolling data exists.")
+
+    z_rows = [
+        {
+            "feature": feat,
+            "z_score": round(float(bm.z_score(feat, float(getattr(latest, feat, 0.0)))), 4),
+        }
+        for feat in _BASELINE_DEBUG_FEATURES
+    ]
+    st.markdown("**C. Z-scores from BaselineManager.z_score()**")
+    st.dataframe(pd.DataFrame(z_rows), hide_index=True, use_container_width=True)
+
+    debug_values = fusion.acoustic_debug_values(latest) if fusion is not None else {"score": 0.0, "z_scores": {}, "branch_values": {}}
+    branch_z = debug_values.get("z_scores", {})
+    branch_values = debug_values.get("branch_values", {})
+    st.markdown("**D. Acoustic branch values used by score_fusion.py**")
+    branch_rows = [
+        {"name": name, "value": value}
+        for name, value in {**branch_z, **branch_values}.items()
+    ]
+    st.dataframe(pd.DataFrame(branch_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**E. Final scores**")
+    score_cols = st.columns(5)
+    score_cols[0].metric("Latest acoustic branch", debug_values.get("score", 0.0))
+    if result is not None:
+        score_cols[1].metric("Result acoustic", result.acoustic_score)
+        score_cols[2].metric("Result linguistic", result.linguistic_score)
+        score_cols[3].metric("Fused agitation", result.smoothed_score)
+        score_cols[4].metric("Reliability", result.reliability)
+        st.caption(f"Severity: {result.severity}")
+    else:
+        score_cols[1].metric("Result acoustic", "N/A")
+        score_cols[2].metric("Result linguistic", "N/A")
+        score_cols[3].metric("Fused agitation", "N/A")
+        score_cols[4].metric("Reliability", "N/A")
+
+    classifier = st.session_state.get("behaviour_classifier")
+    if classifier is not None and hasattr(classifier, "scream_debug_state"):
+        st.markdown("**F. Scream gate (hysteresis / persistence)**")
+        st.json(classifier.scream_debug_state)
+
+    if result is not None:
+        st.markdown("**G. Latest linguistic and behaviour evidence**")
+        st.json({
+            "transcript": result.utterance.full_text if result.utterance else "",
+            "linguistic_signals": result.linguistic_features.evidence if result.linguistic_features else {},
+            "detected_behaviours": result.behaviours,
+            "reasons": [event.notes for event in result.behaviour_events],
+        })
+
+
 def _render_summary_cards(df: pd.DataFrame) -> None:
     today_df = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
     high_df = df[df["severity"].isin(["High", "Critical"])] if not df.empty else df
@@ -434,7 +712,7 @@ def _render_summary_cards(df: pd.DataFrame) -> None:
     cols[2].metric("Most Common", most_common)
     cols[3].metric("Avg Severity", avg_severity)
     cols[4].metric("Most Active Resident", active_resident)
-    cols[5].metric("System Status", "Running" if st.session_state.pipeline is not None else "Stopped")
+    cols[5].metric("System Status", "Running" if _pipeline_running() else "Stopped")
 
 
 def _render_empty(message: str) -> None:
@@ -478,6 +756,61 @@ def _render_charts(df: pd.DataFrame) -> None:
     else:
         hourly = df.assign(hour=df["timestamp"].dt.hour).groupby("hour").size().reset_index(name="events")
         st.line_chart(hourly, x="hour", y="events")
+
+
+def _render_rolling_behaviour_history() -> None:
+    """Render rolling 30-minute behaviour-history analytics.
+
+    This reads the existing dashboard behaviour log populated by the real-time
+    classifier and manual logging. It is a history/frequency view only.
+    """
+    st.subheader("Behaviours detected in last 30 minutes")
+    recent_events = get_recent_events(
+        st.session_state.behaviour_log,
+        window_minutes=DEFAULT_WINDOW_MINUTES,
+    )
+    most_common = get_most_common_behaviour(recent_events)
+    total_events = len(recent_events)
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Total events", total_events)
+    if most_common is None:
+        metric_cols[1].metric("Most repeated behaviour", "None")
+        metric_cols[2].metric("Occurrences", 0)
+    else:
+        behaviour, occurrences = most_common
+        metric_cols[1].metric("Most repeated behaviour", behaviour.upper())
+        metric_cols[2].metric("Occurrences", occurrences)
+
+    if not recent_events:
+        _render_empty("No behaviours detected in the last 30 minutes.")
+        return
+
+    st.markdown("**Behaviour breakdown**")
+    counts = count_behaviours(recent_events)
+    breakdown = pd.DataFrame(
+        [{"behaviour": behaviour, "events": events} for behaviour, events in counts.most_common()]
+    )
+    st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
+    st.markdown("**30-minute history graph**")
+    timeline = pd.DataFrame(
+        build_behaviour_timeline(
+            recent_events,
+            window_minutes=DEFAULT_WINDOW_MINUTES,
+        )
+    )
+    if timeline.empty:
+        _render_empty("No timeline data available for the last 30 minutes.")
+        return
+    chart_data = timeline.pivot_table(
+        index="time",
+        columns="behaviour",
+        values="events",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    st.bar_chart(chart_data)
 
 
 def _render_recent_events(df: pd.DataFrame) -> None:
@@ -551,6 +884,24 @@ def _render_logging_form() -> None:
             st.success("Behaviour event saved.")
 
 
+
+def _displayed_behaviour_label(result: FusedResult) -> str:
+    """Return the label shown in the current-behaviour card and log UI selection."""
+    event_labels = [event.canonical_label for event in result.behaviour_events]
+    candidate_labels = event_labels or [
+        label for label in result.behaviours if label != "No audio agitation detected"
+    ] or result.behaviours
+    displayed = candidate_labels[0] if candidate_labels else "No audio agitation detected"
+    logger.info(
+        "BEHAVIOUR_TRACE ui_display transcript=%r behaviours=%s event_labels=%s severity=%s displayed_behavior=%r",
+        result.utterance.full_text if result.utterance else "",
+        result.behaviours,
+        event_labels,
+        result.severity,
+        displayed,
+    )
+    return displayed
+
 def _render_behaviour_events(result: FusedResult) -> None:
     """Render canonical behaviour events in a compact, research-friendly layout."""
     if result.behaviour_events:
@@ -563,6 +914,8 @@ def _render_behaviour_events(result: FusedResult) -> None:
                     details.append(f"Internal code: {event.internal_code}")
                 if event.cmai_category:
                     details.append(f"CMAI: {event.cmai_category}")
+                if event.speaker_label or event.person:
+                    details.append(f"Speaker: {event.speaker_label or event.person}")
                 if event.mapping_status:
                     details.append(f"Mapping status: {event.mapping_status}")
                 if event.timestamp is not None:
@@ -579,13 +932,20 @@ def _render_behaviour_events(result: FusedResult) -> None:
         return
 
     st.subheader("Detected Behaviours")
+    non_event_labels = [label for label in result.behaviours if label != "No audio agitation detected"]
+    if non_event_labels:
+        for label in non_event_labels:
+            st.info(label)
+        return
     st.success("No audio agitation detected")
 
 
 def _render() -> None:
     """Render the main dashboard from session state."""
     df = _records_dataframe()
-    filters = _sidebar_filters(df)
+    filters = st.session_state.get("dashboard_filters")
+    if filters is None:
+        filters = _default_filters(df)
     filtered_df = _apply_filters(df, filters)
     result: FusedResult | None = st.session_state.latest_result
 
@@ -598,15 +958,38 @@ def _render() -> None:
         st.divider()
         st.subheader("🩺 System Status")
         status_cols = st.columns([1, 1, 2])
-        status_cols[0].success("Microphone active" if st.session_state.pipeline is not None else "Monitoring stopped")
+        status_cols[0].success("Microphone active" if _pipeline_running() else "Monitoring stopped")
         status_cols[1].caption("Local decision support only — not a clinical diagnosis.")
-        status_cols[2].progress(1.0 if st.session_state.pipeline is not None else 0.0, text="Audio pipeline status")
+        status_cols[2].progress(1.0 if _pipeline_running() else 0.0, text="Audio pipeline status")
+        manager = st.session_state.get("manager")
+        worker = manager.transcription_worker if manager is not None else None
+        if worker is None:
+            st.caption(f"Speaker diarization: {'enabled' if config.ENABLE_SPEAKER_DIARIZATION else 'disabled'}")
+        elif worker.diarization_error:
+            st.error(f"Speaker diarization unavailable — {worker.diarization_error}")
+        else:
+            state = "enabled" if worker.diarization_active else "disabled"
+            st.caption(f"Speaker diarization: {state} • Speakers observed: {worker.speakers_seen}")
+        if result is not None and result.latency_trace is not None:
+            with st.expander("⏱️ Latency diagnostics", expanded=False):
+                latency = result.latency_trace.durations_ms()
+                st.json(latency if latency else {"status": "waiting for complete trace"})
+        with st.expander("Acoustic Baseline Debug", expanded=False):
+            _render_acoustic_baseline_debug()
 
         live_col, current_col = st.columns([1, 1])
         with live_col:
             st.subheader("🎙️ Current Recording")
             partial = st.session_state.partial_caption or "_Waiting for speech…_"
             st.markdown(f"> {partial}")
+            manager = st.session_state.get("manager")
+            worker = manager.transcription_worker if manager is not None else None
+            tx = worker.latest_result if worker is not None else None
+            if tx is not None:
+                meta_cols = st.columns(3)
+                meta_cols[0].metric("Transcript time", datetime.fromtimestamp(tx.timestamp).strftime("%H:%M:%S"))
+                meta_cols[1].metric("Confidence", "N/A" if tx.confidence is None else f"{tx.confidence:.0%}")
+                meta_cols[2].metric("Inference", f"{tx.inference_ms:.0f} ms")
             committed = st.session_state.committed_lines
             with st.expander("📝 Current Transcript", expanded=bool(committed)):
                 st.write("  \n".join(committed[-20:]) if committed else "No committed transcript yet.")
@@ -616,7 +999,9 @@ def _render() -> None:
             if result is None:
                 st.info("Waiting for a completed utterance…")
             else:
-                behaviour_label = result.behaviour_events[0].canonical_label if result.behaviour_events else "No audio agitation detected"
+                behaviour_label = _displayed_behaviour_label(result)
+                if result.speaker_label:
+                    st.caption(f"Latest speaker: {result.speaker_label}")
                 st.metric("Behaviour", behaviour_label)
                 st.metric("Current Severity", _severity_badge(result.severity))
                 st.metric("Current Confidence", f"{result.reliability:.0%}")
@@ -633,6 +1018,9 @@ def _render() -> None:
 
     with analytics_tab:
         _render_summary_cards(filtered_df)
+        st.divider()
+        _render_rolling_behaviour_history()
+        st.divider()
         _render_charts(filtered_df)
         if st.session_state.timeline:
             st.subheader("📈 Detection Score Timeline")
@@ -678,8 +1066,14 @@ _ensure_services()
 # ---- Sidebar ------------------------------------------------------------
 with st.sidebar:
     st.title("🎛️ Controls")
+    st.session_state.dashboard_role = st.selectbox(
+        "Dashboard role",
+        list(USER_ROLES),
+        index=list(USER_ROLES).index(st.session_state.get("dashboard_role", "Care staff")),
+        help="Controls whether manual behaviour events can be added.",
+    )
 
-    pipeline_running = st.session_state.pipeline is not None
+    pipeline_running = _pipeline_running()
     col_start, col_stop = st.columns(2)
 
     if col_start.button("▶ Start mic", disabled=pipeline_running):
@@ -696,46 +1090,48 @@ with st.sidebar:
     st.divider()
 
     # Baseline calibration
-    st.subheader("📐 Baseline Calibration")
     bm: BaselineManager | None = st.session_state.baseline_manager
-    if bm:
-        if bm.has_personal_baseline:
-            st.success(f"Personal baseline set ({bm._personal_n} windows)")
-            if st.button("Reset baseline"):
-                bm.reset_calibration()
-        elif bm.is_calibrating:
-            progress = bm.calibration_progress
-            st.progress(progress, text=f"Calibrating… {int(progress * 100)}%")
-            if st.button("Stop calibration"):
-                ok = bm.stop_calibration()
-                st.session_state.calibrating = False
-                if ok:
-                    st.success("Baseline saved!")
-                else:
-                    st.warning("Not enough data — keep recording and try again")
-        else:
-            st.info(f"No personal baseline. Collect ~{config.BASELINE_COLLECT_MIN:.0f} min of calm speech.")
-            if st.button("Start calibration", disabled=not pipeline_running):
-                bm.start_calibration()
-                st.session_state.calibrating = True
+    _render_baseline_calibration_panel()
+
+    st.divider()
+    st.session_state.dashboard_filters = _sidebar_filters(_records_dataframe())
 
     st.divider()
 
     # Debug
     with st.expander("🔧 Debug"):
         st.write("Pipeline running:", pipeline_running)
-        st.write("WLK auto-launch:", config.WLK_AUTO_LAUNCH)
-        st.write("WLK backend:", config.WLK_BACKEND)
-        st.write("WLK model:", config.WLK_MODEL)
+        st.write("Transcription engine:", config.TRANSCRIPTION_ENGINE)
+        st.write("Whisper model:", config.WHISPER_MODEL)
+        st.write("Transcription window (s):", config.TRANSCRIPTION_WINDOW_SECONDS)
+        st.write("Transcription interval (s):", config.TRANSCRIPTION_INTERVAL_SECONDS)
+        st.write("Use GPU if available:", config.USE_GPU_IF_AVAILABLE)
         st.write("Gemini comparison:", config.ENABLE_GEMINI_COMPARISON)
-        aw = st.session_state.acoustic_worker
+        manager = st.session_state.get("manager")
+        aw = manager.acoustic_worker if manager else None
         if aw:
             st.write("Acoustic windows extracted:", aw.windows_extracted)
-        ua = st.session_state.utterance_aggregator
+            st.write("Last acoustic extraction (ms):", round(aw.last_extraction_ms, 2))
+            st.write("Average acoustic extraction (ms):", round(aw.average_extraction_ms, 2))
+            st.write("Acoustic extractions scheduled:", aw.windows_scheduled)
+            st.write("Pending acoustic extractions:", aw.pending_extractions)
+            st.write("Skipped acoustic windows (backpressure):", aw.windows_skipped_backpressure)
+            latest = aw.latest_window()
+            if latest:
+                st.write("Latest acoustic window age (ms):", round((time.time() - latest.end_time) * 1000.0, 2))
+        ua = manager.utterance_aggregator if manager else None
         if ua:
             st.write("Utterances emitted:", ua.emitted_count)
         if bm:
+            st.write("Baseline manager id:", id(bm))
+            st.write("Calibration active:", bm.is_calibrating)
+            st.write("Calibration windows:", bm.calibration_window_count)
+            st.write("Calibration min windows:", bm.minimum_windows_for_personal)
+            st.write("Calibration progress:", round(bm.calibration_progress * 100.0, 1))
             st.write("Rolling baseline windows:", len(bm._rolling))
+            if manager:
+                st.write("Manager baseline id:", id(manager._baseline_manager))
+                st.write("Manager uses session baseline:", manager._baseline_manager is bm)
 
 # ---- Error banner --------------------------------------------------------
 if st.session_state.error:
@@ -752,8 +1148,7 @@ st.caption(
 # ---- Live fragment (polls every second) ----------------------------------
 @st.fragment(run_every=1.0)
 def _live() -> None:
-    if st.session_state.pipeline is not None:
-        _consume()
+    _consume()
     _render()
 
 

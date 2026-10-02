@@ -6,7 +6,51 @@ a single source of truth for inter-module data contracts.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any
+
+
+@dataclass
+class LatencyTrace:
+    """Monotonic timestamps for end-to-end audio pipeline latency diagnostics."""
+
+    microphone_ts: float | None = None
+    queue_ts: float | None = None
+    transcription_input_ts: float | None = None
+    transcript_ts: float | None = None
+    feature_extraction_ts: float | None = None
+    inference_ts: float | None = None
+    dashboard_render_ts: float | None = None
+
+    def mark(self, stage: str) -> None:
+        setattr(self, f"{stage}_ts", time.monotonic())
+
+    def durations_ms(self) -> dict[str, float]:
+        stages = [
+            ("microphone", self.microphone_ts),
+            ("queue", self.queue_ts),
+            ("transcription_input", self.transcription_input_ts),
+            ("transcript", self.transcript_ts),
+            ("feature_extraction", self.feature_extraction_ts),
+            ("inference", self.inference_ts),
+            ("dashboard_render", self.dashboard_render_ts),
+        ]
+        out: dict[str, float] = {}
+        previous_name: str | None = None
+        previous_ts: float | None = None
+        first_ts: float | None = None
+        for name, ts in stages:
+            if ts is None:
+                continue
+            if first_ts is None:
+                first_ts = ts
+            if previous_ts is not None and previous_name is not None:
+                out[f"{previous_name}_to_{name}"] = round((ts - previous_ts) * 1000.0, 2)
+            previous_name = name
+            previous_ts = ts
+        if first_ts is not None and previous_ts is not None:
+            out["end_to_end"] = round((previous_ts - first_ts) * 1000.0, 2)
+        return out
 
 
 @dataclass
@@ -19,6 +63,8 @@ class BehaviourEvent:
     canonical_label: str = "Unmapped audio behaviour"
     cmai_category: str | None = None
     person: str | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
     timestamp: Any = None
     location: str | None = None
     severity: str | None = None
@@ -58,6 +104,9 @@ class AcousticFeatureWindow:
     spectral_centroid: float = 0.0
     spectral_rolloff: float = 0.0
     harmonic_to_noise_ratio: float = 0.0
+    non_speech_vocalization_score: float = 0.0
+    non_speech_vocalization_label: str | None = None
+    non_speech_vocalization_evidence: str | None = None
 
     # Voice activity (Silero mask — not a gate)
     voiced_ratio: float = 0.0       # proportion of frames flagged as speech
@@ -77,10 +126,19 @@ class AcousticFeatureWindow:
 
 @dataclass
 class CommittedLine:
-    """A transcript segment that WhisperLiveKit has confirmed will not change."""
+    """A transcript segment that local transcriber has confirmed will not change."""
 
     text: str
     timestamp: float    # Unix timestamp when line was committed
+    latency_trace: LatencyTrace | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
+    start_time: float | None = None
+    end_time: float | None = None
+    # ASR confidence is propagated to the linguistic detector.  A missing
+    # value means the backend did not expose a confidence, not that the text
+    # is known to be correct.
+    transcript_confidence: float | None = None
 
 
 @dataclass
@@ -90,6 +148,9 @@ class Utterance:
     lines: list[CommittedLine]
     start_time: float   # Unix timestamp of first word
     end_time: float     # Unix timestamp of last committed line
+    latency_trace: LatencyTrace | None = None
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
 
     @property
     def full_text(self) -> str:
@@ -114,6 +175,11 @@ class LinguisticFeatures:
     threat_score: float = 0.0
     profanity_score: float = 0.0
     imperative_score: float = 0.0
+    yelling_score: float = 0.0
+    sexual_advance_score: float = 0.0
+    complaint_score: float = 0.0
+    negativism_score: float = 0.0
+    strange_noise_score: float = 0.0
 
     # Raw evidence strings (for explainability panel)
     evidence: dict[str, Any] = field(default_factory=dict)
@@ -152,3 +218,10 @@ class FusedResult:
 
     # Optional Gemini comparison result (disabled by default)
     gemini_result: dict[str, Any] | None = None
+
+    # End-to-end latency diagnostics for the utterance lifecycle
+    latency_trace: LatencyTrace | None = None
+
+    # Session-local diarization attribution (not biometric identity).
+    speaker_id: int | str | None = None
+    speaker_label: str | None = None
